@@ -22,9 +22,10 @@ use ldk_server_protos::endpoints::{
 	BOLT11_RECEIVE_PATH, BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH,
 	CLOSE_CHANNEL_PATH, CONNECT_PEER_PATH, EXPORT_PATHFINDING_SCORES_PATH,
 	FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH, GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH,
-	LIST_CHANNELS_PATH, LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, ONCHAIN_RECEIVE_PATH,
-	ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH, SIGN_MESSAGE_PATH, SPLICE_IN_PATH, SPLICE_OUT_PATH,
-	SPONTANEOUS_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH, VERIFY_SIGNATURE_PATH,
+	LIST_CHANNELS_PATH, LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH,
+	ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH, SIGN_MESSAGE_PATH,
+	SPLICE_IN_PATH, SPLICE_OUT_PATH, SPONTANEOUS_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH,
+	VERIFY_SIGNATURE_PATH,
 };
 use prost::Message;
 
@@ -34,6 +35,7 @@ use crate::api::bolt12_receive::handle_bolt12_receive_request;
 use crate::api::bolt12_send::handle_bolt12_send_request;
 use crate::api::close_channel::{handle_close_channel_request, handle_force_close_channel_request};
 use crate::api::connect_peer::handle_connect_peer;
+use crate::api::list_peers::handle_list_peers_request;
 use crate::api::error::LdkServerError;
 use crate::api::error::LdkServerErrorCode::{AuthError, InvalidRequestError};
 use crate::api::export_pathfinding_scores::handle_export_pathfinding_scores_request;
@@ -328,6 +330,13 @@ impl Service<Request<Incoming>> for NodeService {
 				auth_params,
 				api_key,
 				handle_export_pathfinding_scores_request,
+			)),
+			LIST_PEERS_PATH => Box::pin(handle_request(
+				context,
+				req,
+				auth_params,
+				api_key,
+				handle_list_peers_request,
 			)),
 			path => {
 				let error = format!("Unknown request: {}", path).into_bytes();

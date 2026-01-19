@@ -27,12 +27,12 @@ use ldk_server_client::ldk_server_protos::api::{
 	ExportPathfindingScoresRequest, ForceCloseChannelRequest, ForceCloseChannelResponse,
 	GetBalancesRequest, GetBalancesResponse, GetNodeInfoRequest, GetNodeInfoResponse,
 	GetPaymentDetailsRequest, GetPaymentDetailsResponse, ListChannelsRequest, ListChannelsResponse,
-	ListForwardedPaymentsRequest, ListPaymentsRequest, OnchainReceiveRequest,
-	OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse, OpenChannelRequest,
-	OpenChannelResponse, SignMessageRequest, SignMessageResponse, SpliceInRequest,
-	SpliceInResponse, SpliceOutRequest, SpliceOutResponse, SpontaneousSendRequest,
-	SpontaneousSendResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
-	VerifySignatureRequest, VerifySignatureResponse,
+	ListForwardedPaymentsRequest, ListPaymentsRequest, ListPaymentsResponse, ListPeersRequest,
+	ListPeersResponse, OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest,
+	OnchainSendResponse, OpenChannelRequest, OpenChannelResponse, SignMessageRequest,
+	SignMessageResponse, SpliceInRequest, SpliceInResponse, SpliceOutRequest, SpliceOutResponse,
+	SpontaneousSendRequest, SpontaneousSendResponse, UpdateChannelConfigRequest,
+	UpdateChannelConfigResponse, VerifySignatureRequest, VerifySignatureResponse,
 };
 use ldk_server_client::ldk_server_protos::types::{
 	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig, PageToken,
@@ -397,6 +397,8 @@ enum Commands {
 	},
 	#[command(about = "Export the pathfinding scores used by the router")]
 	ExportPathfindingScores,
+	#[command(about = "List all known peers")]
+	ListPeers,
 	#[command(about = "Generate shell completions for the CLI")]
 	Completions {
 		#[arg(
@@ -792,6 +794,11 @@ async fn main() {
 						json!({ "pathfinding_scores": scores_hex })
 					},
 				),
+			);
+		},
+		Commands::ListPeers => {
+			handle_response_result::<_, ListPeersResponse>(
+				client.list_peers(ListPeersRequest {}).await,
 			);
 		},
 		Commands::Completions { .. } => unreachable!("Handled above"),
