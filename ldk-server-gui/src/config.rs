@@ -1,3 +1,6 @@
+//! Configuration loading and saving - mostly used on native platforms only.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 
 use hex::DisplayHex;
@@ -5,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// GUI-specific config extracted from ldk-server config file.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct GuiConfig {
     pub server_url: String,
     pub api_key: String,
@@ -81,6 +85,7 @@ pub enum ChainSourceConfig {
 }
 
 impl ChainSourceConfig {
+    #[allow(dead_code)]
     pub fn source_type(&self) -> ChainSourceType {
         match self {
             ChainSourceConfig::None => ChainSourceType::None,
@@ -172,15 +177,20 @@ impl TryFrom<TomlConfig> for GuiConfig {
     }
 }
 
+/// Parse config from TOML string content.
+pub fn parse_config_from_str(contents: &str) -> Result<GuiConfig, String> {
+    let toml_config: TomlConfig =
+        toml::from_str(contents).map_err(|e| format!("Failed to parse config: {}", e))?;
+
+    GuiConfig::try_from(toml_config)
+}
+
 /// Try to load config from a file path.
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuiConfig, String> {
     let contents = std::fs::read_to_string(path.as_ref())
         .map_err(|e| format!("Failed to read config file: {}", e))?;
 
-    let toml_config: TomlConfig =
-        toml::from_str(&contents).map_err(|e| format!("Failed to parse config file: {}", e))?;
-
-    GuiConfig::try_from(toml_config)
+    parse_config_from_str(&contents)
 }
 
 /// Search for config file in common locations and load it.

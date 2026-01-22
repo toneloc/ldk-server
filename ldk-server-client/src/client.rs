@@ -7,7 +7,11 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(target_arch = "wasm32")]
+use js_sys;
 
 use bitcoin_hashes::hmac::{Hmac, HmacEngine};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
@@ -32,7 +36,9 @@ use ldk_server_protos::endpoints::{
 use ldk_server_protos::error::{ErrorCode, ErrorResponse};
 use prost::Message;
 use reqwest::header::CONTENT_TYPE;
-use reqwest::{Certificate, Client};
+use reqwest::Client;
+#[cfg(not(target_arch = "wasm32"))]
+use reqwest::Certificate;
 
 use crate::error::LdkServerError;
 use crate::error::LdkServerErrorCode::{
@@ -60,6 +66,10 @@ impl LdkServerClient {
 	/// `api_key` is used for HMAC-based authentication.
 	/// `server_cert_pem` is the server's TLS certificate in PEM format. This can be
 	/// found at `<server_storage_dir>/tls.crt` after the server starts.
+	///
+	/// Note: On WASM targets, the certificate parameter is ignored as the browser
+	/// handles TLS verification.
+	#[cfg(not(target_arch = "wasm32"))]
 	pub fn new(base_url: String, api_key: String, server_cert_pem: &[u8]) -> Result<Self, String> {
 		let cert = Certificate::from_pem(server_cert_pem)
 			.map_err(|e| format!("Failed to parse server certificate: {e}"))?;
@@ -72,13 +82,44 @@ impl LdkServerClient {
 		Ok(Self { base_url, client, api_key })
 	}
 
+	/// Constructs a [`LdkServerClient`] for WASM targets.
+	///
+	/// `base_url` should not include the scheme, e.g., `localhost:3000`.
+	/// `api_key` is used for HMAC-based authentication.
+	///
+	/// On WASM, the browser handles TLS verification automatically.
+	#[cfg(target_arch = "wasm32")]
+	pub fn new(base_url: String, api_key: String, _server_cert_pem: &[u8]) -> Result<Self, String> {
+		let client = Client::builder()
+			.build()
+			.map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+		Ok(Self { base_url, client, api_key })
+	}
+
+	/// Constructs a [`LdkServerClient`] without requiring a TLS certificate.
+	///
+	/// This is useful for WASM targets where the browser handles TLS, or for
+	/// development environments where certificate verification is handled differently.
+	pub fn new_without_cert(base_url: String, api_key: String) -> Result<Self, String> {
+		let client = Client::builder()
+			.build()
+			.map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+		Ok(Self { base_url, client, api_key })
+	}
+
 	/// Computes the HMAC-SHA256 authentication header value.
 	/// Format: "HMAC <timestamp>:<hmac_hex>"
 	fn compute_auth_header(&self, body: &[u8]) -> String {
+		#[cfg(not(target_arch = "wasm32"))]
 		let timestamp = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.expect("System time should be after Unix epoch")
 			.as_secs();
+
+		#[cfg(target_arch = "wasm32")]
+		let timestamp = (js_sys::Date::now() / 1000.0) as u64;
 
 		// Compute HMAC-SHA256(api_key, timestamp_bytes || body)
 		let mut hmac_engine: HmacEngine<sha256::Hash> = HmacEngine::new(self.api_key.as_bytes());

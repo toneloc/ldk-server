@@ -1,8 +1,10 @@
 use std::sync::Arc;
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
-use tokio::task::JoinHandle;
 
 use crate::config::{ChainSourceConfig, ChainSourceType};
+use crate::task::ChannelTaskHandle;
 use ldk_server_client::client::LdkServerClient;
 use ldk_server_client::ldk_server_protos::api::{
     Bolt11ReceiveResponse, Bolt11SendResponse, Bolt12ReceiveResponse, Bolt12SendResponse,
@@ -13,7 +15,6 @@ use ldk_server_client::ldk_server_protos::api::{
 };
 use ldk_server_client::ldk_server_protos::types::PageToken;
 
-pub type AsyncTaskResult<T> = Result<T, String>;
 
 #[derive(Clone, PartialEq, Default)]
 pub enum ConnectionStatus {
@@ -114,7 +115,8 @@ pub struct ConnectPeerForm {
     pub persist: bool,
 }
 
-/// Editable chain source configuration
+/// Editable chain source configuration (used on native only)
+#[allow(dead_code)]
 #[derive(Default, Clone)]
 pub struct ChainSourceForm {
     pub source_type: ChainSourceType,
@@ -126,6 +128,7 @@ pub struct ChainSourceForm {
     pub server_url: String,
 }
 
+#[allow(dead_code)]
 impl ChainSourceForm {
     pub fn from_config(config: &ChainSourceConfig) -> Self {
         match config {
@@ -181,13 +184,19 @@ pub struct Forms {
     pub update_channel_config: UpdateChannelConfigForm,
     pub close_channel: CloseChannelForm,
     pub connect_peer: ConnectPeerForm,
+    #[allow(dead_code)]
     pub chain_source: ChainSourceForm,
 }
 
 pub struct StatusMessage {
     pub text: String,
     pub is_error: bool,
+    #[allow(dead_code)]
+    #[cfg(not(target_arch = "wasm32"))]
     pub timestamp: Instant,
+    #[allow(dead_code)]
+    #[cfg(target_arch = "wasm32")]
+    pub timestamp: f64,
 }
 
 impl StatusMessage {
@@ -195,7 +204,10 @@ impl StatusMessage {
         Self {
             text: text.into(),
             is_error: false,
+            #[cfg(not(target_arch = "wasm32"))]
             timestamp: Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            timestamp: 0.0, // Could use js_sys::Date::now() if needed
         }
     }
 
@@ -203,29 +215,32 @@ impl StatusMessage {
         Self {
             text: text.into(),
             is_error: true,
+            #[cfg(not(target_arch = "wasm32"))]
             timestamp: Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            timestamp: 0.0,
         }
     }
 }
 
 pub struct AsyncTasks {
-    pub node_info: Option<JoinHandle<AsyncTaskResult<GetNodeInfoResponse>>>,
-    pub balances: Option<JoinHandle<AsyncTaskResult<GetBalancesResponse>>>,
-    pub channels: Option<JoinHandle<AsyncTaskResult<ListChannelsResponse>>>,
-    pub payments: Option<JoinHandle<AsyncTaskResult<ListPaymentsResponse>>>,
-    pub onchain_receive: Option<JoinHandle<AsyncTaskResult<OnchainReceiveResponse>>>,
-    pub onchain_send: Option<JoinHandle<AsyncTaskResult<OnchainSendResponse>>>,
-    pub bolt11_receive: Option<JoinHandle<AsyncTaskResult<Bolt11ReceiveResponse>>>,
-    pub bolt11_send: Option<JoinHandle<AsyncTaskResult<Bolt11SendResponse>>>,
-    pub bolt12_receive: Option<JoinHandle<AsyncTaskResult<Bolt12ReceiveResponse>>>,
-    pub bolt12_send: Option<JoinHandle<AsyncTaskResult<Bolt12SendResponse>>>,
-    pub open_channel: Option<JoinHandle<AsyncTaskResult<OpenChannelResponse>>>,
-    pub close_channel: Option<JoinHandle<AsyncTaskResult<CloseChannelResponse>>>,
-    pub force_close_channel: Option<JoinHandle<AsyncTaskResult<ForceCloseChannelResponse>>>,
-    pub splice_in: Option<JoinHandle<AsyncTaskResult<SpliceInResponse>>>,
-    pub splice_out: Option<JoinHandle<AsyncTaskResult<SpliceOutResponse>>>,
-    pub update_channel_config: Option<JoinHandle<AsyncTaskResult<UpdateChannelConfigResponse>>>,
-    pub connect_peer: Option<JoinHandle<AsyncTaskResult<ConnectPeerResponse>>>,
+    pub node_info: Option<ChannelTaskHandle<GetNodeInfoResponse>>,
+    pub balances: Option<ChannelTaskHandle<GetBalancesResponse>>,
+    pub channels: Option<ChannelTaskHandle<ListChannelsResponse>>,
+    pub payments: Option<ChannelTaskHandle<ListPaymentsResponse>>,
+    pub onchain_receive: Option<ChannelTaskHandle<OnchainReceiveResponse>>,
+    pub onchain_send: Option<ChannelTaskHandle<OnchainSendResponse>>,
+    pub bolt11_receive: Option<ChannelTaskHandle<Bolt11ReceiveResponse>>,
+    pub bolt11_send: Option<ChannelTaskHandle<Bolt11SendResponse>>,
+    pub bolt12_receive: Option<ChannelTaskHandle<Bolt12ReceiveResponse>>,
+    pub bolt12_send: Option<ChannelTaskHandle<Bolt12SendResponse>>,
+    pub open_channel: Option<ChannelTaskHandle<OpenChannelResponse>>,
+    pub close_channel: Option<ChannelTaskHandle<CloseChannelResponse>>,
+    pub force_close_channel: Option<ChannelTaskHandle<ForceCloseChannelResponse>>,
+    pub splice_in: Option<ChannelTaskHandle<SpliceInResponse>>,
+    pub splice_out: Option<ChannelTaskHandle<SpliceOutResponse>>,
+    pub update_channel_config: Option<ChannelTaskHandle<UpdateChannelConfigResponse>>,
+    pub connect_peer: Option<ChannelTaskHandle<ConnectPeerResponse>>,
 }
 
 impl Default for AsyncTasks {
@@ -278,11 +293,13 @@ pub struct AppState {
     // Connection settings
     pub server_url: String,
     pub api_key: String,
+    #[allow(dead_code)] // Used only on native
     pub tls_cert_path: String,
     pub connection_status: ConnectionStatus,
     pub client: Option<Arc<LdkServerClient>>,
 
     // Config info (from loaded config file)
+    #[allow(dead_code)] // Used only on native
     pub config_file_path: Option<String>,
     pub network: String,
     pub chain_source: ChainSourceConfig,
@@ -319,6 +336,8 @@ pub struct AppState {
     pub show_splice_out_dialog: bool,
     pub show_update_config_dialog: bool,
     pub show_connect_peer_dialog: bool,
+    pub show_load_config_dialog: bool,
+    pub config_paste_text: String,
     pub lightning_tab: LightningTab,
     pub onchain_tab: OnchainTab,
 }
@@ -379,6 +398,8 @@ impl Default for AppState {
             show_splice_out_dialog: false,
             show_update_config_dialog: false,
             show_connect_peer_dialog: false,
+            show_load_config_dialog: false,
+            config_paste_text: String::new(),
             lightning_tab: LightningTab::default(),
             onchain_tab: OnchainTab::default(),
         }

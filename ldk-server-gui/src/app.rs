@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::{egui, App, Frame};
-use futures_util::FutureExt;
+
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::runtime::Runtime;
 
 use ldk_server_client::client::LdkServerClient;
@@ -17,66 +18,110 @@ use ldk_server_client::ldk_server_protos::types::{
     bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::config;
-use crate::state::{ActiveTab, AppState, ChainSourceForm, ConnectionStatus, StatusMessage};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::state::ChainSourceForm;
+use crate::state::{ActiveTab, AppState, ConnectionStatus, StatusMessage};
+use crate::task;
 use crate::ui;
 
 pub struct LdkServerApp {
     pub state: AppState,
+    #[cfg(not(target_arch = "wasm32"))]
     pub rt: Runtime,
 }
 
 impl LdkServerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let mut state = AppState::default();
+        #[cfg(not(target_arch = "wasm32"))]
+        let state = {
+            let mut state = AppState::default();
+            // Try to load config from file and populate connection settings
+            if let Some(gui_config) = config::find_and_load_config() {
+                state.server_url = gui_config.server_url;
+                state.api_key = gui_config.api_key;
+                state.tls_cert_path = gui_config.tls_cert_path;
+                state.network = gui_config.network;
+                state.forms.chain_source = ChainSourceForm::from_config(&gui_config.chain_source);
+                state.chain_source = gui_config.chain_source;
+                state.status_message =
+                    Some(StatusMessage::success("Config loaded from ldk-server-config.toml"));
+            }
+            state
+        };
 
-        // Try to load config from file and populate connection settings
-        if let Some(gui_config) = config::find_and_load_config() {
-            state.server_url = gui_config.server_url;
-            state.api_key = gui_config.api_key;
-            state.tls_cert_path = gui_config.tls_cert_path;
-            state.network = gui_config.network;
-            state.forms.chain_source = ChainSourceForm::from_config(&gui_config.chain_source);
-            state.chain_source = gui_config.chain_source;
-            state.status_message =
-                Some(StatusMessage::success("Config loaded from ldk-server-config.toml"));
+        #[cfg(target_arch = "wasm32")]
+        let state = AppState::default();
+
+        Self {
+            state,
+            #[cfg(not(target_arch = "wasm32"))]
+            rt: Runtime::new().expect("Failed to create tokio runtime"),
         }
-
-        Self { state, rt: Runtime::new().expect("Failed to create tokio runtime") }
     }
 
     pub fn connect(&mut self) {
         let url = self.state.server_url.trim().to_string();
         let api_key = self.state.api_key.clone();
-        let cert_path = self.state.tls_cert_path.trim().to_string();
 
-        if url.is_empty() || api_key.is_empty() || cert_path.is_empty() {
-            self.state.status_message =
-                Some(StatusMessage::error("Please fill in all connection fields"));
-            return;
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cert_path = self.state.tls_cert_path.trim().to_string();
 
-        let cert_data = match std::fs::read(&cert_path) {
-            Ok(data) => data,
-            Err(e) => {
+            if url.is_empty() || api_key.is_empty() || cert_path.is_empty() {
                 self.state.status_message =
-                    Some(StatusMessage::error(format!("Failed to read TLS cert: {}", e)));
+                    Some(StatusMessage::error("Please fill in all connection fields"));
                 return;
             }
-        };
 
-        match LdkServerClient::new(url.clone(), api_key, &cert_data) {
-            Ok(client) => {
-                self.state.client = Some(Arc::new(client));
-                self.state.connection_status = ConnectionStatus::Connected;
-                self.state.status_message = Some(StatusMessage::success("Connected"));
-                self.fetch_node_info();
-                self.fetch_balances();
-                self.fetch_channels();
+            let cert_data = match std::fs::read(&cert_path) {
+                Ok(data) => data,
+                Err(e) => {
+                    self.state.status_message =
+                        Some(StatusMessage::error(format!("Failed to read TLS cert: {}", e)));
+                    return;
+                }
+            };
+
+            match LdkServerClient::new(url.clone(), api_key, &cert_data) {
+                Ok(client) => {
+                    self.state.client = Some(Arc::new(client));
+                    self.state.connection_status = ConnectionStatus::Connected;
+                    self.state.status_message = Some(StatusMessage::success("Connected"));
+                    self.fetch_node_info();
+                    self.fetch_balances();
+                    self.fetch_channels();
+                }
+                Err(e) => {
+                    self.state.connection_status = ConnectionStatus::Error(e.clone());
+                    self.state.status_message = Some(StatusMessage::error(e));
+                }
             }
-            Err(e) => {
-                self.state.connection_status = ConnectionStatus::Error(e.clone());
-                self.state.status_message = Some(StatusMessage::error(e));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if url.is_empty() || api_key.is_empty() {
+                self.state.status_message =
+                    Some(StatusMessage::error("Please fill in server URL and API key"));
+                return;
+            }
+
+            // On WASM, the browser handles TLS - no certificate needed
+            match LdkServerClient::new(url.clone(), api_key, &[]) {
+                Ok(client) => {
+                    self.state.client = Some(Arc::new(client));
+                    self.state.connection_status = ConnectionStatus::Connected;
+                    self.state.status_message = Some(StatusMessage::success("Connected"));
+                    self.fetch_node_info();
+                    self.fetch_balances();
+                    self.fetch_channels();
+                }
+                Err(e) => {
+                    self.state.connection_status = ConnectionStatus::Error(e.clone());
+                    self.state.status_message = Some(StatusMessage::error(e));
+                }
             }
         }
     }
@@ -91,13 +136,32 @@ impl LdkServerApp {
         self.state.status_message = Some(StatusMessage::success("Disconnected"));
     }
 
+    /// Spawns an async task using the appropriate runtime for the platform
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_task<T, F>(&self, future: F) -> task::ChannelTaskHandle<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    {
+        task::spawn_with_runtime(&self.rt, future)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_task<T, F>(&self, future: F) -> task::ChannelTaskHandle<T>
+    where
+        T: 'static,
+        F: std::future::Future<Output = Result<T, String>> + 'static,
+    {
+        task::spawn_local(future)
+    }
+
     pub fn fetch_node_info(&mut self) {
         if self.state.tasks.node_info.is_some() {
             return;
         }
         if let Some(client) = &self.state.client {
             let client = client.clone();
-            self.state.tasks.node_info = Some(self.rt.spawn(async move {
+            self.state.tasks.node_info = Some(self.spawn_task(async move {
                 client.get_node_info(GetNodeInfoRequest {}).await.map_err(|e| e.to_string())
             }));
         }
@@ -109,7 +173,7 @@ impl LdkServerApp {
         }
         if let Some(client) = &self.state.client {
             let client = client.clone();
-            self.state.tasks.balances = Some(self.rt.spawn(async move {
+            self.state.tasks.balances = Some(self.spawn_task(async move {
                 client.get_balances(GetBalancesRequest {}).await.map_err(|e| e.to_string())
             }));
         }
@@ -121,7 +185,7 @@ impl LdkServerApp {
         }
         if let Some(client) = &self.state.client {
             let client = client.clone();
-            self.state.tasks.channels = Some(self.rt.spawn(async move {
+            self.state.tasks.channels = Some(self.spawn_task(async move {
                 client.list_channels(ListChannelsRequest {}).await.map_err(|e| e.to_string())
             }));
         }
@@ -134,7 +198,7 @@ impl LdkServerApp {
         if let Some(client) = &self.state.client {
             let client = client.clone();
             let page_token = self.state.payments_page_token.clone();
-            self.state.tasks.payments = Some(self.rt.spawn(async move {
+            self.state.tasks.payments = Some(self.spawn_task(async move {
                 client
                     .list_payments(ListPaymentsRequest { page_token })
                     .await
@@ -149,7 +213,7 @@ impl LdkServerApp {
         }
         if let Some(client) = &self.state.client {
             let client = client.clone();
-            self.state.tasks.onchain_receive = Some(self.rt.spawn(async move {
+            self.state.tasks.onchain_receive = Some(self.spawn_task(async move {
                 client.onchain_receive(OnchainReceiveRequest {}).await.map_err(|e| e.to_string())
             }));
         }
@@ -172,7 +236,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.onchain_send = Some(self.rt.spawn(async move {
+            self.state.tasks.onchain_send = Some(self.spawn_task(async move {
                 client
                     .onchain_send(OnchainSendRequest {
                         address,
@@ -205,7 +269,7 @@ impl LdkServerApp {
             };
 
             let client = client.clone();
-            self.state.tasks.bolt11_receive = Some(self.rt.spawn(async move {
+            self.state.tasks.bolt11_receive = Some(self.spawn_task(async move {
                 client
                     .bolt11_receive(Bolt11ReceiveRequest {
                         amount_msat,
@@ -233,7 +297,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.bolt11_send = Some(self.rt.spawn(async move {
+            self.state.tasks.bolt11_send = Some(self.spawn_task(async move {
                 client
                     .bolt11_send(Bolt11SendRequest { invoice, amount_msat, route_parameters: None })
                     .await
@@ -259,7 +323,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.bolt12_receive = Some(self.rt.spawn(async move {
+            self.state.tasks.bolt12_receive = Some(self.spawn_task(async move {
                 client
                     .bolt12_receive(Bolt12ReceiveRequest {
                         description,
@@ -294,7 +358,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.bolt12_send = Some(self.rt.spawn(async move {
+            self.state.tasks.bolt12_send = Some(self.spawn_task(async move {
                 client
                     .bolt12_send(Bolt12SendRequest {
                         offer,
@@ -342,7 +406,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.open_channel = Some(self.rt.spawn(async move {
+            self.state.tasks.open_channel = Some(self.spawn_task(async move {
                 client
                     .open_channel(OpenChannelRequest {
                         node_pubkey,
@@ -375,7 +439,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.close_channel = Some(self.rt.spawn(async move {
+            self.state.tasks.close_channel = Some(self.spawn_task(async move {
                 client
                     .close_channel(CloseChannelRequest { user_channel_id, counterparty_node_id })
                     .await
@@ -406,7 +470,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.force_close_channel = Some(self.rt.spawn(async move {
+            self.state.tasks.force_close_channel = Some(self.spawn_task(async move {
                 client
                     .force_close_channel(ForceCloseChannelRequest {
                         user_channel_id,
@@ -444,7 +508,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.splice_in = Some(self.rt.spawn(async move {
+            self.state.tasks.splice_in = Some(self.spawn_task(async move {
                 client
                     .splice_in(SpliceInRequest {
                         user_channel_id,
@@ -484,7 +548,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.splice_out = Some(self.rt.spawn(async move {
+            self.state.tasks.splice_out = Some(self.spawn_task(async move {
                 client
                     .splice_out(SpliceOutRequest {
                         user_channel_id,
@@ -528,7 +592,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.update_channel_config = Some(self.rt.spawn(async move {
+            self.state.tasks.update_channel_config = Some(self.spawn_task(async move {
                 client
                     .update_channel_config(UpdateChannelConfigRequest {
                         user_channel_id,
@@ -558,7 +622,7 @@ impl LdkServerApp {
             }
 
             let client = client.clone();
-            self.state.tasks.connect_peer = Some(self.rt.spawn(async move {
+            self.state.tasks.connect_peer = Some(self.spawn_task(async move {
                 client
                     .connect_peer(ConnectPeerRequest { node_pubkey, address, persist })
                     .await
@@ -571,18 +635,14 @@ impl LdkServerApp {
         macro_rules! poll_task {
             ($task:expr => |$val:ident| $handler:expr) => {
                 if let Some(t) = &mut $task {
-                    if let Some(res) = t.now_or_never() {
+                    if let Some(res) = t.try_take() {
                         $task = None;
                         match res {
-                            Ok(Ok($val)) => {
+                            Ok($val) => {
                                 $handler
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 self.state.status_message = Some(StatusMessage::error(e));
-                            }
-                            Err(join_err) => {
-                                self.state.status_message =
-                                    Some(StatusMessage::error(join_err.to_string()));
                             }
                         }
                     } else {
@@ -785,5 +845,6 @@ impl App for LdkServerApp {
         });
 
         ui::channels::render_dialogs(ctx, self);
+        ui::connection::render_load_config_dialog(ctx, self);
     }
 }

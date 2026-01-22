@@ -57,6 +57,45 @@ Or run the release binary directly:
 ./target/release/ldk-server-gui
 ```
 
+## Running in Browser (WASM)
+
+The GUI can also run in a web browser using WebAssembly.
+
+### Prerequisites
+
+Install [Trunk](https://trunkrs.dev/), a WASM web application bundler:
+
+```bash
+cargo install trunk
+```
+
+### Building and Running
+
+From the `ldk-server-gui` directory:
+
+```bash
+cd ldk-server-gui
+
+# Development server with hot reload
+trunk serve
+
+# Or build for production
+trunk build --release
+```
+
+The development server runs at `http://127.0.0.1:8080` by default.
+
+### Browser Limitations
+
+When running in the browser:
+- **TLS certificates** are handled by the browser, so the TLS Cert Path field is not needed
+- **File dialogs** are not available. Use the **Load Config** button to paste your `ldk-server-config.toml` contents directly
+- **Auto-loading** of config files is not supported; you must paste the config manually
+
+### CORS Configuration
+
+Your ldk-server must allow CORS requests from the browser origin. If you encounter CORS errors, ensure your server is configured to accept requests from `http://127.0.0.1:8080` (or wherever Trunk is serving).
+
 ## Configuration
 
 ### Auto-loading from Config File
