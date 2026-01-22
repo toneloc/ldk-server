@@ -4,11 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["native"]
+native = []
 serde = ["ldk-server-protos/serde"]
 
 [dependencies]
 ldk-server-protos = { path = "../ldk-server-protos" }
-reqwest = { version = "0.11.13", default-features = false, features = ["rustls-tls"] }
 prost = { version = "0.11.6", default-features = false, features = ["std", "prost-derive"] }
 bitcoin_hashes = "0.14"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.12", default-features = false }
+js-sys = "0.3"
