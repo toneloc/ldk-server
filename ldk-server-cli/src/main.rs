@@ -9,7 +9,8 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use config::{
 	get_default_api_key_path, get_default_cert_path, get_default_config_path, load_config,
 };
@@ -22,20 +23,20 @@ use ldk_server_client::error::LdkServerErrorCode::{
 use ldk_server_client::ldk_server_protos::api::{
 	Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11SendRequest, Bolt11SendResponse,
 	Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
-	CloseChannelRequest, CloseChannelResponse, ConnectPeerRequest, ConnectPeerResponse,
-	ForceCloseChannelRequest, ForceCloseChannelResponse, GetBalancesRequest, GetBalancesResponse,
-	GetNodeInfoRequest, GetNodeInfoResponse, ListChannelsRequest, ListChannelsResponse,
-	ListPaymentsRequest, ListPaymentsResponse, ListPeersRequest, ListPeersResponse,
-	OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse,
-	OpenChannelRequest, OpenChannelResponse, SpliceInRequest, SpliceInResponse, SpliceOutRequest,
-	SpliceOutResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
+	CloseChannelRequest, CloseChannelResponse, ForceCloseChannelRequest, ForceCloseChannelResponse,
+	GetBalancesRequest, GetBalancesResponse, GetNodeInfoRequest, GetNodeInfoResponse,
+	GetPaymentDetailsRequest, GetPaymentDetailsResponse, ListChannelsRequest, ListChannelsResponse,
+	ListForwardedPaymentsRequest, ListPaymentsRequest, OnchainReceiveRequest,
+	OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse, OpenChannelRequest,
+	OpenChannelResponse, SpliceInRequest, SpliceInResponse, SpliceOutRequest, SpliceOutResponse,
+	UpdateChannelConfigRequest, UpdateChannelConfigResponse,
 };
 use ldk_server_client::ldk_server_protos::types::{
 	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig, PageToken,
 	RouteParametersConfig,
 };
 use serde::Serialize;
-use types::CliListPaymentsResponse;
+use types::{CliListForwardedPaymentsResponse, CliListPaymentsResponse, CliPaginatedResponse};
 
 mod config;
 mod types;
@@ -294,7 +295,22 @@ enum Commands {
 		#[arg(help = "Page token to continue from a previous page (format: token:index)")]
 		page_token: Option<String>,
 	},
-	#[command(about = "Update the config for a previously opened channel")]
+	#[command(about = "Get details of a specific payment by its payment ID")]
+	GetPaymentDetails {
+		#[arg(short, long, help = "The payment ID in hex-encoded form")]
+		payment_id: String,
+	},
+	#[command(about = "Retrieves list of all forwarded payments")]
+	ListForwardedPayments {
+		#[arg(
+			short,
+			long,
+			help = "Fetch at least this many forwarded payments by iterating through multiple pages. Returns combined results with the last page token. If not provided, returns only a single page."
+		)]
+		number_of_payments: Option<u64>,
+		#[arg(long, help = "Page token to continue from a previous page (format: token:index)")]
+		page_token: Option<String>,
+	},
 	UpdateChannelConfig {
 		#[arg(short, long, help = "The local user_channel_id of this channel")]
 		user_channel_id: String,
@@ -320,25 +336,25 @@ enum Commands {
 		)]
 		cltv_expiry_delta: Option<u32>,
 	},
-	ConnectPeer {
-		#[arg(short, long, help = "The hex-encoded public key of the node to connect to")]
-		node_pubkey: String,
-		#[arg(short, long, help = "Address of the peer (e.g., 127.0.0.1:9735)")]
-		address: String,
+	#[command(about = "Generate shell completions for the CLI")]
+	Completions {
 		#[arg(
-			short,
-			long,
-			default_value = "true",
-			help = "Whether to persist the connection for reconnection on restart"
+			value_enum,
+			help = "The shell to generate completions for (bash, zsh, fish, powershell, elvish)"
 		)]
-		persist: bool,
+		shell: Shell,
 	},
-	ListPeers,
 }
 
 #[tokio::main]
 async fn main() {
 	let cli = Cli::parse();
+
+	// short-circuit if generating completions
+	if let Commands::Completions { shell } = cli.command {
+		generate(shell, &mut Cli::command(), "ldk-server-cli", &mut std::io::stdout());
+		return;
+	}
 
 	let config_path = cli.config.map(PathBuf::from).or_else(get_default_config_path);
 	let config = config_path.as_ref().and_then(|p| load_config(p).ok());
@@ -599,7 +615,36 @@ async fn main() {
 				.map(|token_str| parse_page_token(&token_str).unwrap_or_else(|e| handle_error(e)));
 
 			handle_response_result::<_, CliListPaymentsResponse>(
-				handle_list_payments(client, number_of_payments, page_token).await,
+				fetch_paginated(
+					number_of_payments,
+					page_token,
+					|pt| client.list_payments(ListPaymentsRequest { page_token: pt }),
+					|r| (r.payments, r.next_page_token),
+				)
+				.await,
+			);
+		},
+		Commands::GetPaymentDetails { payment_id } => {
+			handle_response_result::<_, GetPaymentDetailsResponse>(
+				client.get_payment_details(GetPaymentDetailsRequest { payment_id }).await,
+			);
+		},
+		Commands::ListForwardedPayments { number_of_payments, page_token } => {
+			let page_token = page_token
+				.map(|token_str| parse_page_token(&token_str).unwrap_or_else(|e| handle_error(e)));
+
+			handle_response_result::<_, CliListForwardedPaymentsResponse>(
+				fetch_paginated(
+					number_of_payments,
+					page_token,
+					|pt| {
+						client.list_forwarded_payments(ListForwardedPaymentsRequest {
+							page_token: pt,
+						})
+					},
+					|r| (r.forwarded_payments, r.next_page_token),
+				)
+				.await,
 			);
 		},
 		Commands::UpdateChannelConfig {
@@ -628,18 +673,7 @@ async fn main() {
 					.await,
 			);
 		},
-		Commands::ConnectPeer { node_pubkey, address, persist } => {
-			handle_response_result::<_, ConnectPeerResponse>(
-				client
-					.connect_peer(ConnectPeerRequest { node_pubkey, address, persist })
-					.await,
-			);
-		},
-		Commands::ListPeers => {
-			handle_response_result::<_, ListPeersResponse>(
-				client.list_peers(ListPeersRequest {}).await,
-			);
-		},
+		Commands::Completions { .. } => unreachable!("Handled above"),
 	}
 }
 
@@ -665,37 +699,40 @@ fn build_open_channel_config(
 	})
 }
 
-async fn handle_list_payments(
-	client: LdkServerClient, number_of_payments: Option<u64>, initial_page_token: Option<PageToken>,
-) -> Result<ListPaymentsResponse, LdkServerError> {
-	if let Some(count) = number_of_payments {
-		list_n_payments(client, count, initial_page_token).await
-	} else {
-		// Fetch single page
-		client.list_payments(ListPaymentsRequest { page_token: initial_page_token }).await
+async fn fetch_paginated<T, R, Fut>(
+	target_count: Option<u64>, initial_page_token: Option<PageToken>,
+	fetch_page: impl Fn(Option<PageToken>) -> Fut,
+	extract: impl Fn(R) -> (Vec<T>, Option<PageToken>),
+) -> Result<CliPaginatedResponse<T>, LdkServerError>
+where
+	Fut: std::future::Future<Output = Result<R, LdkServerError>>,
+{
+	match target_count {
+		Some(count) => {
+			let mut items = Vec::with_capacity(count as usize);
+			let mut page_token = initial_page_token;
+			let mut next_page_token;
+
+			loop {
+				let response = fetch_page(page_token).await?;
+				let (new_items, new_next_page_token) = extract(response);
+				items.extend(new_items);
+				next_page_token = new_next_page_token;
+
+				if items.len() >= count as usize || next_page_token.is_none() {
+					break;
+				}
+				page_token = next_page_token;
+			}
+
+			Ok(CliPaginatedResponse::new(items, next_page_token))
+		},
+		None => {
+			let response = fetch_page(initial_page_token).await?;
+			let (items, next_page_token) = extract(response);
+			Ok(CliPaginatedResponse::new(items, next_page_token))
+		},
 	}
-}
-
-async fn list_n_payments(
-	client: LdkServerClient, target_count: u64, initial_page_token: Option<PageToken>,
-) -> Result<ListPaymentsResponse, LdkServerError> {
-	let mut payments = Vec::with_capacity(target_count as usize);
-	let mut page_token = initial_page_token;
-	let mut next_page_token;
-
-	loop {
-		let response = client.list_payments(ListPaymentsRequest { page_token }).await?;
-
-		payments.extend(response.payments);
-		next_page_token = response.next_page_token;
-
-		if payments.len() >= target_count as usize || next_page_token.is_none() {
-			break;
-		}
-		page_token = next_page_token;
-	}
-
-	Ok(ListPaymentsResponse { payments, next_page_token })
 }
 
 fn handle_response_result<Rs, Js>(response: Result<Rs, LdkServerError>)

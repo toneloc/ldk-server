@@ -20,18 +20,20 @@ use ldk_server_protos::api::{
 	Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
 	CloseChannelRequest, CloseChannelResponse, ConnectPeerRequest, ConnectPeerResponse,
 	ForceCloseChannelRequest, ForceCloseChannelResponse, GetBalancesRequest, GetBalancesResponse,
-	GetNodeInfoRequest, GetNodeInfoResponse, ListChannelsRequest, ListChannelsResponse,
-	ListPaymentsRequest, ListPaymentsResponse, ListPeersRequest, ListPeersResponse,
-	OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse,
-	OpenChannelRequest, OpenChannelResponse, SpliceInRequest, SpliceInResponse, SpliceOutRequest,
-	SpliceOutResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
+	GetNodeInfoRequest, GetNodeInfoResponse, GetPaymentDetailsRequest, GetPaymentDetailsResponse,
+	ListChannelsRequest, ListChannelsResponse, ListForwardedPaymentsRequest,
+	ListForwardedPaymentsResponse, ListPaymentsRequest, ListPaymentsResponse, ListPeersRequest,
+	ListPeersResponse, OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest,
+	OnchainSendResponse, OpenChannelRequest, OpenChannelResponse, SpliceInRequest,
+	SpliceInResponse, SpliceOutRequest, SpliceOutResponse, UpdateChannelConfigRequest,
+	UpdateChannelConfigResponse,
 };
 use ldk_server_protos::endpoints::{
 	BOLT11_RECEIVE_PATH, BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH,
 	CLOSE_CHANNEL_PATH, CONNECT_PEER_PATH, FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH,
-	GET_NODE_INFO_PATH, LIST_CHANNELS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH,
-	ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH, SPLICE_IN_PATH, SPLICE_OUT_PATH,
-	UPDATE_CHANNEL_CONFIG_PATH,
+	GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH, LIST_CHANNELS_PATH, LIST_FORWARDED_PAYMENTS_PATH,
+	LIST_PAYMENTS_PATH, LIST_PEERS_PATH, ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH,
+	SPLICE_IN_PATH, SPLICE_OUT_PATH, UPDATE_CHANNEL_CONFIG_PATH,
 };
 use ldk_server_protos::error::{ErrorCode, ErrorResponse};
 use prost::Message;
@@ -84,24 +86,9 @@ impl LdkServerClient {
 
 	/// Constructs a [`LdkServerClient`] for WASM targets.
 	///
-	/// `base_url` should not include the scheme, e.g., `localhost:3000`.
-	/// `api_key` is used for HMAC-based authentication.
-	///
 	/// On WASM, the browser handles TLS verification automatically.
 	#[cfg(target_arch = "wasm32")]
 	pub fn new(base_url: String, api_key: String, _server_cert_pem: &[u8]) -> Result<Self, String> {
-		let client = Client::builder()
-			.build()
-			.map_err(|e| format!("Failed to build HTTP client: {e}"))?;
-
-		Ok(Self { base_url, client, api_key })
-	}
-
-	/// Constructs a [`LdkServerClient`] without requiring a TLS certificate.
-	///
-	/// This is useful for WASM targets where the browser handles TLS, or for
-	/// development environments where certificate verification is handled differently.
-	pub fn new_without_cert(base_url: String, api_key: String) -> Result<Self, String> {
 		let client = Client::builder()
 			.build()
 			.map_err(|e| format!("Failed to build HTTP client: {e}"))?;
@@ -271,6 +258,24 @@ impl LdkServerClient {
 		&self, request: UpdateChannelConfigRequest,
 	) -> Result<UpdateChannelConfigResponse, LdkServerError> {
 		let url = format!("https://{}/{UPDATE_CHANNEL_CONFIG_PATH}", self.base_url);
+		self.post_request(&request, &url).await
+	}
+
+	/// Retrieves payment details for a given payment id.
+	/// For API contract/usage, refer to docs for [`GetPaymentDetailsRequest`] and [`GetPaymentDetailsResponse`].
+	pub async fn get_payment_details(
+		&self, request: GetPaymentDetailsRequest,
+	) -> Result<GetPaymentDetailsResponse, LdkServerError> {
+		let url = format!("https://{}/{GET_PAYMENT_DETAILS_PATH}", self.base_url);
+		self.post_request(&request, &url).await
+	}
+
+	/// Retrieves list of all forwarded payments.
+	/// For API contract/usage, refer to docs for [`ListForwardedPaymentsRequest`] and [`ListForwardedPaymentsResponse`].
+	pub async fn list_forwarded_payments(
+		&self, request: ListForwardedPaymentsRequest,
+	) -> Result<ListForwardedPaymentsResponse, LdkServerError> {
+		let url = format!("https://{}/{LIST_FORWARDED_PAYMENTS_PATH}", self.base_url);
 		self.post_request(&request, &url).await
 	}
 

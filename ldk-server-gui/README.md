@@ -137,4 +137,4 @@ When running in the browser:
 
 ### CORS Configuration
 
-Your ldk-server must allow CORS requests from the browser origin. If you encounter CORS errors, ensure your server is configured to accept requests from `http://127.0.0.1:8080` (or wherever Trunk is serving).
+The ldk-server includes built-in CORS support for `http://localhost:8080`, which is the default Trunk development server address. No additional configuration is needed for local development.
