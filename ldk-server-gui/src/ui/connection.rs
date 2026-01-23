@@ -33,7 +33,14 @@ pub fn render_settings(ui: &mut Ui, app: &mut LdkServerApp) {
             ui.end_row();
 
             ui.label("API Key:");
-            ui.add(egui::TextEdit::singleline(&mut app.state.api_key).password(true));
+            ui.vertical(|ui| {
+                ui.text_edit_singleline(&mut app.state.api_key);
+                ui.label(
+                    egui::RichText::new("Auto-generated at <storage_dir>/<network>/api_key. Get hex: xxd -p <path>/api_key | tr -d '\\n'")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+            });
             ui.end_row();
 
             // TLS cert path is only needed on native (browser handles TLS)

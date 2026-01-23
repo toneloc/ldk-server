@@ -57,6 +57,46 @@ Or run the release binary directly:
 ./target/release/ldk-server-gui
 ```
 
+## Configuration
+
+The GUI automatically searches for `ldk-server-config.toml` in these locations:
+- Current directory
+- `../ldk-server/` directory
+- Parent directory
+- Path specified in `LDK_SERVER_CONFIG` environment variable
+
+When found, the connection settings are auto-populated from the config file, including the auto-generated API key.
+
+You can also click **Load Config** to browse for a config file.
+
+### Manual Configuration
+
+If no config file is loaded, configure the connection manually:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| Server URL | The ldk-server REST API address (without `https://`) | `localhost:3002` |
+| API Key | Hex-encoded API key (see below) | `4181fc9f...` |
+| TLS Cert Path | Path to the server's TLS certificate | `/tmp/ldk-server/tls.crt` |
+
+**Note on API Key:** The server auto-generates a random API key on first startup and stores it at `<storage_dir>/<network>/api_key`. To get the hex-encoded key manually:
+```bash
+xxd -p /tmp/ldk-server/regtest/api_key | tr -d '\n'
+```
+
+The TLS certificate is also auto-generated and located at `<storage_dir>/tls.crt`.
+
+Click **Connect** to establish a connection.
+
+## Features
+
+- **Node Info** - View node ID, block height, sync timestamps, and chain source info
+- **Balances** - View on-chain and lightning balances
+- **Channels** - List, open, close, force-close, splice, and update channel config
+- **Payments** - View payment history with pagination
+- **Lightning** - Send and receive via BOLT11 invoices and BOLT12 offers
+- **On-chain** - Send and receive on-chain transactions
+
 ## Running in Browser (WASM)
 
 The GUI can also run in a web browser using WebAssembly.
@@ -89,52 +129,12 @@ The development server runs at `http://127.0.0.1:8080` by default.
 
 When running in the browser:
 - **TLS certificates** are handled by the browser, so the TLS Cert Path field is not needed
-- **File dialogs** are not available. Use the **Load Config** button to paste your `ldk-server-config.toml` contents directly
-- **Auto-loading** of config files is not supported; you must paste the config manually
+- **File dialogs** are not available; click **Load Config** to paste your `ldk-server-config.toml` contents instead
+- **API Key** must be entered manually (the config file doesn't contain it). Get it with:
+  ```bash
+  xxd -p /tmp/ldk-server/regtest/api_key | tr -d '\n'
+  ```
 
 ### CORS Configuration
 
 Your ldk-server must allow CORS requests from the browser origin. If you encounter CORS errors, ensure your server is configured to accept requests from `http://127.0.0.1:8080` (or wherever Trunk is serving).
-
-## Configuration
-
-### Auto-loading from Config File
-
-The GUI automatically searches for `ldk-server-config.toml` in these locations:
-- Current directory
-- `../ldk-server/` directory
-- Parent directory
-- Path specified in `LDK_SERVER_CONFIG` environment variable
-
-When found, the connection settings are auto-populated from the config file, including the auto-generated API key.
-
-You can also click **Load Config** to manually browse for a config file.
-
-### Manual Configuration
-
-If no config file is found, configure the connection manually in the **Node Info** tab:
-
-| Field | Description | Example |
-|-------|-------------|---------|
-| Server URL | The ldk-server REST API address (without `https://`) | `localhost:3002` |
-| API Key | Hex-encoded API key (see below) | `4181fc9f...` |
-| TLS Cert Path | Path to the server's TLS certificate | `/tmp/ldk-server/tls.crt` |
-
-**Note on API Key:** The server auto-generates a random API key on first startup and stores it at `<storage_dir>/<network>/api_key`. To get the hex-encoded key manually:
-```bash
-xxd -p /tmp/ldk-server/regtest/api_key | tr -d '\n'
-```
-
-The TLS certificate is also auto-generated and located at `<storage_dir>/tls.crt`.
-
-Click **Connect** to establish a connection.
-
-## Features
-
-- **Node Info** - View node ID, block height, sync timestamps, and chain source info
-- **Balances** - View on-chain and lightning balances
-- **Channels** - List, open, close, force-close, splice, and update channel config
-- **Payments** - View payment history with pagination
-- **Lightning** - Send and receive via BOLT11 invoices and BOLT12 offers
-- **On-chain** - Send and receive on-chain transactions
-
