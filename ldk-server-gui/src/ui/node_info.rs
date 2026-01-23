@@ -1,4 +1,6 @@
 use egui::Ui;
+#[cfg(target_arch = "wasm32")]
+use web_sys::js_sys;
 
 use crate::app::LdkServerApp;
 use crate::config::ChainSourceConfig;
@@ -87,13 +89,19 @@ pub fn render(ui: &mut Ui, app: &mut LdkServerApp) {
 }
 
 fn format_timestamp(ts: u64) -> String {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    let datetime = UNIX_EPOCH + Duration::from_secs(ts);
-    let now = SystemTime::now();
+    // Get current time - use js_sys on WASM, SystemTime on native
+    #[cfg(target_arch = "wasm32")]
+    let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Calculate how long ago
-    if let Ok(elapsed) = now.duration_since(datetime) {
-        let secs = elapsed.as_secs();
+    if now_secs >= ts {
+        let secs = now_secs - ts;
         if secs < 60 {
             format!("{} seconds ago", secs)
         } else if secs < 3600 {

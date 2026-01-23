@@ -631,7 +631,7 @@ impl LdkServerApp {
         }
     }
 
-    fn poll_tasks(&mut self, ctx: &egui::Context) {
+    fn poll_tasks(&mut self, _ctx: &egui::Context) {
         macro_rules! poll_task {
             ($task:expr => |$val:ident| $handler:expr) => {
                 if let Some(t) = &mut $task {
@@ -645,9 +645,8 @@ impl LdkServerApp {
                                 self.state.status_message = Some(StatusMessage::error(e));
                             }
                         }
-                    } else {
-                        ctx.request_repaint();
                     }
+                    // Note: repaint is handled by update() with request_repaint_after()
                 }
             };
         }
