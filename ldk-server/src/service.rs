@@ -13,8 +13,11 @@ use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
+use hyper::header::{
+	ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+};
 use hyper::service::Service;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use ldk_node::bitcoin::hashes::hmac::{Hmac, HmacEngine};
 use ldk_node::bitcoin::hashes::{sha256, Hash, HashEngine};
 use ldk_node::Node;
@@ -53,6 +56,24 @@ use crate::util::proto_adapter::to_error_response;
 // Maximum request body size: 10 MB
 // This prevents memory exhaustion from large requests
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Adds CORS headers to a response builder (restricted to localhost)
+fn cors_headers(
+	builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+	builder
+		.header(ACCESS_CONTROL_ALLOW_ORIGIN, "http://localhost:8080")
+		.header(ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
+		.header(ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, X-Auth")
+}
+
+/// Creates a CORS preflight response
+fn cors_preflight_response() -> Response<Full<Bytes>> {
+	cors_headers(Response::builder())
+		.status(StatusCode::NO_CONTENT)
+		.body(Full::new(Bytes::new()))
+		.unwrap()
+}
 
 #[derive(Clone)]
 pub struct NodeService {
@@ -149,13 +170,18 @@ impl Service<Request<Incoming>> for NodeService {
 	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
 	fn call(&self, req: Request<Incoming>) -> Self::Future {
+		// Handle CORS preflight requests
+		if req.method() == Method::OPTIONS {
+			return Box::pin(async { Ok(cors_preflight_response()) });
+		}
+
 		// Extract auth params from headers (validation happens after body is read)
 		let auth_params = match extract_auth_params(&req) {
 			Ok(params) => params,
 			Err(e) => {
 				let (error_response, status_code) = to_error_response(e);
 				return Box::pin(async move {
-					Ok(Response::builder()
+					Ok(cors_headers(Response::builder())
 						.status(status_code)
 						.body(Full::new(Bytes::from(error_response.encode_to_vec())))
 						// unwrap safety: body only errors when previous chained calls failed.
@@ -311,7 +337,7 @@ impl Service<Request<Incoming>> for NodeService {
 			path => {
 				let error = format!("Unknown request: {}", path).into_bytes();
 				Box::pin(async {
-					Ok(Response::builder()
+					Ok(cors_headers(Response::builder())
 						.status(StatusCode::BAD_REQUEST)
 						.body(Full::new(Bytes::from(error)))
 						// unwrap safety: body only errors when previous chained calls failed.
@@ -339,7 +365,7 @@ async fn handle_request<
 				InvalidRequestError,
 				"Request body too large or failed to read.",
 			));
-			return Ok(Response::builder()
+			return Ok(cors_headers(Response::builder())
 				.status(status_code)
 				.body(Full::new(Bytes::from(error_response.encode_to_vec())))
 				// unwrap safety: body only errors when previous chained calls failed.
@@ -352,7 +378,7 @@ async fn handle_request<
 		validate_hmac_auth(auth_params.timestamp, &auth_params.hmac_hex, &bytes, &api_key)
 	{
 		let (error_response, status_code) = to_error_response(e);
-		return Ok(Response::builder()
+		return Ok(cors_headers(Response::builder())
 			.status(status_code)
 			.body(Full::new(Bytes::from(error_response.encode_to_vec())))
 			// unwrap safety: body only errors when previous chained calls failed.
@@ -361,13 +387,13 @@ async fn handle_request<
 
 	match T::decode(bytes) {
 		Ok(request) => match handler(context, request) {
-			Ok(response) => Ok(Response::builder()
+			Ok(response) => Ok(cors_headers(Response::builder())
 				.body(Full::new(Bytes::from(response.encode_to_vec())))
 				// unwrap safety: body only errors when previous chained calls failed.
 				.unwrap()),
 			Err(e) => {
 				let (error_response, status_code) = to_error_response(e);
-				Ok(Response::builder()
+				Ok(cors_headers(Response::builder())
 					.status(status_code)
 					.body(Full::new(Bytes::from(error_response.encode_to_vec())))
 					// unwrap safety: body only errors when previous chained calls failed.
@@ -377,7 +403,7 @@ async fn handle_request<
 		Err(_) => {
 			let (error_response, status_code) =
 				to_error_response(LdkServerError::new(InvalidRequestError, "Malformed request."));
-			Ok(Response::builder()
+			Ok(cors_headers(Response::builder())
 				.status(status_code)
 				.body(Full::new(Bytes::from(error_response.encode_to_vec())))
 				// unwrap safety: body only errors when previous chained calls failed.
