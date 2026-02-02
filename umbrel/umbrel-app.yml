@@ -1,0 +1,26 @@
+manifestVersion: 1
+id: ldk-server
+name: LDK Server
+tagline: Lightning node powered by LDK
+icon: https://raw.githubusercontent.com/lightningdevkit/ldk-node/main/logo.svg
+category: bitcoin
+version: "1.0.0"
+port: 8080
+description: >-
+  A self-hosted Lightning Network node built with the Lightning Development Kit (LDK).
+  Features a web-based GUI for managing channels, payments, and node operations.
+  Supports BOLT11 and BOLT12 payments, channel splicing, and payment forwarding.
+developer: LDK
+website: https://lightningdevkit.org
+submitter: Community
+submission: https://github.com/getumbrel/umbrel-apps
+repo: https://github.com/lightningdevkit/ldk-node
+support: https://github.com/lightningdevkit/ldk-node/issues
+gallery:
+  - https://raw.githubusercontent.com/lightningdevkit/ldk-node/main/logo.svg
+releaseNotes: >-
+  Initial release of LDK Server for Umbrel.
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""

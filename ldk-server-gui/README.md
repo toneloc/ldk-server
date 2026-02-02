@@ -138,3 +138,57 @@ When running in the browser:
 ### CORS Configuration
 
 Your ldk-server must allow CORS requests from the browser origin. If you encounter CORS errors, ensure your server is configured to accept requests from `http://127.0.0.1:8080` (or wherever Trunk is serving).
+
+## Umbrel App
+
+The GUI can be deployed as an Umbrel app using the files in `umbrel/`.
+
+### Testing Locally with Docker
+
+1. Build the WASM GUI:
+   ```bash
+   cd ldk-server-gui
+   trunk build --release
+   ```
+
+2. Run with Docker Compose:
+   ```bash
+   cd ../umbrel
+   export APP_DATA_DIR="$(pwd)/data"
+   export APP_LDK_SERVER_IP=172.20.0.2
+   export APP_LDK_WEB_IP=172.20.0.3
+
+   docker compose up --build
+   ```
+
+3. Open `http://localhost:8080` in your browser.
+
+### Deploying to Umbrel
+
+**Option 1: Custom App Store**
+1. Push the repo to GitHub
+2. On Umbrel: Settings → App Store → Add your repo URL
+
+**Option 2: Direct Install**
+```bash
+ssh umbrel@umbrel.local
+cd ~/umbrel/app-data
+git clone <your-repo> ldk-server
+~/umbrel/scripts/app install ldk-server
+```
+
+**Option 3: Community App Store**
+1. Fork `github.com/getumbrel/umbrel-apps`
+2. Add the `umbrel/` folder as `ldk-server/`
+3. Submit a PR
+
+### Architecture
+
+The Umbrel deployment uses nginx as a reverse proxy:
+
+```
+Browser → nginx:8080 → /api/* → ldk-server:3002 (internal)
+                     → /*     → WASM GUI (static files)
+```
+
+This eliminates CORS issues since everything is served from the same origin.

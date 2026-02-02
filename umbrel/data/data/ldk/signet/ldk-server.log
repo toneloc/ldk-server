@@ -1,0 +1,42 @@
+[2026-02-02T02:01:27.038Z INFO  ldk_server:261] Starting up...
+[2026-02-02T02:01:27.039Z INFO  ldk_node:250] Starting up LDK Node with node ID 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80 on network: signet
+[2026-02-02T02:01:27.389Z INFO  ldk_node::chain::esplora:334] Fee rate cache update finished in 349ms.
+[2026-02-02T02:01:27.396Z INFO  ldk_node:664] Startup complete.
+[2026-02-02T02:01:27.398Z INFO  ldk_server:270] CONNECTION_STRING: 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80@0.0.0.0:3001
+[2026-02-02T02:01:27.404Z INFO  ldk_server:309] TLS enabled for REST service on 0.0.0.0:3002
+[2026-02-02T02:01:27.938Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 541ms.
+[2026-02-02T02:01:30.807Z INFO  ldk_node::chain::esplora:200] Sync of on-chain wallet finished in 2864ms.
+[2026-02-02T02:01:54.607Z INFO  ldk_server:480] Received SIGTERM, shutting down..
+[2026-02-02T02:01:54.608Z INFO  ldk_node:678] Shutting down LDK Node with node ID 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80...
+[2026-02-02T02:01:54.617Z INFO  ldk_node:730] Shutdown complete.
+[2026-02-02T02:01:54.617Z INFO  ldk_server:488] Shutdown complete..
+[2026-02-02T02:02:01.963Z INFO  ldk_server:261] Starting up...
+[2026-02-02T02:02:01.963Z INFO  ldk_node:250] Starting up LDK Node with node ID 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80 on network: signet
+[2026-02-02T02:02:02.094Z INFO  ldk_node::chain::esplora:334] Fee rate cache update finished in 129ms.
+[2026-02-02T02:02:02.096Z INFO  ldk_node:664] Startup complete.
+[2026-02-02T02:02:02.097Z INFO  ldk_server:270] CONNECTION_STRING: 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80@0.0.0.0:3001
+[2026-02-02T02:02:02.099Z INFO  ldk_server:309] TLS enabled for REST service on 0.0.0.0:3002
+[2026-02-02T02:02:02.372Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 273ms.
+[2026-02-02T02:02:02.424Z INFO  ldk_node::chain::esplora:189] Incremental sync of on-chain wallet finished in 46ms.
+[2026-02-02T02:02:32.824Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 725ms.
+[2026-02-02T02:03:02.342Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 245ms.
+[2026-02-02T02:03:22.167Z INFO  ldk_node::chain::esplora:189] Incremental sync of on-chain wallet finished in 65ms.
+[2026-02-02T02:03:32.316Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 219ms.
+[2026-02-02T02:04:03.006Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 907ms.
+[2026-02-02T02:04:05.152Z INFO  ldk_server:480] Received SIGTERM, shutting down..
+[2026-02-02T02:04:05.154Z INFO  ldk_node:678] Shutting down LDK Node with node ID 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80...
+[2026-02-02T02:04:05.159Z INFO  ldk_node:730] Shutdown complete.
+[2026-02-02T02:04:05.160Z INFO  ldk_server:488] Shutdown complete..
+[2026-02-02T02:04:24.194Z INFO  ldk_server:261] Starting up...
+[2026-02-02T02:04:24.195Z INFO  ldk_node:250] Starting up LDK Node with node ID 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80 on network: signet
+[2026-02-02T02:04:24.341Z INFO  ldk_node::chain::esplora:334] Fee rate cache update finished in 144ms.
+[2026-02-02T02:04:24.343Z INFO  ldk_node:664] Startup complete.
+[2026-02-02T02:04:24.344Z INFO  ldk_server:270] CONNECTION_STRING: 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80@0.0.0.0:3001
+[2026-02-02T02:04:24.356Z INFO  ldk_server:309] TLS enabled for REST service on 0.0.0.0:3002
+[2026-02-02T02:04:24.450Z INFO  ldk_node::chain::esplora:189] Incremental sync of on-chain wallet finished in 105ms.
+[2026-02-02T02:04:25.099Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 646ms.
+[2026-02-02T02:04:54.615Z INFO  ldk_node::chain::esplora:250] Sync of Lightning wallet finished in 266ms.
+[2026-02-02T02:04:56.984Z INFO  ldk_server:480] Received SIGTERM, shutting down..
+[2026-02-02T02:04:56.985Z INFO  ldk_node:678] Shutting down LDK Node with node ID 027faf6c4d5184303e9454877e5348e9d1793e722e04ff4b300ea31e6566972d80...
+[2026-02-02T02:04:56.993Z INFO  ldk_node:730] Shutdown complete.
+[2026-02-02T02:04:56.994Z INFO  ldk_server:488] Shutdown complete..

@@ -1,0 +1,40 @@
+version: "3.7"
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: umbrel/Dockerfile
+      target: server
+    restart: unless-stopped
+    stop_grace_period: 1m
+    ports:
+      - "3001:3001"  # Lightning P2P (external)
+    expose:
+      - "3002"       # REST API (internal only, proxied via nginx)
+    volumes:
+      - ${APP_DATA_DIR:-./data}/data:/data
+    environment:
+      - LDK_NETWORK=${LDK_NETWORK:-signet}
+      - LDK_ESPLORA_URL=${LDK_ESPLORA_URL:-https://mutinynet.com/api}
+      - LDK_ALIAS=${LDK_ALIAS:-umbrel-ldk}
+      - LDK_REST_ADDRESS=0.0.0.0:3002
+      - LDK_LISTENING_ADDRESS=0.0.0.0:3001
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sko /dev/null https://localhost:3002 || [ $? -eq 22 ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  web:
+    build:
+      context: ..
+      dockerfile: umbrel/Dockerfile
+      target: web
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      server:
+        condition: service_healthy
