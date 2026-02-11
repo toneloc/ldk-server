@@ -9,7 +9,8 @@ use ldk_server_client::client::LdkServerClient;
 use ldk_server_client::ldk_server_protos::api::{
     Bolt11ReceiveResponse, Bolt11SendResponse, Bolt12ReceiveResponse, Bolt12SendResponse,
     CloseChannelResponse, ConnectPeerResponse, ForceCloseChannelResponse, GetBalancesResponse,
-    GetNodeInfoResponse, ListChannelsResponse, ListPaymentsResponse, OnchainReceiveResponse,
+    GetNodeInfoResponse, GetPaymentDetailsResponse, ListChannelsResponse,
+    ListForwardedPaymentsResponse, ListPaymentsResponse, ListPeersResponse, OnchainReceiveResponse,
     OnchainSendResponse, OpenChannelResponse, SpliceInResponse, SpliceOutResponse,
     UpdateChannelConfigResponse,
 };
@@ -30,7 +31,9 @@ pub enum ActiveTab {
     NodeInfo,
     Balances,
     Channels,
+    Peers,
     Payments,
+    ForwardedPayments,
     Lightning,
     Onchain,
 }
@@ -228,6 +231,9 @@ pub struct AsyncTasks {
     pub balances: Option<ChannelTaskHandle<GetBalancesResponse>>,
     pub channels: Option<ChannelTaskHandle<ListChannelsResponse>>,
     pub payments: Option<ChannelTaskHandle<ListPaymentsResponse>>,
+    pub peers: Option<ChannelTaskHandle<ListPeersResponse>>,
+    pub forwarded_payments: Option<ChannelTaskHandle<ListForwardedPaymentsResponse>>,
+    pub payment_details: Option<ChannelTaskHandle<GetPaymentDetailsResponse>>,
     pub onchain_receive: Option<ChannelTaskHandle<OnchainReceiveResponse>>,
     pub onchain_send: Option<ChannelTaskHandle<OnchainSendResponse>>,
     pub bolt11_receive: Option<ChannelTaskHandle<Bolt11ReceiveResponse>>,
@@ -250,6 +256,9 @@ impl Default for AsyncTasks {
             balances: None,
             channels: None,
             payments: None,
+            peers: None,
+            forwarded_payments: None,
+            payment_details: None,
             onchain_receive: None,
             onchain_send: None,
             bolt11_receive: None,
@@ -273,6 +282,9 @@ impl AsyncTasks {
             || self.balances.is_some()
             || self.channels.is_some()
             || self.payments.is_some()
+            || self.peers.is_some()
+            || self.forwarded_payments.is_some()
+            || self.payment_details.is_some()
             || self.onchain_receive.is_some()
             || self.onchain_send.is_some()
             || self.bolt11_receive.is_some()
@@ -313,6 +325,10 @@ pub struct AppState {
     pub channels: Option<ListChannelsResponse>,
     pub payments: Option<ListPaymentsResponse>,
     pub payments_page_token: Option<PageToken>,
+    pub peers: Option<ListPeersResponse>,
+    pub forwarded_payments: Option<ListForwardedPaymentsResponse>,
+    pub forwarded_payments_page_token: Option<PageToken>,
+    pub payment_details: Option<GetPaymentDetailsResponse>,
 
     // Operation results
     pub onchain_address: Option<String>,
@@ -329,6 +345,7 @@ pub struct AppState {
     pub forms: Forms,
 
     // UI state
+    pub auto_connect_pending: bool,
     pub status_message: Option<StatusMessage>,
     pub show_open_channel_dialog: bool,
     pub show_close_channel_dialog: bool,
@@ -337,6 +354,8 @@ pub struct AppState {
     pub show_update_config_dialog: bool,
     pub show_connect_peer_dialog: bool,
     pub show_load_config_dialog: bool,
+    pub show_payment_details_dialog: bool,
+    pub payment_details_id: String,
     pub config_paste_text: String,
     pub lightning_tab: LightningTab,
     pub onchain_tab: OnchainTab,
@@ -379,6 +398,10 @@ impl Default for AppState {
             channels: None,
             payments: None,
             payments_page_token: None,
+            peers: None,
+            forwarded_payments: None,
+            forwarded_payments_page_token: None,
+            payment_details: None,
 
             onchain_address: None,
             generated_invoice: None,
@@ -391,6 +414,7 @@ impl Default for AppState {
 
             forms: Forms::default(),
 
+            auto_connect_pending: false,
             status_message: None,
             show_open_channel_dialog: false,
             show_close_channel_dialog: false,
@@ -399,6 +423,8 @@ impl Default for AppState {
             show_update_config_dialog: false,
             show_connect_peer_dialog: false,
             show_load_config_dialog: false,
+            show_payment_details_dialog: false,
+            payment_details_id: String::new(),
             config_paste_text: String::new(),
             lightning_tab: LightningTab::default(),
             onchain_tab: OnchainTab::default(),

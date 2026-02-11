@@ -1,10 +1,12 @@
 pub mod balances;
 pub mod channels;
 pub mod connection;
+pub mod forwarded_payments;
 pub mod lightning;
 pub mod node_info;
 pub mod onchain;
 pub mod payments;
+pub mod peers;
 
 pub fn truncate_id(s: &str, start: usize, end: usize) -> String {
     if s.len() <= start + end + 2 {

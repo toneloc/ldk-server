@@ -10,7 +10,8 @@ use ldk_server_client::client::LdkServerClient;
 use ldk_server_client::ldk_server_protos::api::{
     Bolt11ReceiveRequest, Bolt11SendRequest, Bolt12ReceiveRequest, Bolt12SendRequest,
     CloseChannelRequest, ConnectPeerRequest, ForceCloseChannelRequest, GetBalancesRequest,
-    GetNodeInfoRequest, ListChannelsRequest, ListPaymentsRequest, OnchainReceiveRequest,
+    GetNodeInfoRequest, GetPaymentDetailsRequest, ListChannelsRequest,
+    ListForwardedPaymentsRequest, ListPaymentsRequest, ListPeersRequest, OnchainReceiveRequest,
     OnchainSendRequest, OpenChannelRequest, SpliceInRequest, SpliceOutRequest,
     UpdateChannelConfigRequest,
 };
@@ -45,8 +46,7 @@ impl LdkServerApp {
                 state.network = gui_config.network;
                 state.forms.chain_source = ChainSourceForm::from_config(&gui_config.chain_source);
                 state.chain_source = gui_config.chain_source;
-                state.status_message =
-                    Some(StatusMessage::success("Config loaded from ldk-server-config.toml"));
+                state.auto_connect_pending = true; // Auto-connect on first update
             }
             state
         };
@@ -201,6 +201,49 @@ impl LdkServerApp {
             self.state.tasks.payments = Some(self.spawn_task(async move {
                 client
                     .list_payments(ListPaymentsRequest { page_token })
+                    .await
+                    .map_err(|e| e.to_string())
+            }));
+        }
+    }
+
+    pub fn fetch_peers(&mut self) {
+        if self.state.tasks.peers.is_some() {
+            return;
+        }
+        if let Some(client) = &self.state.client {
+            let client = client.clone();
+            self.state.tasks.peers = Some(self.spawn_task(async move {
+                client.list_peers(ListPeersRequest {}).await.map_err(|e| e.to_string())
+            }));
+        }
+    }
+
+    pub fn fetch_forwarded_payments(&mut self) {
+        if self.state.tasks.forwarded_payments.is_some() {
+            return;
+        }
+        if let Some(client) = &self.state.client {
+            let client = client.clone();
+            let page_token = self.state.forwarded_payments_page_token.clone();
+            self.state.tasks.forwarded_payments = Some(self.spawn_task(async move {
+                client
+                    .list_forwarded_payments(ListForwardedPaymentsRequest { page_token })
+                    .await
+                    .map_err(|e| e.to_string())
+            }));
+        }
+    }
+
+    pub fn fetch_payment_details(&mut self, payment_id: String) {
+        if self.state.tasks.payment_details.is_some() {
+            return;
+        }
+        if let Some(client) = &self.state.client {
+            let client = client.clone();
+            self.state.tasks.payment_details = Some(self.spawn_task(async move {
+                client
+                    .get_payment_details(GetPaymentDetailsRequest { payment_id })
                     .await
                     .map_err(|e| e.to_string())
             }));
@@ -668,6 +711,19 @@ impl LdkServerApp {
             self.state.payments = Some(v);
         });
 
+        poll_task!(self.state.tasks.peers => |v| {
+            self.state.peers = Some(v);
+        });
+
+        poll_task!(self.state.tasks.forwarded_payments => |v| {
+            self.state.forwarded_payments_page_token = v.next_page_token.clone();
+            self.state.forwarded_payments = Some(v);
+        });
+
+        poll_task!(self.state.tasks.payment_details => |v| {
+            self.state.payment_details = Some(v);
+        });
+
         poll_task!(self.state.tasks.onchain_receive => |v| {
             self.state.onchain_address = Some(v.address);
             self.state.status_message = Some(StatusMessage::success("Address generated"));
@@ -775,6 +831,12 @@ impl App for LdkServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         self.poll_tasks(ctx);
 
+        // Auto-connect if config was loaded at startup
+        if self.state.auto_connect_pending {
+            self.state.auto_connect_pending = false;
+            self.connect();
+        }
+
         if self.state.tasks.any_pending() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -796,7 +858,9 @@ impl App for LdkServerApp {
                 (ActiveTab::NodeInfo, "Node Info"),
                 (ActiveTab::Balances, "Balances"),
                 (ActiveTab::Channels, "Channels"),
-                (ActiveTab::Payments, "Payment History"),
+                (ActiveTab::Peers, "Peers"),
+                (ActiveTab::Payments, "Payments"),
+                (ActiveTab::ForwardedPayments, "Forwarded"),
                 (ActiveTab::Lightning, "Lightning"),
                 (ActiveTab::Onchain, "On-chain"),
             ];
@@ -837,7 +901,9 @@ impl App for LdkServerApp {
                 ActiveTab::NodeInfo => ui::node_info::render(ui, self),
                 ActiveTab::Balances => ui::balances::render(ui, self),
                 ActiveTab::Channels => ui::channels::render(ui, self),
+                ActiveTab::Peers => ui::peers::render(ui, self),
                 ActiveTab::Payments => ui::payments::render(ui, self),
+                ActiveTab::ForwardedPayments => ui::forwarded_payments::render(ui, self),
                 ActiveTab::Lightning => ui::lightning::render(ui, self),
                 ActiveTab::Onchain => ui::onchain::render(ui, self),
             }
@@ -845,5 +911,6 @@ impl App for LdkServerApp {
 
         ui::channels::render_dialogs(ctx, self);
         ui::connection::render_load_config_dialog(ctx, self);
+        ui::payments::render_dialogs(ctx, self);
     }
 }

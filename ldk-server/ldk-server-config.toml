@@ -2,7 +2,7 @@
 
 # Lightning node settings
 [node]
-network = "regtest"                           # Bitcoin network to use
+network = "signet"                            # Bitcoin network to use (mutinynet)
 alias = "ldk-regtest"                         # REQUIRED for announcement (<=32 bytes, printable)
 listening_addresses = ["127.0.0.1:3001"]      # Lightning node listening addresses
 announcement_addresses = ["127.0.0.1:3001"]   # Announcement addresses
@@ -30,7 +30,7 @@ hosts = ["localhost"]
 # ─────────────────────────────────────────────
 
 [esplora]
-server_url = "https://mempool.space/api"  
+server_url = "https://mutinynet.com/api"  
 
 # ─────────────────────────────────────────────
 # Optional / features

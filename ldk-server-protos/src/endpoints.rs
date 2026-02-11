@@ -15,6 +15,7 @@ pub const BOLT11_RECEIVE_PATH: &str = "Bolt11Receive";
 pub const BOLT11_SEND_PATH: &str = "Bolt11Send";
 pub const BOLT12_RECEIVE_PATH: &str = "Bolt12Receive";
 pub const BOLT12_SEND_PATH: &str = "Bolt12Send";
+pub const KEYSEND_PATH: &str = "Keysend";
 pub const OPEN_CHANNEL_PATH: &str = "OpenChannel";
 pub const SPLICE_IN_PATH: &str = "SpliceIn";
 pub const SPLICE_OUT_PATH: &str = "SpliceOut";
