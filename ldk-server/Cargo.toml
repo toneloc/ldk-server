@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 ldk-node = "0.7.0"
-stable-channels = { path = "/Users/t/Drive/ldk-server/ldk-server" }
+stable-channels = { path = "../../2026/stable-channels" }
 serde = { version = "1.0.203", default-features = false, features = ["derive"] }
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 http-body-util = { version = "0.1", default-features = false }

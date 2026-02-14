@@ -11,12 +11,12 @@ api_key = "your-secret-api-key"               # API key for REST requests
 
 # Storage settings
 [storage.disk]
-dir_path = "/tmp/ldk-server/"                 # Path for LDK and BDK data persistence
+dir_path = "/Users/t/Library/Application Support/ldk-server/"
 
 # Logging
 [log]
-level = "Debug"                               # Error | Warn | Info | Debug | Trace
-file_path = "/tmp/ldk-server/ldk-server.log"
+level = "Debug"
+file_path = "/Users/t/Library/Application Support/ldk-server/ldk-server.log"
 
 # TLS
 [tls]

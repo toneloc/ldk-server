@@ -32,12 +32,17 @@ use ldk_server_protos::api::{
 };
 use ldk_server_protos::endpoints::{
 	BOLT11_RECEIVE_PATH, BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH,
-	CLOSE_CHANNEL_PATH, CONNECT_PEER_PATH, EXPORT_PATHFINDING_SCORES_PATH,
-	FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH, GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH,
-	LIST_CHANNELS_PATH, LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH,
-	ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH, SIGN_MESSAGE_PATH,
-	SPLICE_IN_PATH, SPLICE_OUT_PATH, SPONTANEOUS_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH,
-	VERIFY_SIGNATURE_PATH,
+	CLOSE_CHANNEL_PATH, CONNECT_PEER_PATH, EDIT_STABLE_CHANNEL_PATH,
+	EXPORT_PATHFINDING_SCORES_PATH, FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH,
+	GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH, GET_PRICE_PATH, LIST_CHANNELS_PATH,
+	LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH,
+	LIST_STABLE_CHANNELS_PATH, ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH,
+	SIGN_MESSAGE_PATH, SPLICE_IN_PATH, SPLICE_OUT_PATH, SPONTANEOUS_SEND_PATH,
+	UPDATE_CHANNEL_CONFIG_PATH, VERIFY_SIGNATURE_PATH,
+};
+use ldk_server_protos::stable::{
+	EditStableChannelRequest, EditStableChannelResponse, GetPriceRequest, GetPriceResponse,
+	ListStableChannelsRequest, ListStableChannelsResponse,
 };
 use ldk_server_protos::error::{ErrorCode, ErrorResponse};
 use prost::Message;
@@ -369,6 +374,29 @@ impl LdkServerClient {
 		self.post_request(&request, &url).await
 	}
 
+	/// Retrieves the current cached BTC/USD price.
+	pub async fn get_price(
+		&self, request: GetPriceRequest,
+	) -> Result<GetPriceResponse, LdkServerError> {
+		let url = self.build_url(GET_PRICE_PATH);
+		self.post_request(&request, &url).await
+	}
+
+	/// Lists all stable channels with their current state.
+	pub async fn list_stable_channels(
+		&self, request: ListStableChannelsRequest,
+	) -> Result<ListStableChannelsResponse, LdkServerError> {
+		let url = self.build_url(LIST_STABLE_CHANNELS_PATH);
+		self.post_request(&request, &url).await
+	}
+
+	/// Edits a stable channel's target USD amount or note.
+	pub async fn edit_stable_channel(
+		&self, request: EditStableChannelRequest,
+	) -> Result<EditStableChannelResponse, LdkServerError> {
+		let url = self.build_url(EDIT_STABLE_CHANNEL_PATH);
+		self.post_request(&request, &url).await
+	}
 
 	async fn post_request<Rq: Message, Rs: Message + Default>(
 		&self, request: &Rq, url: &str,

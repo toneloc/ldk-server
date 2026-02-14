@@ -7,6 +7,7 @@ pub mod node_info;
 pub mod onchain;
 pub mod payments;
 pub mod peers;
+pub mod stable_channels;
 
 pub fn truncate_id(s: &str, start: usize, end: usize) -> String {
     if s.len() <= start + end + 2 {

@@ -14,6 +14,9 @@ use ldk_server_client::ldk_server_protos::api::{
     OnchainSendResponse, OpenChannelResponse, SpliceInResponse, SpliceOutResponse,
     UpdateChannelConfigResponse,
 };
+use ldk_server_client::ldk_server_protos::stable::{
+    EditStableChannelResponse, GetPriceResponse, ListStableChannelsResponse,
+};
 use ldk_server_client::ldk_server_protos::types::PageToken;
 
 
@@ -36,6 +39,7 @@ pub enum ActiveTab {
     ForwardedPayments,
     Lightning,
     Onchain,
+    StableChannels,
 }
 
 #[derive(Default, Clone)]
@@ -118,6 +122,13 @@ pub struct ConnectPeerForm {
     pub persist: bool,
 }
 
+#[derive(Default, Clone)]
+pub struct EditStableChannelForm {
+    pub channel_id: String,
+    pub expected_usd: String,
+    pub note: String,
+}
+
 /// Editable chain source configuration (used on native only)
 #[allow(dead_code)]
 #[derive(Default, Clone)]
@@ -187,6 +198,7 @@ pub struct Forms {
     pub update_channel_config: UpdateChannelConfigForm,
     pub close_channel: CloseChannelForm,
     pub connect_peer: ConnectPeerForm,
+    pub edit_stable_channel: EditStableChannelForm,
     #[allow(dead_code)]
     pub chain_source: ChainSourceForm,
 }
@@ -247,6 +259,9 @@ pub struct AsyncTasks {
     pub splice_out: Option<ChannelTaskHandle<SpliceOutResponse>>,
     pub update_channel_config: Option<ChannelTaskHandle<UpdateChannelConfigResponse>>,
     pub connect_peer: Option<ChannelTaskHandle<ConnectPeerResponse>>,
+    pub get_price: Option<ChannelTaskHandle<GetPriceResponse>>,
+    pub list_stable_channels: Option<ChannelTaskHandle<ListStableChannelsResponse>>,
+    pub edit_stable_channel: Option<ChannelTaskHandle<EditStableChannelResponse>>,
 }
 
 impl Default for AsyncTasks {
@@ -272,6 +287,9 @@ impl Default for AsyncTasks {
             splice_out: None,
             update_channel_config: None,
             connect_peer: None,
+            get_price: None,
+            list_stable_channels: None,
+            edit_stable_channel: None,
         }
     }
 }
@@ -298,6 +316,9 @@ impl AsyncTasks {
             || self.splice_out.is_some()
             || self.update_channel_config.is_some()
             || self.connect_peer.is_some()
+            || self.get_price.is_some()
+            || self.list_stable_channels.is_some()
+            || self.edit_stable_channel.is_some()
     }
 }
 
@@ -329,6 +350,8 @@ pub struct AppState {
     pub forwarded_payments: Option<ListForwardedPaymentsResponse>,
     pub forwarded_payments_page_token: Option<PageToken>,
     pub payment_details: Option<GetPaymentDetailsResponse>,
+    pub price: Option<GetPriceResponse>,
+    pub stable_channels: Option<ListStableChannelsResponse>,
 
     // Operation results
     pub onchain_address: Option<String>,
@@ -402,6 +425,8 @@ impl Default for AppState {
             forwarded_payments: None,
             forwarded_payments_page_token: None,
             payment_details: None,
+            price: None,
+            stable_channels: None,
 
             onchain_address: None,
             generated_invoice: None,
