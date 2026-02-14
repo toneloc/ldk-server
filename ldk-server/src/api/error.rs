@@ -109,7 +109,6 @@ impl From<NodeError> for LdkServerError {
 			| NodeError::DuplicatePayment
 			| NodeError::InsufficientFunds
 			| NodeError::UnsupportedCurrency
-			| NodeError::HrnParsingFailed
 			| NodeError::LiquidityFeeTooHigh => (error.to_string(), LdkServerErrorCode::LightningError),
 			NodeError::AlreadyRunning
 			| NodeError::NotRunning
@@ -125,7 +124,6 @@ impl From<NodeError> for LdkServerError {
 			| NodeError::OnchainTxCreationFailed
 			| NodeError::OnchainTxSigningFailed
 			| NodeError::TxSyncFailed
-			| NodeError::InvalidScriptPubKey
 			| NodeError::TxSyncTimeout => (error.to_string(), LdkServerErrorCode::InternalServerError),
 		};
 		LdkServerError::new(error_code, message)

@@ -36,6 +36,7 @@ pub(crate) mod sign_message;
 pub(crate) mod splice_channel;
 pub(crate) mod spontaneous_send;
 pub(crate) mod update_channel_config;
+pub(crate) mod stable_channels;
 pub(crate) mod verify_signature;
 
 pub(crate) fn build_channel_config_from_proto(

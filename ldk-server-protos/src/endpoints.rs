@@ -32,3 +32,6 @@ pub const SIGN_MESSAGE_PATH: &str = "SignMessage";
 pub const VERIFY_SIGNATURE_PATH: &str = "VerifySignature";
 pub const EXPORT_PATHFINDING_SCORES_PATH: &str = "ExportPathfindingScores";
 pub const LIST_PEERS_PATH: &str = "ListPeers";
+pub const GET_PRICE_PATH: &str = "GetPrice";
+pub const LIST_STABLE_CHANNELS_PATH: &str = "ListStableChannels";
+pub const EDIT_STABLE_CHANNEL_PATH: &str = "EditStableChannel";

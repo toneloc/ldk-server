@@ -10,20 +10,20 @@
 mod api;
 mod io;
 mod service;
+pub mod stable_manager;
 mod util;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hex::DisplayHex;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use ldk_node::bitcoin::Network;
 use ldk_node::config::Config;
-use ldk_node::entropy::NodeEntropy;
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::{Builder, Event, Node};
 use ldk_server_protos::events;
@@ -47,6 +47,7 @@ use crate::io::persist::{
 	PAYMENTS_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::service::NodeService;
+use crate::stable_manager::StableChannelManager;
 use crate::util::config::{load_config, ChainSource};
 use crate::util::logger::ServerLogger;
 use crate::util::proto_adapter::{forwarded_payment_to_proto, payment_to_proto};
@@ -58,7 +59,7 @@ const API_KEY_FILE: &str = "api_key";
 fn get_default_data_dir() -> Option<PathBuf> {
 	#[cfg(target_os = "macos")]
 	{
-		#[allow(deprecated)] // todo can remove once we update MSRV to 1.87+
+		#[allow(deprecated)]
 		std::env::home_dir().map(|home| home.join("Library/Application Support/ldk-server"))
 	}
 	#[cfg(target_os = "windows")]
@@ -67,7 +68,7 @@ fn get_default_data_dir() -> Option<PathBuf> {
 	}
 	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 	{
-		#[allow(deprecated)] // todo can remove once we update MSRV to 1.87+
+		#[allow(deprecated)]
 		std::env::home_dir().map(|home| home.join(".ldk-server"))
 	}
 }
@@ -202,7 +203,6 @@ fn main() {
 		},
 	}
 
-	// LSPS2 support is highly experimental and for testing purposes only.
 	#[cfg(feature = "experimental-lsps2-support")]
 	builder.set_liquidity_provider_lsps2(
 		config_file.lsps2_service_config.expect("Missing liquidity.lsps2_server config"),
@@ -218,16 +218,7 @@ fn main() {
 
 	builder.set_runtime(runtime.handle().clone());
 
-	let seed_path = storage_dir.join("keys_seed").to_str().unwrap().to_string();
-	let node_entropy = match NodeEntropy::from_seed_path(seed_path) {
-		Ok(entropy) => entropy,
-		Err(e) => {
-			error!("Failed to load or generate seed: {e}");
-			std::process::exit(-1);
-		},
-	};
-
-	let node = match builder.build(node_entropy) {
+	let node = match builder.build() {
 		Ok(node) => Arc::new(node),
 		Err(e) => {
 			error!("Failed to build LDK Node: {e}");
@@ -272,8 +263,22 @@ fn main() {
 		node.config().listening_addresses.as_ref().unwrap().first().unwrap()
 	);
 
+	// ── Stable Channels ──────────────────────────────────────────────────────
+	let stable_manager = {
+		let mut mgr = StableChannelManager::new(&network_dir);
+		mgr.load_stable_channels(&node);
+		Arc::new(Mutex::new(mgr))
+	};
+
+	// Background price fetching
+	runtime.spawn(async {
+		loop {
+			let _ = stable_channels::price_feeds::get_cached_price();
+			tokio::time::sleep(Duration::from_secs(30)).await;
+		}
+	});
+
 	runtime.block_on(async {
-		// Register SIGHUP handler for log rotation
 		let mut sighup_stream = match tokio::signal::unix::signal(SignalKind::hangup()) {
 			Ok(stream) => stream,
 			Err(e) => {
@@ -307,6 +312,10 @@ fn main() {
 		let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 		info!("TLS enabled for REST service on {}", config_file.rest_service_addr);
 
+		let mut stability_interval = tokio::time::interval(Duration::from_secs(
+			stable_channels::constants::STABILITY_CHECK_INTERVAL_SECS,
+		));
+
 		loop {
 			select! {
 				event = event_node.next_event_async() => {
@@ -325,17 +334,34 @@ fn main() {
 								"CHANNEL_READY: {} from counterparty {:?}",
 								channel_id, counterparty_node_id
 							);
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_channel_ready(channel_id, &event_node);
+							}
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
 						},
-						Event::PaymentReceived { payment_id, payment_hash, amount_msat, .. } => {
+						Event::ChannelClosed { channel_id, reason, .. } => {
+							info!("CHANNEL_CLOSED: {} reason: {:?}", channel_id, reason);
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_channel_closed(channel_id);
+							}
+							if let Err(e) = event_node.event_handled() {
+								error!("Failed to mark event as handled: {e}");
+							}
+						},
+						Event::PaymentReceived { payment_id, payment_hash, amount_msat, custom_records } => {
 							info!(
 								"PAYMENT_RECEIVED: with id {:?}, hash {}, amount_msat {}",
 								payment_id, payment_hash, amount_msat
 							);
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_payment_received(amount_msat, custom_records, &event_node);
+							}
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
-
 							publish_event_and_upsert_payment(&payment_id,
 								|payment_ref| event_envelope::Event::PaymentReceived(events::PaymentReceived {
 									payment: Some(payment_ref.clone()),
@@ -346,7 +372,6 @@ fn main() {
 						},
 						Event::PaymentSuccessful {payment_id, ..} => {
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
-
 							publish_event_and_upsert_payment(&payment_id,
 								|payment_ref| event_envelope::Event::PaymentSuccessful(events::PaymentSuccessful {
 									payment: Some(payment_ref.clone()),
@@ -357,7 +382,6 @@ fn main() {
 						},
 						Event::PaymentFailed {payment_id, ..} => {
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
-
 							publish_event_and_upsert_payment(&payment_id,
 								|payment_ref| event_envelope::Event::PaymentFailed(events::PaymentFailed {
 									payment: Some(payment_ref.clone()),
@@ -386,10 +410,20 @@ fn main() {
 							claim_from_onchain_tx,
 							outbound_amount_forwarded_msat
 						} => {
-
 							info!("PAYMENT_FORWARDED: with outbound_amount_forwarded_msat {}, total_fee_earned_msat: {}, inbound channel: {}, outbound channel: {}",
 								outbound_amount_forwarded_msat.unwrap_or(0), total_fee_earned_msat.unwrap_or(0), prev_channel_id, next_channel_id
 							);
+
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_payment_forwarded(
+									prev_channel_id,
+									next_channel_id,
+									outbound_amount_forwarded_msat,
+									total_fee_earned_msat,
+									&event_node,
+								);
+							}
 
 							let forwarded_payment = forwarded_payment_to_proto(
 								prev_channel_id,
@@ -404,9 +438,6 @@ fn main() {
 								outbound_amount_forwarded_msat
 							);
 
-							// We don't expose this payment-id to the user, it is a temporary measure to generate
-							// some unique identifiers until we have forwarded-payment-id available in ldk.
-							// Currently, this is the expected user handling behaviour for forwarded payments.
 							let mut forwarded_payment_id = [0u8; 32];
 							getrandom::getrandom(&mut forwarded_payment_id).expect("Failed to generate random bytes");
 
@@ -449,7 +480,12 @@ fn main() {
 				res = rest_svc_listener.accept() => {
 					match res {
 						Ok((stream, _)) => {
-							let node_service = NodeService::new(Arc::clone(&node), Arc::clone(&paginated_store), api_key.clone());
+							let node_service = NodeService::new(
+								Arc::clone(&node),
+								Arc::clone(&paginated_store),
+								api_key.clone(),
+								Arc::clone(&stable_manager),
+							);
 							let acceptor = tls_acceptor.clone();
 							runtime.spawn(async move {
 								match acceptor.accept(stream).await {
@@ -465,6 +501,12 @@ fn main() {
 						},
 						Err(e) => error!("Failed to accept connection: {}", e),
 					}
+				}
+				_ = stability_interval.tick() => {
+					let mut mgr = stable_manager.lock().unwrap();
+					let price = stable_channels::price_feeds::get_cached_price();
+					if price > 0.0 { mgr.btc_price = price; }
+					mgr.check_and_update_stable_channels(&event_node);
 				}
 				_ = tokio::signal::ctrl_c() => {
 					info!("Received CTRL-C, shutting down..");
@@ -535,8 +577,6 @@ fn upsert_payment_details(
 	}
 }
 
-/// Loads the API key from a file, or generates a new one if it doesn't exist.
-/// The API key file is stored with 0400 permissions (read-only for owner).
 fn load_or_generate_api_key(storage_dir: &Path) -> std::io::Result<String> {
 	let api_key_path = storage_dir.join(API_KEY_FILE);
 
@@ -544,17 +584,13 @@ fn load_or_generate_api_key(storage_dir: &Path) -> std::io::Result<String> {
 		let key_bytes = fs::read(&api_key_path)?;
 		Ok(key_bytes.to_lower_hex_string())
 	} else {
-		// Ensure the storage directory exists
 		fs::create_dir_all(storage_dir)?;
 
-		// Generate a 32-byte random API key
 		let mut key_bytes = [0u8; 32];
 		getrandom::getrandom(&mut key_bytes).map_err(std::io::Error::other)?;
 
-		// Write the raw bytes to the file
 		fs::write(&api_key_path, key_bytes)?;
 
-		// Set permissions to 0400 (read-only for owner)
 		let permissions = fs::Permissions::from_mode(0o400);
 		fs::set_permissions(&api_key_path, permissions)?;
 
