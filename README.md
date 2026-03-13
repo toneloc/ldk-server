@@ -71,6 +71,10 @@ ldk-server-cli -b localhost:3002 --api-key your-secret-api-key --tls-cert /path/
 ldk-server-cli -b localhost:3002 --api-key your-secret-api-key --tls-cert /path/to/tls_cert.pem help # To print help/available commands.
 ```
 
+### Configuration Reference
+
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for a full reference of every TOML field, environment variable, and CLI flag.
+
 ### Shell Completions
 
 The CLI supports generating shell completions for Bash, Zsh, Fish, Elvish, and PowerShell.
