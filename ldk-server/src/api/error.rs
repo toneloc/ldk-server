@@ -91,9 +91,9 @@ impl From<NodeError> for LdkServerError {
 			| NodeError::InvalidFeeRate
 			| NodeError::UriParameterParsingFailed
 			| NodeError::InvalidBlindedPaths
-			| NodeError::AsyncPaymentServicesDisabled => {
-				(error.to_string(), LdkServerErrorCode::InvalidRequestError)
-			},
+			| NodeError::AsyncPaymentServicesDisabled
+			| NodeError::InvalidScriptPubKey
+			| NodeError::HrnParsingFailed => (error.to_string(), LdkServerErrorCode::InvalidRequestError),
 			NodeError::ConnectionFailed
 			| NodeError::InvoiceCreationFailed
 			| NodeError::InvoiceRequestCreationFailed

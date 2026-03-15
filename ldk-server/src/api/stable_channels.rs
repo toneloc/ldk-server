@@ -1,3 +1,7 @@
+// STABLE_CHANNELS_DISABLED: entire file contents commented out.
+// To re-enable, search for STABLE_CHANNELS_DISABLED across the codebase.
+
+/*
 use ldk_server_protos::stable::{
 	EditStableChannelRequest, EditStableChannelResponse, GetPriceRequest, GetPriceResponse,
 	ListStableChannelsRequest, ListStableChannelsResponse, StableChannelInfo,
@@ -44,3 +48,4 @@ pub(crate) fn handle_edit_stable_channel_request(
 		Err(msg) => Ok(EditStableChannelResponse { ok: false, status: msg }),
 	}
 }
+*/

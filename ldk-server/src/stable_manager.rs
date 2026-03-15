@@ -1,3 +1,7 @@
+// STABLE_CHANNELS_DISABLED: entire file contents commented out.
+// To re-enable, search for STABLE_CHANNELS_DISABLED across the codebase.
+
+/*
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -617,3 +621,4 @@ impl StableChannelManager {
 
 // Thread-safe wrapper
 pub type SharedStableManager = Arc<Mutex<StableChannelManager>>;
+*/

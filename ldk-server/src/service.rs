@@ -22,14 +22,38 @@ use ldk_node::bitcoin::hashes::hmac::{Hmac, HmacEngine};
 use ldk_node::bitcoin::hashes::{sha256, Hash, HashEngine};
 use ldk_node::Node;
 use ldk_server_protos::endpoints::{
-	BOLT11_RECEIVE_PATH, BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH,
-	CLOSE_CHANNEL_PATH, CONNECT_PEER_PATH, DISCONNECT_PEER_PATH, EDIT_STABLE_CHANNEL_PATH,
-	EXPORT_PATHFINDING_SCORES_PATH, FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH,
-	GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH, GET_PRICE_PATH, GRAPH_GET_CHANNEL_PATH,
-	GRAPH_GET_NODE_PATH, GRAPH_LIST_CHANNELS_PATH, GRAPH_LIST_NODES_PATH, LIST_CHANNELS_PATH,
-	LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH, LIST_STABLE_CHANNELS_PATH,
-	ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH, SIGN_MESSAGE_PATH, SPLICE_IN_PATH,
-	SPLICE_OUT_PATH, SPONTANEOUS_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH, VERIFY_SIGNATURE_PATH,
+	BOLT11_RECEIVE_PATH,
+	BOLT11_SEND_PATH,
+	BOLT12_RECEIVE_PATH,
+	BOLT12_SEND_PATH,
+	CLOSE_CHANNEL_PATH,
+	CONNECT_PEER_PATH,
+	DISCONNECT_PEER_PATH,
+	// STABLE_CHANNELS_DISABLED: EDIT_STABLE_CHANNEL_PATH,
+	EXPORT_PATHFINDING_SCORES_PATH,
+	FORCE_CLOSE_CHANNEL_PATH,
+	GET_BALANCES_PATH,
+	GET_NODE_INFO_PATH,
+	GET_PAYMENT_DETAILS_PATH,
+	// STABLE_CHANNELS_DISABLED: GET_PRICE_PATH,
+	GRAPH_GET_CHANNEL_PATH,
+	GRAPH_GET_NODE_PATH,
+	GRAPH_LIST_CHANNELS_PATH,
+	GRAPH_LIST_NODES_PATH,
+	LIST_CHANNELS_PATH,
+	LIST_FORWARDED_PAYMENTS_PATH,
+	LIST_PAYMENTS_PATH,
+	LIST_PEERS_PATH,
+	// STABLE_CHANNELS_DISABLED: LIST_STABLE_CHANNELS_PATH,
+	ONCHAIN_RECEIVE_PATH,
+	ONCHAIN_SEND_PATH,
+	OPEN_CHANNEL_PATH,
+	SIGN_MESSAGE_PATH,
+	SPLICE_IN_PATH,
+	SPLICE_OUT_PATH,
+	SPONTANEOUS_SEND_PATH,
+	UPDATE_CHANNEL_CONFIG_PATH,
+	VERIFY_SIGNATURE_PATH,
 };
 use prost::Message;
 
@@ -60,14 +84,14 @@ use crate::api::open_channel::handle_open_channel;
 use crate::api::sign_message::handle_sign_message_request;
 use crate::api::splice_channel::{handle_splice_in_request, handle_splice_out_request};
 use crate::api::spontaneous_send::handle_spontaneous_send_request;
-use crate::api::stable_channels::{
-	handle_edit_stable_channel_request, handle_get_price_request,
-	handle_list_stable_channels_request,
-};
+// STABLE_CHANNELS_DISABLED: use crate::api::stable_channels::{
+// 	handle_edit_stable_channel_request, handle_get_price_request,
+// 	handle_list_stable_channels_request,
+// };
 use crate::api::update_channel_config::handle_update_channel_config_request;
 use crate::api::verify_signature::handle_verify_signature_request;
 use crate::io::persist::paginated_kv_store::PaginatedKVStore;
-use crate::stable_manager::SharedStableManager;
+// STABLE_CHANNELS_DISABLED: use crate::stable_manager::SharedStableManager;
 use crate::util::proto_adapter::to_error_response;
 
 // Maximum request body size: 10 MB
@@ -95,15 +119,21 @@ pub struct NodeService {
 	node: Arc<Node>,
 	paginated_kv_store: Arc<dyn PaginatedKVStore>,
 	api_key: String,
-	stable_manager: SharedStableManager,
+	// STABLE_CHANNELS_DISABLED: stable_manager: SharedStableManager,
 }
 
 impl NodeService {
 	pub(crate) fn new(
-		node: Arc<Node>, paginated_kv_store: Arc<dyn PaginatedKVStore>, api_key: String,
-		stable_manager: SharedStableManager,
+		node: Arc<Node>,
+		paginated_kv_store: Arc<dyn PaginatedKVStore>,
+		api_key: String,
+		// STABLE_CHANNELS_DISABLED: stable_manager: SharedStableManager,
 	) -> Self {
-		Self { node, paginated_kv_store, api_key, stable_manager }
+		Self {
+			node,
+			paginated_kv_store,
+			api_key, /* STABLE_CHANNELS_DISABLED: , stable_manager */
+		}
 	}
 }
 
@@ -179,7 +209,7 @@ fn validate_hmac_auth(
 pub(crate) struct Context {
 	pub(crate) node: Arc<Node>,
 	pub(crate) paginated_kv_store: Arc<dyn PaginatedKVStore>,
-	pub(crate) stable_manager: SharedStableManager,
+	// STABLE_CHANNELS_DISABLED: pub(crate) stable_manager: SharedStableManager,
 }
 
 impl Service<Request<Incoming>> for NodeService {
@@ -211,7 +241,7 @@ impl Service<Request<Incoming>> for NodeService {
 		let context = Context {
 			node: Arc::clone(&self.node),
 			paginated_kv_store: Arc::clone(&self.paginated_kv_store),
-			stable_manager: Arc::clone(&self.stable_manager),
+			// STABLE_CHANNELS_DISABLED: stable_manager: Arc::clone(&self.stable_manager),
 		};
 		let api_key = self.api_key.clone();
 
@@ -408,27 +438,27 @@ impl Service<Request<Incoming>> for NodeService {
 				api_key,
 				handle_graph_get_node_request,
 			)),
-			GET_PRICE_PATH => Box::pin(handle_request(
-				context,
-				req,
-				auth_params,
-				api_key,
-				handle_get_price_request,
-			)),
-			LIST_STABLE_CHANNELS_PATH => Box::pin(handle_request(
-				context,
-				req,
-				auth_params,
-				api_key,
-				handle_list_stable_channels_request,
-			)),
-			EDIT_STABLE_CHANNEL_PATH => Box::pin(handle_request(
-				context,
-				req,
-				auth_params,
-				api_key,
-				handle_edit_stable_channel_request,
-			)),
+			// STABLE_CHANNELS_DISABLED: GET_PRICE_PATH => Box::pin(handle_request(
+			// 	context,
+			// 	req,
+			// 	auth_params,
+			// 	api_key,
+			// 	handle_get_price_request,
+			// )),
+			// STABLE_CHANNELS_DISABLED: LIST_STABLE_CHANNELS_PATH => Box::pin(handle_request(
+			// 	context,
+			// 	req,
+			// 	auth_params,
+			// 	api_key,
+			// 	handle_list_stable_channels_request,
+			// )),
+			// STABLE_CHANNELS_DISABLED: EDIT_STABLE_CHANNEL_PATH => Box::pin(handle_request(
+			// 	context,
+			// 	req,
+			// 	auth_params,
+			// 	api_key,
+			// 	handle_edit_stable_channel_request,
+			// )),
 			path => {
 				let error = format!("Unknown request: {}", path).into_bytes();
 				Box::pin(async {

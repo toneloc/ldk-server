@@ -40,7 +40,7 @@ pub(crate) mod open_channel;
 pub(crate) mod sign_message;
 pub(crate) mod splice_channel;
 pub(crate) mod spontaneous_send;
-pub(crate) mod stable_channels;
+// STABLE_CHANNELS_DISABLED: pub(crate) mod stable_channels;
 pub(crate) mod update_channel_config;
 pub(crate) mod verify_signature;
 

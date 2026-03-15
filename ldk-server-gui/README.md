@@ -30,7 +30,7 @@ The server generates the TLS certificate on first startup, which is required for
 
 ```bash
 # 1. First, start the ldk-server
-cargo run -p ldk-server -- --config /path/to/ldk-server-config.toml
+cargo run -p ldk-server -- /path/to/ldk-server-config.toml
 
 # 2. Wait for the server to start and generate the TLS certificate
 #    You should see output indicating the server is listening
