@@ -47,8 +47,7 @@ pub struct StableChannelManager {
 
 impl StableChannelManager {
 	pub fn new(data_dir: &Path) -> Self {
-		let db =
-			Database::open(data_dir).expect("Failed to open stable channels database");
+		let db = Database::open(data_dir).expect("Failed to open stable channels database");
 
 		let data_dir_str = data_dir.to_string_lossy().to_string();
 
@@ -70,12 +69,9 @@ impl StableChannelManager {
 				"[stable] saving channel={} expected_usd={} backing_sats={}",
 				ch_id, sc.expected_usd.0, sc.backing_sats
 			);
-			if let Err(e) = self.db.save_channel(
-				&ch_id,
-				sc.expected_usd.0,
-				sc.backing_sats,
-				sc.note.as_deref(),
-			) {
+			if let Err(e) =
+				self.db.save_channel(&ch_id, sc.expected_usd.0, sc.backing_sats, sc.note.as_deref())
+			{
 				error!("[stable] ERROR saving channel {} to DB: {}", ch_id, e);
 			}
 		}
@@ -91,11 +87,7 @@ impl StableChannelManager {
 		};
 
 		let ldk_channels = node.list_channels();
-		info!(
-			"[stable] DB has {} entries, LDK has {} channels",
-			entries.len(),
-			ldk_channels.len()
-		);
+		info!("[stable] DB has {} entries, LDK has {} channels", entries.len(), ldk_channels.len());
 
 		self.stable_channels.clear();
 
@@ -109,8 +101,7 @@ impl StableChannelManager {
 				if channel.channel_id.to_string() == entry.channel_id {
 					matched = true;
 					let unspendable = channel.unspendable_punishment_reserve.unwrap_or(0);
-					let our_balance_sats =
-						(channel.outbound_capacity_msat / 1000) + unspendable;
+					let our_balance_sats = (channel.outbound_capacity_msat / 1000) + unspendable;
 					let their_balance_sats =
 						channel.channel_value_sats.saturating_sub(our_balance_sats);
 
@@ -150,10 +141,7 @@ impl StableChannelManager {
 				}
 			}
 			if !matched {
-				warn!(
-					"[stable] no LDK channel matched DB entry {}",
-					entry.channel_id
-				);
+				warn!("[stable] no LDK channel matched DB entry {}", entry.channel_id);
 			}
 		}
 
@@ -196,19 +184,14 @@ impl StableChannelManager {
 	// ---- Event handlers -----------------------------------------------------
 
 	pub fn handle_channel_ready(&mut self, channel_id: ChannelId, node: &Node) {
-		if let Some(chan) =
-			node.list_channels().into_iter().find(|c| c.channel_id == channel_id)
-		{
-			let funded_usd = chan.channel_value_sats as f64 / 2.0
-				/ SATS_IN_BTC as f64
-				* self.btc_price;
+		if let Some(chan) = node.list_channels().into_iter().find(|c| c.channel_id == channel_id) {
+			let funded_usd =
+				chan.channel_value_sats as f64 / 2.0 / SATS_IN_BTC as f64 * self.btc_price;
 
 			// Create channel with $0 stabilized (user opts in via trade message)
 			let unspendable = chan.unspendable_punishment_reserve.unwrap_or(0);
-			let our_balance_sats =
-				(chan.outbound_capacity_msat / 1000) + unspendable;
-			let their_balance_sats =
-				chan.channel_value_sats.saturating_sub(our_balance_sats);
+			let our_balance_sats = (chan.outbound_capacity_msat / 1000) + unspendable;
+			let their_balance_sats = chan.channel_value_sats.saturating_sub(our_balance_sats);
 
 			let stable_channel = StableChannel {
 				channel_id: chan.channel_id,
@@ -282,8 +265,7 @@ impl StableChannelManager {
 	}
 
 	pub fn handle_payment_received(
-		&mut self, amount_msat: u64, custom_records: Vec<ldk_node::CustomTlvRecord>,
-		node: &Node,
+		&mut self, amount_msat: u64, custom_records: Vec<ldk_node::CustomTlvRecord>, node: &Node,
 	) {
 		let mut decoded_payload: Option<String> = None;
 
@@ -351,10 +333,8 @@ impl StableChannelManager {
 		);
 
 		// Check if the payment came FROM a stable channel (user sent payment out)
-		if let Some(sc) = self
-			.stable_channels
-			.iter_mut()
-			.find(|sc| sc.channel_id == prev_channel_id)
+		if let Some(sc) =
+			self.stable_channels.iter_mut().find(|sc| sc.channel_id == prev_channel_id)
 		{
 			if sc.expected_usd.0 <= 0.0 || self.btc_price <= 0.0 {
 				return;
@@ -478,8 +458,7 @@ impl StableChannelManager {
 
 		// 5) Verify signature using counterparty's pubkey
 		let pkey = channel.counterparty_node_id;
-		let sig_ok =
-			node.verify_signature(signed.payload.as_bytes(), &signed.signature, &pkey);
+		let sig_ok = node.verify_signature(signed.payload.as_bytes(), &signed.signature, &pkey);
 
 		if !sig_ok {
 			audit_event(
@@ -496,18 +475,13 @@ impl StableChannelManager {
 		);
 
 		// 6) Apply new expected_usd to StableChannel
-		if let Some(sc) = self
-			.stable_channels
-			.iter_mut()
-			.find(|sc| sc.channel_id == channel.channel_id)
+		if let Some(sc) =
+			self.stable_channels.iter_mut().find(|sc| sc.channel_id == channel.channel_id)
 		{
 			// Refresh balances
 			let (ok, _) = stable::update_balances(node, sc);
 			if !ok {
-				audit_event(
-					"TRADE_BALANCE_UPDATE_FAILED",
-					json!({ "channel_id": chan_id_str }),
-				);
+				audit_event("TRADE_BALANCE_UPDATE_FAILED", json!({ "channel_id": chan_id_str }));
 				return;
 			}
 

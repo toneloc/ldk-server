@@ -19,11 +19,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use clap::Parser;
 use hex::DisplayHex;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use ldk_node::bitcoin::Network;
 use ldk_node::config::Config;
+use ldk_node::entropy::NodeEntropy;
 use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::{Builder, Event, Node};
 use ldk_server_protos::events;
@@ -48,18 +50,17 @@ use crate::io::persist::{
 };
 use crate::service::NodeService;
 use crate::stable_manager::StableChannelManager;
-use crate::util::config::{load_config, ChainSource};
+use crate::util::config::{load_config, ArgsConfig, ChainSource};
 use crate::util::logger::ServerLogger;
 use crate::util::proto_adapter::{forwarded_payment_to_proto, payment_to_proto};
 use crate::util::tls::get_or_generate_tls_config;
 
-const DEFAULT_CONFIG_FILE: &str = "config.toml";
 const API_KEY_FILE: &str = "api_key";
 
-fn get_default_data_dir() -> Option<PathBuf> {
+pub fn get_default_data_dir() -> Option<PathBuf> {
 	#[cfg(target_os = "macos")]
 	{
-		#[allow(deprecated)]
+		#[allow(deprecated)] // todo can remove once we update MSRV to 1.87+
 		std::env::home_dir().map(|home| home.join("Library/Application Support/ldk-server"))
 	}
 	#[cfg(target_os = "windows")]
@@ -68,53 +69,19 @@ fn get_default_data_dir() -> Option<PathBuf> {
 	}
 	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 	{
-		#[allow(deprecated)]
+		#[allow(deprecated)] // todo can remove once we update MSRV to 1.87+
 		std::env::home_dir().map(|home| home.join(".ldk-server"))
 	}
 }
 
-fn get_default_config_path() -> Option<PathBuf> {
-	get_default_data_dir().map(|data_dir| data_dir.join(DEFAULT_CONFIG_FILE))
-}
-
-const USAGE_GUIDE: &str = "Usage: ldk-server [config_path]
-
-If no config path is provided, ldk-server will look for a config file at:
-  Linux:   ~/.ldk-server/config.toml
-  macOS:   ~/Library/Application Support/ldk-server/config.toml
-  Windows: %APPDATA%\\ldk-server\\config.toml";
-
 fn main() {
-	let args: Vec<String> = std::env::args().collect();
-
-	let config_path: PathBuf = if args.len() < 2 {
-		match get_default_config_path() {
-			Some(path) => path,
-			None => {
-				eprintln!("Unable to determine home directory for default config path.");
-				eprintln!("{USAGE_GUIDE}");
-				std::process::exit(-1);
-			},
-		}
-	} else {
-		let arg = args[1].as_str();
-		if arg == "-h" || arg == "--help" {
-			println!("{USAGE_GUIDE}");
-			std::process::exit(0);
-		}
-		PathBuf::from(arg)
-	};
-
-	if fs::File::open(&config_path).is_err() {
-		eprintln!("Unable to access configuration file: {}", config_path.display());
-		std::process::exit(-1);
-	}
+	let args_config = ArgsConfig::parse();
 
 	let mut ldk_node_config = Config::default();
-	let config_file = match load_config(&config_path) {
+	let config_file = match load_config(&args_config) {
 		Ok(config) => config,
 		Err(e) => {
-			eprintln!("Invalid configuration file: {}", e);
+			eprintln!("Invalid configuration: {e}");
 			std::process::exit(-1);
 		},
 	};
@@ -187,13 +154,8 @@ fn main() {
 	}
 
 	match config_file.chain_source {
-		ChainSource::Rpc { rpc_address, rpc_user, rpc_password } => {
-			builder.set_chain_source_bitcoind_rpc(
-				rpc_address.ip().to_string(),
-				rpc_address.port(),
-				rpc_user,
-				rpc_password,
-			);
+		ChainSource::Rpc { rpc_host, rpc_port, rpc_user, rpc_password } => {
+			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
 		},
 		ChainSource::Electrum { server_url } => {
 			builder.set_chain_source_electrum(server_url, None);
@@ -203,6 +165,7 @@ fn main() {
 		},
 	}
 
+	// LSPS2 support is highly experimental and for testing purposes only.
 	#[cfg(feature = "experimental-lsps2-support")]
 	builder.set_liquidity_provider_lsps2(
 		config_file.lsps2_service_config.expect("Missing liquidity.lsps2_server config"),
@@ -218,7 +181,16 @@ fn main() {
 
 	builder.set_runtime(runtime.handle().clone());
 
-	let node = match builder.build() {
+	let seed_path = storage_dir.join("keys_seed").to_str().unwrap().to_string();
+	let node_entropy = match NodeEntropy::from_seed_path(seed_path) {
+		Ok(entropy) => entropy,
+		Err(e) => {
+			error!("Failed to load or generate seed: {e}");
+			std::process::exit(-1);
+		},
+	};
+
+	let node = match builder.build(node_entropy) {
 		Ok(node) => Arc::new(node),
 		Err(e) => {
 			error!("Failed to build LDK Node: {e}");
@@ -257,11 +229,16 @@ fn main() {
 		},
 	}
 
-	info!(
-		"CONNECTION_STRING: {}@{}",
-		node.node_id(),
-		node.config().listening_addresses.as_ref().unwrap().first().unwrap()
-	);
+	let addrs = node
+		.config()
+		.announcement_addresses
+		.filter(|a| !a.is_empty())
+		.or(node.config().listening_addresses);
+	if let Some(addresses) = addrs {
+		for address in &addresses {
+			info!("NODE_URI: {}@{}", node.node_id(), address);
+		}
+	}
 
 	// ── Stable Channels ──────────────────────────────────────────────────────
 	let stable_manager = {
@@ -279,6 +256,7 @@ fn main() {
 	});
 
 	runtime.block_on(async {
+		// Register SIGHUP handler for log rotation
 		let mut sighup_stream = match tokio::signal::unix::signal(SignalKind::hangup()) {
 			Ok(stream) => stream,
 			Err(e) => {
@@ -362,6 +340,7 @@ fn main() {
 								mgr.handle_payment_received(amount_msat, custom_records, &event_node);
 							}
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
+
 							publish_event_and_upsert_payment(&payment_id,
 								|payment_ref| event_envelope::Event::PaymentReceived(events::PaymentReceived {
 									payment: Some(payment_ref.clone()),
@@ -372,6 +351,7 @@ fn main() {
 						},
 						Event::PaymentSuccessful {payment_id, ..} => {
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
+
 							publish_event_and_upsert_payment(&payment_id,
 								|payment_ref| event_envelope::Event::PaymentSuccessful(events::PaymentSuccessful {
 									payment: Some(payment_ref.clone()),
@@ -382,6 +362,7 @@ fn main() {
 						},
 						Event::PaymentFailed {payment_id, ..} => {
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
+
 							publish_event_and_upsert_payment(&payment_id,
 								|payment_ref| event_envelope::Event::PaymentFailed(events::PaymentFailed {
 									payment: Some(payment_ref.clone()),
@@ -410,6 +391,7 @@ fn main() {
 							claim_from_onchain_tx,
 							outbound_amount_forwarded_msat
 						} => {
+
 							info!("PAYMENT_FORWARDED: with outbound_amount_forwarded_msat {}, total_fee_earned_msat: {}, inbound channel: {}, outbound channel: {}",
 								outbound_amount_forwarded_msat.unwrap_or(0), total_fee_earned_msat.unwrap_or(0), prev_channel_id, next_channel_id
 							);
@@ -438,6 +420,9 @@ fn main() {
 								outbound_amount_forwarded_msat
 							);
 
+							// We don't expose this payment-id to the user, it is a temporary measure to generate
+							// some unique identifiers until we have forwarded-payment-id available in ldk.
+							// Currently, this is the expected user handling behaviour for forwarded payments.
 							let mut forwarded_payment_id = [0u8; 32];
 							getrandom::getrandom(&mut forwarded_payment_id).expect("Failed to generate random bytes");
 
@@ -577,6 +562,8 @@ fn upsert_payment_details(
 	}
 }
 
+/// Loads the API key from a file, or generates a new one if it doesn't exist.
+/// The API key file is stored with 0400 permissions (read-only for owner).
 fn load_or_generate_api_key(storage_dir: &Path) -> std::io::Result<String> {
 	let api_key_path = storage_dir.join(API_KEY_FILE);
 
@@ -584,13 +571,17 @@ fn load_or_generate_api_key(storage_dir: &Path) -> std::io::Result<String> {
 		let key_bytes = fs::read(&api_key_path)?;
 		Ok(key_bytes.to_lower_hex_string())
 	} else {
+		// Ensure the storage directory exists
 		fs::create_dir_all(storage_dir)?;
 
+		// Generate a 32-byte random API key
 		let mut key_bytes = [0u8; 32];
 		getrandom::getrandom(&mut key_bytes).map_err(std::io::Error::other)?;
 
+		// Write the raw bytes to the file
 		fs::write(&api_key_path, key_bytes)?;
 
+		// Set permissions to 0400 (read-only for owner)
 		let permissions = fs::Permissions::from_mode(0o400);
 		fs::set_permissions(&api_key_path, permissions)?;
 

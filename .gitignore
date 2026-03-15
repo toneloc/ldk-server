@@ -1,4 +1,3 @@
 /target
-
-# WASM build output (Trunk)
-ldk-server-gui/dist/
+/*/target
+.DS_Store

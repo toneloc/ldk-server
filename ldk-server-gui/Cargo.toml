@@ -17,6 +17,7 @@ futures-util = "0.3"
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 hex = { package = "hex-conservative", version = "0.2", default-features = false, features = ["std"] }
+bytes = "1.4.0"
 
 # Native-only dependencies
 tokio = { version = "1.38.0", features = ["rt-multi-thread", "sync"], optional = true }

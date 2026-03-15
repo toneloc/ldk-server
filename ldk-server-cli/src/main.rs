@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use config::{
-	get_default_api_key_path, get_default_cert_path, get_default_config_path, load_config,
+	api_key_path_for_storage_dir, cert_path_for_storage_dir, get_default_api_key_path,
+	get_default_cert_path, get_default_config_path, load_config,
 };
 use hex_conservative::DisplayHex;
 use ldk_server_client::client::LdkServerClient;
@@ -24,15 +25,18 @@ use ldk_server_client::ldk_server_protos::api::{
 	Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11SendRequest, Bolt11SendResponse,
 	Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
 	CloseChannelRequest, CloseChannelResponse, ConnectPeerRequest, ConnectPeerResponse,
-	ExportPathfindingScoresRequest, ForceCloseChannelRequest, ForceCloseChannelResponse,
-	GetBalancesRequest, GetBalancesResponse, GetNodeInfoRequest, GetNodeInfoResponse,
-	GetPaymentDetailsRequest, GetPaymentDetailsResponse, ListChannelsRequest, ListChannelsResponse,
-	ListForwardedPaymentsRequest, ListPaymentsRequest, ListPaymentsResponse, ListPeersRequest,
-	ListPeersResponse, OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest,
-	OnchainSendResponse, OpenChannelRequest, OpenChannelResponse, SignMessageRequest,
-	SignMessageResponse, SpliceInRequest, SpliceInResponse, SpliceOutRequest, SpliceOutResponse,
-	SpontaneousSendRequest, SpontaneousSendResponse, UpdateChannelConfigRequest,
-	UpdateChannelConfigResponse, VerifySignatureRequest, VerifySignatureResponse,
+	DisconnectPeerRequest, DisconnectPeerResponse, ExportPathfindingScoresRequest,
+	ForceCloseChannelRequest, ForceCloseChannelResponse, GetBalancesRequest, GetBalancesResponse,
+	GetNodeInfoRequest, GetNodeInfoResponse, GetPaymentDetailsRequest, GetPaymentDetailsResponse,
+	GraphGetChannelRequest, GraphGetChannelResponse, GraphGetNodeRequest, GraphGetNodeResponse,
+	GraphListChannelsRequest, GraphListChannelsResponse, GraphListNodesRequest,
+	GraphListNodesResponse, ListChannelsRequest, ListChannelsResponse,
+	ListForwardedPaymentsRequest, ListPaymentsRequest, OnchainReceiveRequest,
+	OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse, OpenChannelRequest,
+	OpenChannelResponse, SignMessageRequest, SignMessageResponse, SpliceInRequest,
+	SpliceInResponse, SpliceOutRequest, SpliceOutResponse, SpontaneousSendRequest,
+	SpontaneousSendResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
+	VerifySignatureRequest, VerifySignatureResponse,
 };
 use ldk_server_client::ldk_server_protos::types::{
 	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig, PageToken,
@@ -40,7 +44,9 @@ use ldk_server_client::ldk_server_protos::types::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use types::{CliListForwardedPaymentsResponse, CliListPaymentsResponse, CliPaginatedResponse};
+use types::{
+	Amount, CliListForwardedPaymentsResponse, CliListPaymentsResponse, CliPaginatedResponse,
+};
 
 mod config;
 mod types;
@@ -95,13 +101,12 @@ enum Commands {
 	OnchainReceive,
 	#[command(about = "Send an on-chain payment to the given address")]
 	OnchainSend {
-		#[arg(short, long, help = "The address to send coins to")]
+		#[arg(help = "The address to send coins to")]
 		address: String,
 		#[arg(
-			long,
-			help = "The amount in satoshis to send. Will respect any on-chain reserve needed for anchor channels"
+			help = "The amount to send, e.g. 50sat or 50000msat, must be a whole sat amount, cannot send msats on-chain. Will respect any on-chain reserve needed for anchor channels"
 		)]
-		amount_sats: Option<u64>,
+		amount: Option<Amount>,
 		#[arg(
 			long,
 			help = "Send full balance to the address. Warning: will not retain on-chain reserves for anchor channels"
@@ -115,6 +120,10 @@ enum Commands {
 	},
 	#[command(about = "Create a BOLT11 invoice to receive a payment")]
 	Bolt11Receive {
+		#[arg(
+			help = "Amount to request, e.g. 50sat or 50000msat. If unset, a variable-amount invoice is returned"
+		)]
+		amount: Option<Amount>,
 		#[arg(short, long, help = "Description to attach along with the invoice")]
 		description: Option<String>,
 		#[arg(
@@ -124,23 +133,20 @@ enum Commands {
 		description_hash: Option<String>,
 		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
 		expiry_secs: Option<u32>,
-		#[arg(
-			long,
-			help = "Amount in millisatoshis to request. If unset, a variable-amount invoice is returned"
-		)]
-		amount_msat: Option<u64>,
 	},
 	#[command(about = "Pay a BOLT11 invoice")]
 	Bolt11Send {
-		#[arg(short, long, help = "A BOLT11 invoice for a payment within the Lightning Network")]
+		#[arg(help = "A BOLT11 invoice for a payment within the Lightning Network")]
 		invoice: String,
-		#[arg(long, help = "Amount in millisatoshis. Required when paying a zero-amount invoice")]
-		amount_msat: Option<u64>,
+		#[arg(
+			help = "Amount to send, e.g. 50sat or 50000msat. Required when paying a zero-amount invoice"
+		)]
+		amount: Option<Amount>,
 		#[arg(
 			long,
-			help = "Maximum total fees in millisatoshis that may accrue during route finding. Defaults to 1% of payment + 50 sats"
+			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of payment + 50 sats"
 		)]
-		max_total_routing_fee_msat: Option<u64>,
+		max_total_routing_fee: Option<Amount>,
 		#[arg(long, help = "Maximum total CLTV delta we accept for the route (default: 1008)")]
 		max_total_cltv_expiry_delta: Option<u32>,
 		#[arg(
@@ -156,13 +162,12 @@ enum Commands {
 	},
 	#[command(about = "Return a BOLT12 offer for receiving payments")]
 	Bolt12Receive {
-		#[arg(short, long, help = "Description to attach along with the offer")]
+		#[arg(help = "Description to attach along with the offer")]
 		description: String,
 		#[arg(
-			long,
-			help = "Amount in millisatoshis to request. If unset, a variable-amount offer is returned"
+			help = "Amount to request, e.g. 50sat or 50000msat. If unset, a variable-amount offer is returned"
 		)]
-		amount_msat: Option<u64>,
+		amount: Option<Amount>,
 		#[arg(long, help = "Offer expiry time in seconds")]
 		expiry_secs: Option<u32>,
 		#[arg(long, help = "Number of items requested. Can only be set for fixed-amount offers")]
@@ -170,10 +175,12 @@ enum Commands {
 	},
 	#[command(about = "Send a payment for a BOLT12 offer")]
 	Bolt12Send {
-		#[arg(short, long, help = "A BOLT12 offer for a payment within the Lightning Network")]
+		#[arg(help = "A BOLT12 offer for a payment within the Lightning Network")]
 		offer: String,
-		#[arg(long, help = "Amount in millisatoshis. Required when paying a zero-amount offer")]
-		amount_msat: Option<u64>,
+		#[arg(
+			help = "Amount to send, e.g. 50sat or 50000msat. Required when paying a zero-amount offer"
+		)]
+		amount: Option<Amount>,
 		#[arg(short, long, help = "Number of items requested")]
 		quantity: Option<u64>,
 		#[arg(
@@ -184,9 +191,9 @@ enum Commands {
 		payer_note: Option<String>,
 		#[arg(
 			long,
-			help = "Maximum total fees, in millisatoshi, that may accrue during route finding, Defaults to 1% of the payment amount + 50 sats"
+			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of the payment amount + 50 sats"
 		)]
-		max_total_routing_fee_msat: Option<u64>,
+		max_total_routing_fee: Option<Amount>,
 		#[arg(long, help = "Maximum total CLTV delta we accept for the route (default: 1008)")]
 		max_total_cltv_expiry_delta: Option<u32>,
 		#[arg(
@@ -202,15 +209,15 @@ enum Commands {
 	},
 	#[command(about = "Send a spontaneous payment (keysend) to a node")]
 	SpontaneousSend {
-		#[arg(short, long, help = "The hex-encoded public key of the node to send the payment to")]
+		#[arg(help = "The hex-encoded public key of the node to send the payment to")]
 		node_id: String,
-		#[arg(short, long, help = "The amount in millisatoshis to send")]
-		amount_msat: u64,
+		#[arg(help = "The amount to send, e.g. 50sat or 50000msat")]
+		amount: Amount,
 		#[arg(
 			long,
-			help = "Maximum total fees in millisatoshis that may accrue during route finding. Defaults to 1% of payment + 50 sats"
+			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of payment + 50 sats"
 		)]
-		max_total_routing_fee_msat: Option<u64>,
+		max_total_routing_fee: Option<Amount>,
 		#[arg(long, help = "Maximum total CLTV delta we accept for the route (default: 1008)")]
 		max_total_cltv_expiry_delta: Option<u32>,
 		#[arg(
@@ -226,45 +233,34 @@ enum Commands {
 	},
 	#[command(about = "Cooperatively close the channel specified by the given channel ID")]
 	CloseChannel {
-		#[arg(short, long, help = "The local user_channel_id of this channel")]
+		#[arg(help = "The local user_channel_id of this channel")]
 		user_channel_id: String,
-		#[arg(
-			short,
-			long,
-			help = "The hex-encoded public key of the node to close a channel with"
-		)]
+		#[arg(help = "The hex-encoded public key of the node to close a channel with")]
 		counterparty_node_id: String,
 	},
 	#[command(about = "Force close the channel specified by the given channel ID")]
 	ForceCloseChannel {
-		#[arg(short, long, help = "The local user_channel_id of this channel")]
+		#[arg(help = "The local user_channel_id of this channel")]
 		user_channel_id: String,
-		#[arg(
-			short,
-			long,
-			help = "The hex-encoded public key of the node to close a channel with"
-		)]
+		#[arg(help = "The hex-encoded public key of the node to close a channel with")]
 		counterparty_node_id: String,
 		#[arg(long, help = "The reason for force-closing, defaults to \"\"")]
 		force_close_reason: Option<String>,
 	},
 	#[command(about = "Create a new outbound channel to the given remote node")]
 	OpenChannel {
-		#[arg(short, long, help = "The hex-encoded public key of the node to open a channel with")]
+		#[arg(help = "The hex-encoded public key of the node to open a channel with")]
 		node_pubkey: String,
 		#[arg(
-			short,
-			long,
 			help = "Address to connect to remote peer (IPv4:port, IPv6:port, OnionV3:port, or hostname:port)"
 		)]
 		address: String,
-		#[arg(long, help = "The amount of satoshis to commit to the channel")]
-		channel_amount_sats: u64,
 		#[arg(
-			long,
-			help = "Amount of satoshis to push to the remote side as part of the initial commitment state"
+			help = "The amount to commit to the channel, e.g. 100sat or 100000msat, must be a whole sat amount, cannot send msats on-chain."
 		)]
-		push_to_counterparty_msat: Option<u64>,
+		channel_amount: Amount,
+		#[arg(long, help = "Amount to push to the remote side, e.g. 50sat or 50000msat")]
+		push_to_counterparty: Option<Amount>,
 		#[arg(long, help = "Whether the channel should be public")]
 		announce_channel: bool,
 		// Channel config options
@@ -288,21 +284,25 @@ enum Commands {
 		about = "Increase the channel balance by the given amount, funds will come from the node's on-chain wallet"
 	)]
 	SpliceIn {
-		#[arg(short, long, help = "The local user_channel_id of the channel")]
+		#[arg(help = "The local user_channel_id of the channel")]
 		user_channel_id: String,
-		#[arg(short, long, help = "The hex-encoded public key of the channel's counterparty node")]
+		#[arg(help = "The hex-encoded public key of the channel's counterparty node")]
 		counterparty_node_id: String,
-		#[arg(long, help = "The amount of sats to splice into the channel")]
-		splice_amount_sats: u64,
+		#[arg(
+			help = "The amount to splice into the channel, e.g. 50sat or 50000msat, must be a whole sat amount, cannot send msats on-chain."
+		)]
+		splice_amount: Amount,
 	},
 	#[command(about = "Decrease the channel balance by the given amount")]
 	SpliceOut {
-		#[arg(short, long, help = "The local user_channel_id of this channel")]
+		#[arg(help = "The local user_channel_id of this channel")]
 		user_channel_id: String,
-		#[arg(short, long, help = "The hex-encoded public key of the channel's counterparty node")]
+		#[arg(help = "The hex-encoded public key of the channel's counterparty node")]
 		counterparty_node_id: String,
-		#[arg(long, help = "The amount of sats to splice out of the channel")]
-		splice_amount_sats: u64,
+		#[arg(
+			help = "The amount to splice out of the channel, e.g. 50sat or 50000msat, must be a whole sat amount, cannot send msats on-chain."
+		)]
+		splice_amount: Amount,
 		#[arg(
 			short,
 			long,
@@ -325,7 +325,7 @@ enum Commands {
 	},
 	#[command(about = "Get details of a specific payment by its payment ID")]
 	GetPaymentDetails {
-		#[arg(short, long, help = "The payment ID in hex-encoded form")]
+		#[arg(help = "The payment ID in hex-encoded form")]
 		payment_id: String,
 	},
 	#[command(about = "Retrieves list of all forwarded payments")]
@@ -339,12 +339,11 @@ enum Commands {
 		#[arg(long, help = "Page token to continue from a previous page (format: token:index)")]
 		page_token: Option<String>,
 	},
+	#[command(about = "Update the forwarding fees and CLTV expiry delta for an existing channel")]
 	UpdateChannelConfig {
-		#[arg(short, long, help = "The local user_channel_id of this channel")]
+		#[arg(help = "The local user_channel_id of this channel")]
 		user_channel_id: String,
 		#[arg(
-			short,
-			long,
 			help = "The hex-encoded public key of the counterparty node to update channel config with"
 		)]
 		counterparty_node_id: String,
@@ -366,14 +365,14 @@ enum Commands {
 	},
 	#[command(about = "Connect to a peer on the Lightning Network without opening a channel")]
 	ConnectPeer {
-		#[arg(short, long, help = "The hex-encoded public key of the node to connect to")]
+		#[arg(
+			help = "The peer to connect to in pubkey@address format, or just the pubkey if address is provided separately"
+		)]
 		node_pubkey: String,
 		#[arg(
-			short,
-			long,
-			help = "Address to connect to remote peer (IPv4:port, IPv6:port, OnionV3:port, or hostname:port)"
+			help = "Address to connect to remote peer (IPv4:port, IPv6:port, OnionV3:port, or hostname:port). Optional if address is included in pubkey via @ separator."
 		)]
-		address: String,
+		address: Option<String>,
 		#[arg(
 			long,
 			default_value_t = false,
@@ -381,24 +380,41 @@ enum Commands {
 		)]
 		persist: bool,
 	},
+	#[command(about = "Disconnect from a peer and remove it from the peer store")]
+	DisconnectPeer {
+		#[arg(help = "The hex-encoded public key of the node to disconnect from")]
+		node_pubkey: String,
+	},
 	#[command(about = "Sign a message with the node's secret key")]
 	SignMessage {
-		#[arg(short, long, help = "The message to sign")]
+		#[arg(help = "The message to sign")]
 		message: String,
 	},
 	#[command(about = "Verify a signature against a message and public key")]
 	VerifySignature {
-		#[arg(short, long, help = "The message that was signed")]
+		#[arg(help = "The message that was signed")]
 		message: String,
-		#[arg(short, long, help = "The zbase32-encoded signature to verify")]
+		#[arg(help = "The zbase32-encoded signature to verify")]
 		signature: String,
-		#[arg(short, long, help = "The hex-encoded public key of the signer")]
+		#[arg(help = "The hex-encoded public key of the signer")]
 		public_key: String,
 	},
 	#[command(about = "Export the pathfinding scores used by the router")]
 	ExportPathfindingScores,
-	#[command(about = "List all known peers")]
-	ListPeers,
+	#[command(about = "List all known short channel IDs in the network graph")]
+	GraphListChannels,
+	#[command(about = "Get channel information from the network graph by short channel ID")]
+	GraphGetChannel {
+		#[arg(help = "The short channel ID to look up")]
+		short_channel_id: u64,
+	},
+	#[command(about = "List all known node IDs in the network graph")]
+	GraphListNodes,
+	#[command(about = "Get node information from the network graph by node ID")]
+	GraphGetNode {
+		#[arg(help = "The hex-encoded node ID to look up")]
+		node_id: String,
+	},
 	#[command(about = "Generate shell completions for the CLI")]
 	Completions {
 		#[arg(
@@ -421,15 +437,22 @@ async fn main() {
 
 	let config_path = cli.config.map(PathBuf::from).or_else(get_default_config_path);
 	let config = config_path.as_ref().and_then(|p| load_config(p).ok());
+	let storage_dir =
+		config.as_ref().and_then(|c| c.storage.as_ref()?.disk.as_ref()?.dir_path.as_deref());
 
-	// Get API key from argument, then from api_key file
+	// Get API key from argument, then from api_key file in storage dir, then from default location
 	let api_key = cli
 		.api_key
 		.or_else(|| {
-			// Try to read from api_key file based on network (file contains raw bytes)
-			let network = config.as_ref().and_then(|c| c.network().ok()).unwrap_or("bitcoin".to_string());
-			get_default_api_key_path(&network)
+			let network =
+				config.as_ref().and_then(|c| c.network().ok()).unwrap_or("bitcoin".to_string());
+			storage_dir
+				.map(|dir| api_key_path_for_storage_dir(dir, &network))
 				.and_then(|path| std::fs::read(&path).ok())
+				.or_else(|| {
+					get_default_api_key_path(&network)
+						.and_then(|path| std::fs::read(&path).ok())
+				})
 				.map(|bytes| bytes.to_lower_hex_string())
 		})
 		.unwrap_or_else(|| {
@@ -445,11 +468,15 @@ async fn main() {
 				std::process::exit(1);
 			});
 
-	// Get TLS cert path from argument, then from config file, then try default location
+	// Get TLS cert path from argument, then from config tls.cert_path, then from storage dir,
+	// then try default location.
 	let tls_cert_path = cli.tls_cert.map(PathBuf::from).or_else(|| {
 		config
 			.as_ref()
 			.and_then(|c| c.tls.as_ref().and_then(|t| t.cert_path.as_ref().map(PathBuf::from)))
+			.or_else(|| {
+				storage_dir.map(cert_path_for_storage_dir).filter(|path| path.exists())
+			})
 			.or_else(get_default_cert_path)
 	})
 		.unwrap_or_else(|| {
@@ -483,7 +510,8 @@ async fn main() {
 				client.onchain_receive(OnchainReceiveRequest {}).await,
 			);
 		},
-		Commands::OnchainSend { address, amount_sats, send_all, fee_rate_sat_per_vb } => {
+		Commands::OnchainSend { address, amount, send_all, fee_rate_sat_per_vb } => {
+			let amount_sats = amount.map(|a| a.to_sat().unwrap_or_else(|e| handle_error_msg(&e)));
 			handle_response_result::<_, OnchainSendResponse>(
 				client
 					.onchain_send(OnchainSendRequest {
@@ -495,7 +523,8 @@ async fn main() {
 					.await,
 			);
 		},
-		Commands::Bolt11Receive { description, description_hash, expiry_secs, amount_msat } => {
+		Commands::Bolt11Receive { description, description_hash, expiry_secs, amount } => {
+			let amount_msat = amount.map(|a| a.to_msat());
 			let invoice_description = match (description, description_hash) {
 				(Some(desc), None) => Some(Bolt11InvoiceDescription {
 					kind: Some(bolt11_invoice_description::Kind::Direct(desc)),
@@ -522,12 +551,14 @@ async fn main() {
 		},
 		Commands::Bolt11Send {
 			invoice,
-			amount_msat,
-			max_total_routing_fee_msat,
+			amount,
+			max_total_routing_fee,
 			max_total_cltv_expiry_delta,
 			max_path_count,
 			max_channel_saturation_power_of_half,
 		} => {
+			let amount_msat = amount.map(|a| a.to_msat());
+			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
 			let route_parameters = RouteParametersConfig {
 				max_total_routing_fee_msat,
 				max_total_cltv_expiry_delta: max_total_cltv_expiry_delta
@@ -546,7 +577,8 @@ async fn main() {
 					.await,
 			);
 		},
-		Commands::Bolt12Receive { description, amount_msat, expiry_secs, quantity } => {
+		Commands::Bolt12Receive { description, amount, expiry_secs, quantity } => {
+			let amount_msat = amount.map(|a| a.to_msat());
 			handle_response_result::<_, Bolt12ReceiveResponse>(
 				client
 					.bolt12_receive(Bolt12ReceiveRequest {
@@ -560,14 +592,16 @@ async fn main() {
 		},
 		Commands::Bolt12Send {
 			offer,
-			amount_msat,
+			amount,
 			quantity,
 			payer_note,
-			max_total_routing_fee_msat,
+			max_total_routing_fee,
 			max_total_cltv_expiry_delta,
 			max_path_count,
 			max_channel_saturation_power_of_half,
 		} => {
+			let amount_msat = amount.map(|a| a.to_msat());
+			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
 			let route_parameters = RouteParametersConfig {
 				max_total_routing_fee_msat,
 				max_total_cltv_expiry_delta: max_total_cltv_expiry_delta
@@ -591,12 +625,14 @@ async fn main() {
 		},
 		Commands::SpontaneousSend {
 			node_id,
-			amount_msat,
-			max_total_routing_fee_msat,
+			amount,
+			max_total_routing_fee,
 			max_total_cltv_expiry_delta,
 			max_path_count,
 			max_channel_saturation_power_of_half,
 		} => {
+			let amount_msat = amount.to_msat();
+			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
 			let route_parameters = RouteParametersConfig {
 				max_total_routing_fee_msat,
 				max_total_cltv_expiry_delta: max_total_cltv_expiry_delta
@@ -641,13 +677,16 @@ async fn main() {
 		Commands::OpenChannel {
 			node_pubkey,
 			address,
-			channel_amount_sats,
-			push_to_counterparty_msat,
+			channel_amount,
+			push_to_counterparty,
 			announce_channel,
 			forwarding_fee_proportional_millionths,
 			forwarding_fee_base_msat,
 			cltv_expiry_delta,
 		} => {
+			let channel_amount_sats =
+				channel_amount.to_sat().unwrap_or_else(|e| handle_error_msg(&e));
+			let push_to_counterparty_msat = push_to_counterparty.map(|a| a.to_msat());
 			let channel_config = build_open_channel_config(
 				forwarding_fee_proportional_millionths,
 				forwarding_fee_base_msat,
@@ -667,7 +706,9 @@ async fn main() {
 					.await,
 			);
 		},
-		Commands::SpliceIn { user_channel_id, counterparty_node_id, splice_amount_sats } => {
+		Commands::SpliceIn { user_channel_id, counterparty_node_id, splice_amount } => {
+			let splice_amount_sats =
+				splice_amount.to_sat().unwrap_or_else(|e| handle_error_msg(&e));
 			handle_response_result::<_, SpliceInResponse>(
 				client
 					.splice_in(SpliceInRequest {
@@ -678,12 +719,9 @@ async fn main() {
 					.await,
 			);
 		},
-		Commands::SpliceOut {
-			user_channel_id,
-			counterparty_node_id,
-			address,
-			splice_amount_sats,
-		} => {
+		Commands::SpliceOut { user_channel_id, counterparty_node_id, address, splice_amount } => {
+			let splice_amount_sats =
+				splice_amount.to_sat().unwrap_or_else(|e| handle_error_msg(&e));
 			handle_response_result::<_, SpliceOutResponse>(
 				client
 					.splice_out(SpliceOutRequest {
@@ -764,8 +802,21 @@ async fn main() {
 			);
 		},
 		Commands::ConnectPeer { node_pubkey, address, persist } => {
+			let (node_pubkey, address) = if let Some(address) = address {
+				(node_pubkey, address)
+			} else if let Some((pubkey, addr)) = node_pubkey.split_once('@') {
+				(pubkey.to_string(), addr.to_string())
+			} else {
+				eprintln!("Error: address is required. Provide it as pubkey@address or as a separate argument.");
+				std::process::exit(1);
+			};
 			handle_response_result::<_, ConnectPeerResponse>(
 				client.connect_peer(ConnectPeerRequest { node_pubkey, address, persist }).await,
+			);
+		},
+		Commands::DisconnectPeer { node_pubkey } => {
+			handle_response_result::<_, DisconnectPeerResponse>(
+				client.disconnect_peer(DisconnectPeerRequest { node_pubkey }).await,
 			);
 		},
 		Commands::SignMessage { message } => {
@@ -796,9 +847,24 @@ async fn main() {
 				),
 			);
 		},
-		Commands::ListPeers => {
-			handle_response_result::<_, ListPeersResponse>(
-				client.list_peers(ListPeersRequest {}).await,
+		Commands::GraphListChannels => {
+			handle_response_result::<_, GraphListChannelsResponse>(
+				client.graph_list_channels(GraphListChannelsRequest {}).await,
+			);
+		},
+		Commands::GraphGetChannel { short_channel_id } => {
+			handle_response_result::<_, GraphGetChannelResponse>(
+				client.graph_get_channel(GraphGetChannelRequest { short_channel_id }).await,
+			);
+		},
+		Commands::GraphListNodes => {
+			handle_response_result::<_, GraphListNodesResponse>(
+				client.graph_list_nodes(GraphListNodesRequest {}).await,
+			);
+		},
+		Commands::GraphGetNode { node_id } => {
+			handle_response_result::<_, GraphGetNodeResponse>(
+				client.graph_get_node(GraphGetNodeRequest { node_id }).await,
 			);
 		},
 		Commands::Completions { .. } => unreachable!("Handled above"),
@@ -897,6 +963,11 @@ fn parse_page_token(token_str: &str) -> Result<PageToken, LdkServerError> {
 		.parse::<i64>()
 		.map_err(|_| LdkServerError::new(InternalError, "Invalid page token index".to_string()))?;
 	Ok(PageToken { token: parts[0].to_string(), index })
+}
+
+fn handle_error_msg(msg: &str) -> ! {
+	eprintln!("Error: {msg}");
+	std::process::exit(1);
 }
 
 fn handle_error(e: LdkServerError) -> ! {

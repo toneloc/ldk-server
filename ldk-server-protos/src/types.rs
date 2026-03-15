@@ -31,9 +31,17 @@ pub struct Payment {
 	pub fee_paid_msat: ::core::option::Option<u64>,
 	/// The direction of the payment.
 	#[prost(enumeration = "PaymentDirection", tag = "4")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_payment_direction")
+	)]
 	pub direction: i32,
 	/// The status of the payment.
 	#[prost(enumeration = "PaymentStatus", tag = "5")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_payment_status")
+	)]
 	pub status: i32,
 	/// The timestamp, in seconds since start of the UNIX epoch, when this entry was last updated.
 	#[prost(uint64, tag = "6")]
@@ -138,6 +146,10 @@ pub struct Bolt11 {
 	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
 	/// The secret used by the payment.
 	#[prost(bytes = "bytes", optional, tag = "3")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_opt_bytes_hex")
+	)]
 	pub secret: ::core::option::Option<::prost::bytes::Bytes>,
 }
 /// Represents a BOLT 11 payment intended to open an LSPS 2 just-in-time channel.
@@ -154,6 +166,10 @@ pub struct Bolt11Jit {
 	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
 	/// The secret used by the payment.
 	#[prost(bytes = "bytes", optional, tag = "3")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_opt_bytes_hex")
+	)]
 	pub secret: ::core::option::Option<::prost::bytes::Bytes>,
 	/// Limits applying to how much fee we allow an LSP to deduct from the payment amount.
 	///
@@ -184,6 +200,10 @@ pub struct Bolt12Offer {
 	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
 	/// The secret used by the payment.
 	#[prost(bytes = "bytes", optional, tag = "3")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_opt_bytes_hex")
+	)]
 	pub secret: ::core::option::Option<::prost::bytes::Bytes>,
 	/// The hex-encoded ID of the offer this payment is for.
 	#[prost(string, tag = "4")]
@@ -213,6 +233,10 @@ pub struct Bolt12Refund {
 	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
 	/// The secret used by the payment.
 	#[prost(bytes = "bytes", optional, tag = "3")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_opt_bytes_hex")
+	)]
 	pub secret: ::core::option::Option<::prost::bytes::Bytes>,
 	/// The payer's note for the payment.
 	/// Truncated to \[PAYER_NOTE_LIMIT\](<https://docs.rs/lightning/latest/lightning/offers/invoice_request/constant.PAYER_NOTE_LIMIT.html>).
@@ -637,6 +661,13 @@ pub struct ClaimableAwaitingConfirmations {
 	/// The height at which we start tracking it as  `SpendableOutput`.
 	#[prost(uint32, tag = "4")]
 	pub confirmation_height: u32,
+	/// Whether this balance is a result of cooperative close, a force-close, or an HTLC.
+	#[prost(enumeration = "BalanceSource", tag = "5")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_balance_source")
+	)]
+	pub source: i32,
 }
 /// The channel has been closed, and the given balance should be ours but awaiting spending transaction confirmation.
 /// If the spending transaction does not confirm in time, it is possible our counterparty can take the funds by
@@ -885,6 +916,105 @@ pub struct RouteParametersConfig {
 	#[prost(uint32, tag = "4")]
 	pub max_channel_saturation_power_of_half: u32,
 }
+/// Routing fees for a channel as part of the network graph.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphRoutingFees {
+	/// Flat routing fee in millisatoshis.
+	#[prost(uint32, tag = "1")]
+	pub base_msat: u32,
+	/// Liquidity-based routing fee in millionths of a routed amount.
+	#[prost(uint32, tag = "2")]
+	pub proportional_millionths: u32,
+}
+/// Details about one direction of a channel in the network graph,
+/// as received within a `ChannelUpdate`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphChannelUpdate {
+	/// When the last update to the channel direction was issued.
+	/// Value is opaque, as set in the announcement.
+	#[prost(uint32, tag = "1")]
+	pub last_update: u32,
+	/// Whether the channel can be currently used for payments (in this one direction).
+	#[prost(bool, tag = "2")]
+	pub enabled: bool,
+	/// The difference in CLTV values that you must have when routing through this channel.
+	#[prost(uint32, tag = "3")]
+	pub cltv_expiry_delta: u32,
+	/// The minimum value, which must be relayed to the next hop via the channel.
+	#[prost(uint64, tag = "4")]
+	pub htlc_minimum_msat: u64,
+	/// The maximum value which may be relayed to the next hop via the channel.
+	#[prost(uint64, tag = "5")]
+	pub htlc_maximum_msat: u64,
+	/// Fees charged when the channel is used for routing.
+	#[prost(message, optional, tag = "6")]
+	pub fees: ::core::option::Option<GraphRoutingFees>,
+}
+/// Details about a channel in the network graph (both directions).
+/// Received within a channel announcement.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphChannel {
+	/// Source node of the first direction of the channel (hex-encoded public key).
+	#[prost(string, tag = "1")]
+	pub node_one: ::prost::alloc::string::String,
+	/// Source node of the second direction of the channel (hex-encoded public key).
+	#[prost(string, tag = "2")]
+	pub node_two: ::prost::alloc::string::String,
+	/// The channel capacity as seen on-chain, if chain lookup is available.
+	#[prost(uint64, optional, tag = "3")]
+	pub capacity_sats: ::core::option::Option<u64>,
+	/// Details about the first direction of a channel.
+	#[prost(message, optional, tag = "4")]
+	pub one_to_two: ::core::option::Option<GraphChannelUpdate>,
+	/// Details about the second direction of a channel.
+	#[prost(message, optional, tag = "5")]
+	pub two_to_one: ::core::option::Option<GraphChannelUpdate>,
+}
+/// Information received in the latest node_announcement from this node.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphNodeAnnouncement {
+	/// When the last known update to the node state was issued.
+	/// Value is opaque, as set in the announcement.
+	#[prost(uint32, tag = "1")]
+	pub last_update: u32,
+	/// Moniker assigned to the node.
+	/// May be invalid or malicious (eg control chars), should not be exposed to the user.
+	#[prost(string, tag = "2")]
+	pub alias: ::prost::alloc::string::String,
+	/// Color assigned to the node as a hex-encoded RGB string, e.g. "ff0000".
+	#[prost(string, tag = "3")]
+	pub rgb: ::prost::alloc::string::String,
+	/// List of addresses on which this node is reachable.
+	#[prost(string, repeated, tag = "4")]
+	pub addresses: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Details about a node in the network graph, known from the network announcement.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphNode {
+	/// All valid channels a node has announced.
+	#[prost(uint64, repeated, tag = "1")]
+	pub channels: ::prost::alloc::vec::Vec<u64>,
+	/// More information about a node from node_announcement.
+	/// Optional because we store a node entry after learning about it from
+	/// a channel announcement, but before receiving a node announcement.
+	#[prost(message, optional, tag = "2")]
+	pub announcement_info: ::core::option::Option<GraphNodeAnnouncement>,
+}
 /// Represents the direction of a payment.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -947,6 +1077,48 @@ impl PaymentStatus {
 			"PENDING" => Some(Self::Pending),
 			"SUCCEEDED" => Some(Self::Succeeded),
 			"FAILED" => Some(Self::Failed),
+			_ => None,
+		}
+	}
+}
+
+/// Indicates whether the balance is derived from a cooperative close, a force-close (for holder or counterparty),
+/// or whether it is for an HTLC.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BalanceSource {
+	/// The channel was force closed by the holder.
+	HolderForceClosed = 0,
+	/// The channel was force closed by the counterparty.
+	CounterpartyForceClosed = 1,
+	/// The channel was cooperatively closed.
+	CoopClose = 2,
+	/// This balance is the result of an HTLC.
+	Htlc = 3,
+}
+
+impl BalanceSource {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			BalanceSource::HolderForceClosed => "HOLDER_FORCE_CLOSED",
+			BalanceSource::CounterpartyForceClosed => "COUNTERPARTY_FORCE_CLOSED",
+			BalanceSource::CoopClose => "COOP_CLOSE",
+			BalanceSource::Htlc => "HTLC",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"HOLDER_FORCE_CLOSED" => Some(Self::HolderForceClosed),
+			"COUNTERPARTY_FORCE_CLOSED" => Some(Self::CounterpartyForceClosed),
+			"COOP_CLOSE" => Some(Self::CoopClose),
+			"HTLC" => Some(Self::Htlc),
 			_ => None,
 		}
 	}
