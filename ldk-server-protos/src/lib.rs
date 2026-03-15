@@ -13,5 +13,4 @@ pub mod error;
 pub mod events;
 #[cfg(feature = "serde")]
 pub mod serde_utils;
-pub mod stable;
 pub mod types;

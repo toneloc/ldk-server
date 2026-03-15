@@ -16,9 +16,6 @@ use ldk_server_client::ldk_server_protos::api::{
 	SpliceOutResponse, SpontaneousSendResponse, UpdateChannelConfigResponse,
 	VerifySignatureResponse,
 };
-use ldk_server_client::ldk_server_protos::stable::{
-	EditStableChannelResponse, GetPriceResponse, ListStableChannelsResponse,
-};
 use ldk_server_client::ldk_server_protos::types::PageToken;
 
 #[derive(Clone, PartialEq, Default)]
@@ -40,7 +37,6 @@ pub enum ActiveTab {
 	ForwardedPayments,
 	Lightning,
 	Onchain,
-	StableChannels,
 	Tools,
 	NetworkGraph,
 }
@@ -123,13 +119,6 @@ pub struct ConnectPeerForm {
 	pub node_pubkey: String,
 	pub address: String,
 	pub persist: bool,
-}
-
-#[derive(Default, Clone)]
-pub struct EditStableChannelForm {
-	pub channel_id: String,
-	pub expected_usd: String,
-	pub note: String,
 }
 
 #[derive(Default, Clone)]
@@ -229,7 +218,6 @@ pub struct Forms {
 	pub update_channel_config: UpdateChannelConfigForm,
 	pub close_channel: CloseChannelForm,
 	pub connect_peer: ConnectPeerForm,
-	pub edit_stable_channel: EditStableChannelForm,
 	pub spontaneous_send: SpontaneousSendForm,
 	pub sign_message: SignMessageForm,
 	pub verify_signature: VerifySignatureForm,
@@ -303,9 +291,6 @@ pub struct AsyncTasks {
 	pub graph_get_channel: Option<ChannelTaskHandle<GraphGetChannelResponse>>,
 	pub graph_list_nodes: Option<ChannelTaskHandle<GraphListNodesResponse>>,
 	pub graph_get_node: Option<ChannelTaskHandle<GraphGetNodeResponse>>,
-	pub get_price: Option<ChannelTaskHandle<GetPriceResponse>>,
-	pub list_stable_channels: Option<ChannelTaskHandle<ListStableChannelsResponse>>,
-	pub edit_stable_channel: Option<ChannelTaskHandle<EditStableChannelResponse>>,
 }
 
 impl Default for AsyncTasks {
@@ -339,9 +324,6 @@ impl Default for AsyncTasks {
 			graph_get_channel: None,
 			graph_list_nodes: None,
 			graph_get_node: None,
-			get_price: None,
-			list_stable_channels: None,
-			edit_stable_channel: None,
 		}
 	}
 }
@@ -376,9 +358,6 @@ impl AsyncTasks {
 			|| self.graph_get_channel.is_some()
 			|| self.graph_list_nodes.is_some()
 			|| self.graph_get_node.is_some()
-			|| self.get_price.is_some()
-			|| self.list_stable_channels.is_some()
-			|| self.edit_stable_channel.is_some()
 	}
 }
 
@@ -410,8 +389,6 @@ pub struct AppState {
 	pub forwarded_payments: Option<ListForwardedPaymentsResponse>,
 	pub forwarded_payments_page_token: Option<PageToken>,
 	pub payment_details: Option<GetPaymentDetailsResponse>,
-	pub price: Option<GetPriceResponse>,
-	pub stable_channels: Option<ListStableChannelsResponse>,
 
 	// Operation results
 	pub onchain_address: Option<String>,
@@ -495,8 +472,6 @@ impl Default for AppState {
 			forwarded_payments: None,
 			forwarded_payments_page_token: None,
 			payment_details: None,
-			price: None,
-			stable_channels: None,
 
 			onchain_address: None,
 			generated_invoice: None,

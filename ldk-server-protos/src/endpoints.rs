@@ -37,6 +37,3 @@ pub const GRAPH_GET_CHANNEL_PATH: &str = "GraphGetChannel";
 pub const GRAPH_LIST_NODES_PATH: &str = "GraphListNodes";
 pub const GRAPH_GET_NODE_PATH: &str = "GraphGetNode";
 pub const LIST_PEERS_PATH: &str = "ListPeers";
-pub const GET_PRICE_PATH: &str = "GetPrice";
-pub const LIST_STABLE_CHANNELS_PATH: &str = "ListStableChannels";
-pub const EDIT_STABLE_CHANNEL_PATH: &str = "EditStableChannel";

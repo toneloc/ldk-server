@@ -16,9 +16,6 @@ use ldk_server_client::ldk_server_protos::api::{
 	OnchainSendRequest, OpenChannelRequest, SignMessageRequest, SpliceInRequest, SpliceOutRequest,
 	SpontaneousSendRequest, UpdateChannelConfigRequest, VerifySignatureRequest,
 };
-use ldk_server_client::ldk_server_protos::stable::{
-	EditStableChannelRequest, GetPriceRequest, ListStableChannelsRequest,
-};
 use ldk_server_client::ldk_server_protos::types::{
 	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig,
 };
@@ -674,63 +671,6 @@ impl LdkServerApp {
 		}
 	}
 
-	pub fn fetch_price(&mut self) {
-		if self.state.tasks.get_price.is_some() {
-			return;
-		}
-		if let Some(client) = &self.state.client {
-			let client = client.clone();
-			self.state.tasks.get_price = Some(self.spawn_task(async move {
-				client.get_price(GetPriceRequest {}).await.map_err(|e| e.to_string())
-			}));
-		}
-	}
-
-	pub fn fetch_stable_channels(&mut self) {
-		if self.state.tasks.list_stable_channels.is_some() {
-			return;
-		}
-		if let Some(client) = &self.state.client {
-			let client = client.clone();
-			self.state.tasks.list_stable_channels = Some(self.spawn_task(async move {
-				client
-					.list_stable_channels(ListStableChannelsRequest {})
-					.await
-					.map_err(|e| e.to_string())
-			}));
-		}
-	}
-
-	pub fn edit_stable_channel(&mut self) {
-		if self.state.tasks.edit_stable_channel.is_some() {
-			return;
-		}
-		if let Some(client) = &self.state.client {
-			let form = &self.state.forms.edit_stable_channel;
-			let channel_id = form.channel_id.trim().to_string();
-			let expected_usd = form.expected_usd.trim().parse::<f64>().ok();
-			let note =
-				if form.note.trim().is_empty() { None } else { Some(form.note.trim().to_string()) };
-
-			if channel_id.is_empty() {
-				self.state.status_message = Some(StatusMessage::error("Channel ID is required"));
-				return;
-			}
-
-			let client = client.clone();
-			self.state.tasks.edit_stable_channel = Some(self.spawn_task(async move {
-				client
-					.edit_stable_channel(EditStableChannelRequest {
-						channel_id,
-						expected_usd,
-						note,
-					})
-					.await
-					.map_err(|e| e.to_string())
-			}));
-		}
-	}
-
 	pub fn disconnect_peer(&mut self, node_pubkey: String) {
 		if self.state.tasks.disconnect_peer.is_some() {
 			return;
@@ -1028,24 +968,6 @@ impl LdkServerApp {
 			self.state.show_connect_peer_dialog = false;
 		});
 
-		poll_task!(self.state.tasks.get_price => |v| {
-			self.state.price = Some(v);
-		});
-
-		poll_task!(self.state.tasks.list_stable_channels => |v| {
-			self.state.stable_channels = Some(v);
-		});
-
-		poll_task!(self.state.tasks.edit_stable_channel => |v| {
-			if v.ok {
-				self.state.status_message = Some(StatusMessage::success(v.status));
-			} else {
-				self.state.status_message = Some(StatusMessage::error(v.status));
-			}
-			self.state.forms.edit_stable_channel = Default::default();
-			self.fetch_stable_channels();
-		});
-
 		poll_task!(self.state.tasks.disconnect_peer => |_v| {
 			self.state.status_message = Some(StatusMessage::success("Peer disconnected"));
 			self.state.show_disconnect_peer_dialog = false;
@@ -1145,7 +1067,6 @@ impl App for LdkServerApp {
 				(ActiveTab::ForwardedPayments, "Forwarded"),
 				(ActiveTab::Lightning, "Lightning"),
 				(ActiveTab::Onchain, "On-chain"),
-				(ActiveTab::StableChannels, "Stable"),
 				(ActiveTab::Tools, "Tools"),
 				(ActiveTab::NetworkGraph, "Graph"),
 			];
@@ -1190,7 +1111,6 @@ impl App for LdkServerApp {
 			ActiveTab::ForwardedPayments => ui::forwarded_payments::render(ui, self),
 			ActiveTab::Lightning => ui::lightning::render(ui, self),
 			ActiveTab::Onchain => ui::onchain::render(ui, self),
-			ActiveTab::StableChannels => ui::stable_channels::render(ui, self),
 			ActiveTab::Tools => ui::tools::render(ui, self),
 			ActiveTab::NetworkGraph => ui::network_graph::render(ui, self),
 		});

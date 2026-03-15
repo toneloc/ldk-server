@@ -10,15 +10,12 @@
 mod api;
 mod io;
 mod service;
-// STABLE_CHANNELS_DISABLED: pub mod stable_manager;
 mod util;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-// STABLE_CHANNELS_DISABLED: use std::sync::Mutex; (was in Arc, Mutex)
-// STABLE_CHANNELS_DISABLED: Duration was here (used by stable channels timer)
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -51,7 +48,6 @@ use crate::io::persist::{
 	PAYMENTS_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::service::NodeService;
-// STABLE_CHANNELS_DISABLED: use crate::stable_manager::StableChannelManager;
 use crate::util::config::{load_config, ArgsConfig, ChainSource};
 use crate::util::logger::ServerLogger;
 use crate::util::proto_adapter::{forwarded_payment_to_proto, payment_to_proto};
@@ -242,20 +238,6 @@ fn main() {
 		}
 	}
 
-	// STABLE_CHANNELS_DISABLED: stable_manager initialization and price fetcher
-	// let stable_manager = {
-	// 	let mut mgr = StableChannelManager::new(&network_dir);
-	// 	mgr.load_stable_channels(&node);
-	// 	Arc::new(Mutex::new(mgr))
-	// };
-	//
-	// runtime.spawn(async {
-	// 	loop {
-	// 		let _ = stable_channels::price_feeds::get_cached_price();
-	// 		tokio::time::sleep(Duration::from_secs(30)).await;
-	// 	}
-	// });
-
 	runtime.block_on(async {
 		// Register SIGHUP handler for log rotation
 		let mut sighup_stream = match tokio::signal::unix::signal(SignalKind::hangup()) {
@@ -291,10 +273,6 @@ fn main() {
 		let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 		info!("TLS enabled for REST service on {}", config_file.rest_service_addr);
 
-		// STABLE_CHANNELS_DISABLED: let mut stability_interval = tokio::time::interval(Duration::from_secs(
-		// 	stable_channels::constants::STABILITY_CHECK_INTERVAL_SECS,
-		// ));
-
 		loop {
 			select! {
 				event = event_node.next_event_async() => {
@@ -313,20 +291,12 @@ fn main() {
 								"CHANNEL_READY: {} from counterparty {:?}",
 								channel_id, counterparty_node_id
 							);
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_channel_ready(channel_id, &event_node);
-							// }
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
 						},
 						Event::ChannelClosed { channel_id, reason, .. } => {
 							info!("CHANNEL_CLOSED: {} reason: {:?}", channel_id, reason);
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_channel_closed(channel_id);
-							// }
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
@@ -336,10 +306,6 @@ fn main() {
 								"PAYMENT_RECEIVED: with id {:?}, hash {}, amount_msat {}",
 								payment_id, payment_hash, amount_msat
 							);
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_payment_received(amount_msat, custom_records, &event_node);
-							// }
 							let _ = (&amount_msat, &custom_records); // suppress unused warnings
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
 
@@ -397,17 +363,6 @@ fn main() {
 							info!("PAYMENT_FORWARDED: with outbound_amount_forwarded_msat {}, total_fee_earned_msat: {}, inbound channel: {}, outbound channel: {}",
 								outbound_amount_forwarded_msat.unwrap_or(0), total_fee_earned_msat.unwrap_or(0), prev_channel_id, next_channel_id
 							);
-
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_payment_forwarded(
-							// 		prev_channel_id,
-							// 		next_channel_id,
-							// 		outbound_amount_forwarded_msat,
-							// 		total_fee_earned_msat,
-							// 		&event_node,
-							// 	);
-							// }
 
 							let forwarded_payment = forwarded_payment_to_proto(
 								prev_channel_id,
@@ -471,7 +426,6 @@ fn main() {
 								Arc::clone(&node),
 								Arc::clone(&paginated_store),
 								api_key.clone(),
-								// STABLE_CHANNELS_DISABLED: Arc::clone(&stable_manager),
 							);
 							let acceptor = tls_acceptor.clone();
 							runtime.spawn(async move {
@@ -489,12 +443,6 @@ fn main() {
 						Err(e) => error!("Failed to accept connection: {}", e),
 					}
 				}
-				// STABLE_CHANNELS_DISABLED: _ = stability_interval.tick() => {
-				// 	let mut mgr = stable_manager.lock().unwrap();
-				// 	let price = stable_channels::price_feeds::get_cached_price();
-				// 	if price > 0.0 { mgr.btc_price = price; }
-				// 	mgr.check_and_update_stable_channels(&event_node);
-				// }
 				_ = tokio::signal::ctrl_c() => {
 					info!("Received CTRL-C, shutting down..");
 					break;
