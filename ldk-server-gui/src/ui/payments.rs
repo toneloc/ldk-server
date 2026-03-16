@@ -301,8 +301,6 @@ fn render_payment_kind_details(
 ) {
 	use ldk_server_client::ldk_server_protos::types::payment_kind::Kind;
 
-	ui.add_space(5.0);
-	ui.end_row();
 	ui.strong("--- Details ---");
 	ui.label("");
 	ui.end_row();

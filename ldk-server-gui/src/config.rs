@@ -193,6 +193,8 @@ pub fn find_and_load_config() -> Option<GuiConfig> {
 	let search_paths = [
 		// Current directory
 		PathBuf::from("ldk-server-config.toml"),
+		// Subdirectory (running from repo root: ./ldk-server/)
+		PathBuf::from("ldk-server/ldk-server-config.toml"),
 		// Parent directory (if running from ldk-server-gui)
 		PathBuf::from("../ldk-server/ldk-server-config.toml"),
 		// Sibling ldk-server directory
