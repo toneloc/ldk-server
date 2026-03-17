@@ -15,6 +15,8 @@ pub fn render(ui: &mut egui::Ui, app: &mut LdkServerApp) {
 	render_sign_message(ui, app);
 	ui.add_space(20.0);
 	render_verify_signature(ui, app);
+	ui.add_space(20.0);
+	render_export_pathfinding_scores(ui, app);
 }
 
 fn render_sign_message(ui: &mut egui::Ui, app: &mut LdkServerApp) {
@@ -56,6 +58,33 @@ fn render_sign_message(ui: &mut egui::Ui, app: &mut LdkServerApp) {
 			if ui.button("Copy Signature").clicked() {
 				ui.output_mut(|o| o.copied_text = signature.clone());
 			}
+		}
+	});
+}
+
+fn render_export_pathfinding_scores(ui: &mut egui::Ui, app: &mut LdkServerApp) {
+	ui.group(|ui| {
+		ui.heading("Export Pathfinding Scores");
+		ui.add_space(5.0);
+
+		ui.label("Export the pathfinding scores used by the router.");
+
+		ui.add_space(10.0);
+
+		ui.horizontal(|ui| {
+			let is_pending = app.state.tasks.export_pathfinding_scores.is_some();
+			if is_pending {
+				ui.spinner();
+				ui.label("Exporting...");
+			} else if ui.button("Export Scores").clicked() {
+				app.export_pathfinding_scores();
+			}
+		});
+
+		if let Some(result) = &app.state.export_scores_result {
+			ui.add_space(10.0);
+			ui.separator();
+			ui.label(format!("Scores data: {} bytes", result.scores.len()));
 		}
 	});
 }

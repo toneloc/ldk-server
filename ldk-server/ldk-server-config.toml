@@ -8,6 +8,7 @@ listening_addresses = ["127.0.0.1:3001"]      # Lightning node listening address
 announcement_addresses = ["127.0.0.1:3001"]   # Announcement addresses
 rest_service_address = "127.0.0.1:3002"       # LDK Server REST address
 api_key = "your-secret-api-key"               # API key for REST requests
+#pathfinding_scores_source_url = ""           # External Pathfinding Scores Source
 
 # Storage settings
 [storage.disk]

@@ -9,12 +9,13 @@ use tokio::runtime::Runtime;
 use ldk_server_client::client::LdkServerClient;
 use ldk_server_client::ldk_server_protos::api::{
 	Bolt11ReceiveRequest, Bolt11SendRequest, Bolt12ReceiveRequest, Bolt12SendRequest,
-	CloseChannelRequest, ConnectPeerRequest, DisconnectPeerRequest, ForceCloseChannelRequest,
-	GetBalancesRequest, GetNodeInfoRequest, GetPaymentDetailsRequest, GraphGetChannelRequest,
-	GraphGetNodeRequest, GraphListChannelsRequest, GraphListNodesRequest, ListChannelsRequest,
-	ListForwardedPaymentsRequest, ListPaymentsRequest, ListPeersRequest, OnchainReceiveRequest,
-	OnchainSendRequest, OpenChannelRequest, SignMessageRequest, SpliceInRequest, SpliceOutRequest,
-	SpontaneousSendRequest, UpdateChannelConfigRequest, VerifySignatureRequest,
+	CloseChannelRequest, ConnectPeerRequest, DisconnectPeerRequest, ExportPathfindingScoresRequest,
+	ForceCloseChannelRequest, GetBalancesRequest, GetNodeInfoRequest, GetPaymentDetailsRequest,
+	GraphGetChannelRequest, GraphGetNodeRequest, GraphListChannelsRequest, GraphListNodesRequest,
+	ListChannelsRequest, ListForwardedPaymentsRequest, ListPaymentsRequest, ListPeersRequest,
+	OnchainReceiveRequest, OnchainSendRequest, OpenChannelRequest, SignMessageRequest,
+	SpliceInRequest, SpliceOutRequest, SpontaneousSendRequest, UpdateChannelConfigRequest,
+	VerifySignatureRequest,
 };
 use ldk_server_client::ldk_server_protos::stable::{
 	EditStableChannelRequest, GetPriceRequest, ListStableChannelsRequest,
@@ -898,6 +899,21 @@ impl LdkServerApp {
 		}
 	}
 
+	pub fn export_pathfinding_scores(&mut self) {
+		if self.state.tasks.export_pathfinding_scores.is_some() {
+			return;
+		}
+		if let Some(client) = &self.state.client {
+			let client = client.clone();
+			self.state.tasks.export_pathfinding_scores = Some(self.spawn_task(async move {
+				client
+					.export_pathfinding_scores(ExportPathfindingScoresRequest {})
+					.await
+					.map_err(|e| e.to_string())
+			}));
+		}
+	}
+
 	fn poll_tasks(&mut self, _ctx: &egui::Context) {
 		macro_rules! poll_task {
 			($task:expr => |$val:ident| $handler:expr) => {
@@ -1086,6 +1102,12 @@ impl LdkServerApp {
 
 		poll_task!(self.state.tasks.graph_get_node => |v| {
 			self.state.graph_node_detail = Some(v);
+		});
+
+		poll_task!(self.state.tasks.export_pathfinding_scores => |v| {
+			let size = v.scores.len();
+			self.state.export_scores_result = Some(v);
+			self.state.status_message = Some(StatusMessage::success(format!("Exported pathfinding scores ({} bytes)", size)));
 		});
 	}
 }

@@ -8,9 +8,10 @@ use crate::task::ChannelTaskHandle;
 use ldk_server_client::client::LdkServerClient;
 use ldk_server_client::ldk_server_protos::api::{
 	Bolt11ReceiveResponse, Bolt11SendResponse, Bolt12ReceiveResponse, Bolt12SendResponse,
-	CloseChannelResponse, ConnectPeerResponse, DisconnectPeerResponse, ForceCloseChannelResponse,
-	GetBalancesResponse, GetNodeInfoResponse, GetPaymentDetailsResponse, GraphGetChannelResponse,
-	GraphGetNodeResponse, GraphListChannelsResponse, GraphListNodesResponse, ListChannelsResponse,
+	CloseChannelResponse, ConnectPeerResponse, DisconnectPeerResponse,
+	ExportPathfindingScoresResponse, ForceCloseChannelResponse, GetBalancesResponse,
+	GetNodeInfoResponse, GetPaymentDetailsResponse, GraphGetChannelResponse, GraphGetNodeResponse,
+	GraphListChannelsResponse, GraphListNodesResponse, ListChannelsResponse,
 	ListForwardedPaymentsResponse, ListPaymentsResponse, ListPeersResponse, OnchainReceiveResponse,
 	OnchainSendResponse, OpenChannelResponse, SignMessageResponse, SpliceInResponse,
 	SpliceOutResponse, SpontaneousSendResponse, UpdateChannelConfigResponse,
@@ -303,6 +304,7 @@ pub struct AsyncTasks {
 	pub graph_get_channel: Option<ChannelTaskHandle<GraphGetChannelResponse>>,
 	pub graph_list_nodes: Option<ChannelTaskHandle<GraphListNodesResponse>>,
 	pub graph_get_node: Option<ChannelTaskHandle<GraphGetNodeResponse>>,
+	pub export_pathfinding_scores: Option<ChannelTaskHandle<ExportPathfindingScoresResponse>>,
 	pub get_price: Option<ChannelTaskHandle<GetPriceResponse>>,
 	pub list_stable_channels: Option<ChannelTaskHandle<ListStableChannelsResponse>>,
 	pub edit_stable_channel: Option<ChannelTaskHandle<EditStableChannelResponse>>,
@@ -339,6 +341,7 @@ impl Default for AsyncTasks {
 			graph_get_channel: None,
 			graph_list_nodes: None,
 			graph_get_node: None,
+			export_pathfinding_scores: None,
 			get_price: None,
 			list_stable_channels: None,
 			edit_stable_channel: None,
@@ -376,6 +379,7 @@ impl AsyncTasks {
 			|| self.graph_get_channel.is_some()
 			|| self.graph_list_nodes.is_some()
 			|| self.graph_get_node.is_some()
+			|| self.export_pathfinding_scores.is_some()
 			|| self.get_price.is_some()
 			|| self.list_stable_channels.is_some()
 			|| self.edit_stable_channel.is_some()
@@ -448,6 +452,7 @@ pub struct AppState {
 	pub graph_node_detail: Option<GraphGetNodeResponse>,
 	pub sign_result: Option<String>,
 	pub verify_result: Option<bool>,
+	pub export_scores_result: Option<ExportPathfindingScoresResponse>,
 	pub show_disconnect_peer_dialog: bool,
 	#[allow(dead_code)]
 	pub disconnect_peer_pubkey: String,
@@ -529,6 +534,7 @@ impl Default for AppState {
 			graph_node_detail: None,
 			sign_result: None,
 			verify_result: None,
+			export_scores_result: None,
 			show_disconnect_peer_dialog: false,
 			disconnect_peer_pubkey: String::new(),
 		}

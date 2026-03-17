@@ -55,6 +55,7 @@ use crate::service::NodeService;
 use crate::util::config::{load_config, ArgsConfig, ChainSource};
 use crate::util::logger::ServerLogger;
 use crate::util::proto_adapter::{forwarded_payment_to_proto, payment_to_proto};
+use crate::util::systemd;
 use crate::util::tls::get_or_generate_tls_config;
 
 const API_KEY_FILE: &str = "api_key";
@@ -165,6 +166,10 @@ fn main() {
 		ChainSource::Esplora { server_url } => {
 			builder.set_chain_source_esplora(server_url, None);
 		},
+	}
+
+	if let Some(pathfinding_scores_source) = config_file.pathfinding_scores_source_url {
+		builder.set_pathfinding_scores_source(pathfinding_scores_source);
 	}
 
 	// LSPS2 support is highly experimental and for testing purposes only.
@@ -294,6 +299,8 @@ fn main() {
 		// STABLE_CHANNELS_DISABLED: let mut stability_interval = tokio::time::interval(Duration::from_secs(
 		// 	stable_channels::constants::STABILITY_CHECK_INTERVAL_SECS,
 		// ));
+
+		systemd::notify_ready();
 
 		loop {
 			select! {
@@ -512,6 +519,7 @@ fn main() {
 		}
 	});
 
+	systemd::notify_stopping();
 	node.stop().expect("Shutdown should always succeed.");
 	info!("Shutdown complete..");
 }
