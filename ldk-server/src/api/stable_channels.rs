@@ -1,10 +1,7 @@
-// STABLE_CHANNELS_DISABLED: entire file contents commented out.
-// To re-enable, search for STABLE_CHANNELS_DISABLED across the codebase.
-
-/*
 use ldk_server_protos::stable::{
 	EditStableChannelRequest, EditStableChannelResponse, GetPriceRequest, GetPriceResponse,
-	ListStableChannelsRequest, ListStableChannelsResponse, StableChannelInfo,
+	ListStableChannelsRequest, ListStableChannelsResponse, LogRequest, LogResponse,
+	StableChannelInfo,
 };
 
 use crate::api::error::LdkServerError;
@@ -48,4 +45,21 @@ pub(crate) fn handle_edit_stable_channel_request(
 		Err(msg) => Ok(EditStableChannelResponse { ok: false, status: msg }),
 	}
 }
-*/
+
+pub(crate) fn handle_audit_log_request(
+	context: Context, request: LogRequest,
+) -> Result<LogResponse, LdkServerError> {
+	let max_lines = if request.max_lines == 0 { 200 } else { request.max_lines as usize };
+	let mgr = context.stable_manager.lock().unwrap();
+	let content = mgr.read_audit_log(max_lines);
+	Ok(LogResponse { content })
+}
+
+pub(crate) fn handle_ldk_log_request(
+	context: Context, request: LogRequest,
+) -> Result<LogResponse, LdkServerError> {
+	let max_lines = if request.max_lines == 0 { 200 } else { request.max_lines as usize };
+	let mgr = context.stable_manager.lock().unwrap();
+	let content = mgr.read_ldk_log(max_lines);
+	Ok(LogResponse { content })
+}

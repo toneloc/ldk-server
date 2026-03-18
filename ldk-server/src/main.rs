@@ -10,15 +10,15 @@
 mod api;
 mod io;
 mod service;
-// STABLE_CHANNELS_DISABLED: pub mod stable_manager;
+pub mod stable_manager;
 mod util;
+pub mod push;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-// STABLE_CHANNELS_DISABLED: use std::sync::Mutex; (was in Arc, Mutex)
-// STABLE_CHANNELS_DISABLED: Duration was here (used by stable channels timer)
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -51,7 +51,7 @@ use crate::io::persist::{
 	PAYMENTS_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use crate::service::NodeService;
-// STABLE_CHANNELS_DISABLED: use crate::stable_manager::StableChannelManager;
+use crate::stable_manager::StableChannelManager;
 use crate::util::config::{load_config, ArgsConfig, ChainSource};
 use crate::util::logger::ServerLogger;
 use crate::util::proto_adapter::{forwarded_payment_to_proto, payment_to_proto};
@@ -247,19 +247,20 @@ fn main() {
 		}
 	}
 
-	// STABLE_CHANNELS_DISABLED: stable_manager initialization and price fetcher
-	// let stable_manager = {
-	// 	let mut mgr = StableChannelManager::new(&network_dir);
-	// 	mgr.load_stable_channels(&node);
-	// 	Arc::new(Mutex::new(mgr))
-	// };
-	//
-	// runtime.spawn(async {
-	// 	loop {
-	// 		let _ = stable_channels::price_feeds::get_cached_price();
-	// 		tokio::time::sleep(Duration::from_secs(30)).await;
-	// 	}
-	// });
+	let stable_manager = {
+		let mut mgr = StableChannelManager::new(&network_dir);
+		mgr.load_stable_channels(&node);
+		Arc::new(Mutex::new(mgr))
+	};
+
+	let push_service = Arc::new(Mutex::new(push::PushService::new(&network_dir)));
+
+	runtime.spawn(async {
+		loop {
+			let _ = stable_channels::price_feeds::get_cached_price();
+			tokio::time::sleep(Duration::from_secs(30)).await;
+		}
+	});
 
 	runtime.block_on(async {
 		// Register SIGHUP handler for log rotation
@@ -296,9 +297,15 @@ fn main() {
 		let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 		info!("TLS enabled for REST service on {}", config_file.rest_service_addr);
 
-		// STABLE_CHANNELS_DISABLED: let mut stability_interval = tokio::time::interval(Duration::from_secs(
-		// 	stable_channels::constants::STABILITY_CHECK_INTERVAL_SECS,
-		// ));
+		// Plain HTTP listener for mobile push registration (no TLS, no auth)
+		let push_listener = TcpListener::bind("0.0.0.0:8080")
+			.await
+			.expect("Failed to bind push registration port 8080");
+		info!("Push registration endpoint on http://0.0.0.0:8080/api/register-push");
+
+		let mut stability_interval = tokio::time::interval(Duration::from_secs(
+			stable_channels::constants::STABILITY_CHECK_INTERVAL_SECS,
+		));
 
 		systemd::notify_ready();
 
@@ -315,25 +322,46 @@ fn main() {
 								error!("Failed to mark event as handled: {e}");
 							}
 						},
-						Event::ChannelReady { channel_id, counterparty_node_id, .. } => {
+						Event::ChannelReady { channel_id, user_channel_id, counterparty_node_id, .. } => {
 							info!(
-								"CHANNEL_READY: {} from counterparty {:?}",
-								channel_id, counterparty_node_id
+								"CHANNEL_READY: {} (user_channel_id={}) from counterparty {:?}",
+								channel_id, user_channel_id.0, counterparty_node_id
 							);
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_channel_ready(channel_id, &event_node);
-							// }
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_channel_ready(channel_id, user_channel_id.0, &event_node);
+							}
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
 						},
-						Event::ChannelClosed { channel_id, reason, .. } => {
-							info!("CHANNEL_CLOSED: {} reason: {:?}", channel_id, reason);
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_channel_closed(channel_id);
-							// }
+						Event::ChannelClosed { channel_id, user_channel_id, reason, .. } => {
+							info!("CHANNEL_CLOSED: {} (user_channel_id={}) reason: {:?}", channel_id, user_channel_id.0, reason);
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_channel_closed(channel_id, user_channel_id.0);
+							}
+							if let Err(e) = event_node.event_handled() {
+								error!("Failed to mark event as handled: {e}");
+							}
+						},
+						Event::SplicePending { channel_id, user_channel_id, counterparty_node_id, new_funding_txo, .. } => {
+							let txid_str = new_funding_txo.txid.to_string();
+							let vout = new_funding_txo.vout;
+							info!(
+								"SPLICE_PENDING: channel {} (user_channel_id={}) counterparty {} funding_txo {}:{}",
+								channel_id, user_channel_id.0, counterparty_node_id, txid_str, vout
+							);
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_splice_pending(channel_id, user_channel_id.0, &txid_str, vout, &event_node);
+							}
+							if let Err(e) = event_node.event_handled() {
+								error!("Failed to mark event as handled: {e}");
+							}
+						},
+						Event::SpliceFailed { channel_id, .. } => {
+							info!("SPLICE_FAILED: channel {}", channel_id);
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
@@ -343,11 +371,10 @@ fn main() {
 								"PAYMENT_RECEIVED: with id {:?}, hash {}, amount_msat {}",
 								payment_id, payment_hash, amount_msat
 							);
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_payment_received(amount_msat, custom_records, &event_node);
-							// }
-							let _ = (&amount_msat, &custom_records); // suppress unused warnings
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_payment_received(amount_msat, custom_records, &event_node);
+							}
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
 
 							publish_event_and_upsert_payment(&payment_id,
@@ -405,16 +432,16 @@ fn main() {
 								outbound_amount_forwarded_msat.unwrap_or(0), total_fee_earned_msat.unwrap_or(0), prev_channel_id, next_channel_id
 							);
 
-							// STABLE_CHANNELS_DISABLED: {
-							// 	let mut mgr = stable_manager.lock().unwrap();
-							// 	mgr.handle_payment_forwarded(
-							// 		prev_channel_id,
-							// 		next_channel_id,
-							// 		outbound_amount_forwarded_msat,
-							// 		total_fee_earned_msat,
-							// 		&event_node,
-							// 	);
-							// }
+							{
+								let mut mgr = stable_manager.lock().unwrap();
+								mgr.handle_payment_forwarded(
+									prev_channel_id,
+									next_channel_id,
+									outbound_amount_forwarded_msat,
+									total_fee_earned_msat,
+									&event_node,
+								);
+							}
 
 							let forwarded_payment = forwarded_payment_to_proto(
 								prev_channel_id,
@@ -478,7 +505,8 @@ fn main() {
 								Arc::clone(&node),
 								Arc::clone(&paginated_store),
 								api_key.clone(),
-								// STABLE_CHANNELS_DISABLED: Arc::clone(&stable_manager),
+								Arc::clone(&stable_manager),
+								Arc::clone(&push_service),
 							);
 							let acceptor = tls_acceptor.clone();
 							runtime.spawn(async move {
@@ -496,12 +524,51 @@ fn main() {
 						Err(e) => error!("Failed to accept connection: {}", e),
 					}
 				}
-				// STABLE_CHANNELS_DISABLED: _ = stability_interval.tick() => {
-				// 	let mut mgr = stable_manager.lock().unwrap();
-				// 	let price = stable_channels::price_feeds::get_cached_price();
-				// 	if price > 0.0 { mgr.btc_price = price; }
-				// 	mgr.check_and_update_stable_channels(&event_node);
-				// }
+				push_res = push_listener.accept() => {
+					if let Ok((stream, _)) = push_res {
+						let ps = Arc::clone(&push_service);
+						runtime.spawn(async move {
+							handle_push_registration(stream, ps).await;
+						});
+					}
+				}
+				_ = stability_interval.tick() => {
+					let (payment_sent, push_targets) = {
+						let mut mgr = stable_manager.lock().unwrap();
+						let price = stable_channels::price_feeds::get_cached_price();
+						if price > 0.0 { mgr.btc_price = price; }
+
+						// Get push targets before stability check
+						let targets = mgr.get_stability_push_targets(&event_node);
+
+						// Filter by push service cooldown and send notifications
+						let mut ps = push_service.lock().unwrap();
+						let filtered: Vec<_> = targets.into_iter().filter(|t| ps.should_notify(&t.node_id)).collect();
+						for t in &filtered {
+							ps.notify(&t.node_id, &t.direction);
+						}
+
+						// Run stability check
+						let sent = mgr.check_and_update_stable_channels(&event_node);
+						(sent, filtered)
+					};
+
+					// If we sent push notifications, wait for NSE to reconnect, then retry
+					if !push_targets.is_empty() {
+						let sm = Arc::clone(&stable_manager);
+						let en = Arc::clone(&event_node);
+						runtime.spawn(async move {
+							tokio::time::sleep(Duration::from_secs(15)).await;
+							let mut mgr = sm.lock().unwrap();
+							mgr.check_and_update_stable_channels(&en);
+						});
+					}
+
+					// After a stability payment, allow LDK to persist
+					if payment_sent {
+						tokio::time::sleep(Duration::from_secs(2)).await;
+					}
+				}
 				_ = tokio::signal::ctrl_c() => {
 					info!("Received CTRL-C, shutting down..");
 					break;
@@ -598,4 +665,65 @@ fn load_or_generate_api_key(storage_dir: &Path) -> std::io::Result<String> {
 		debug!("Generated new API key at {}", api_key_path.display());
 		Ok(key_bytes.to_lower_hex_string())
 	}
+}
+
+/// Handle plain HTTP push registration from mobile apps.
+/// Accepts JSON POST to /api/register-push — no TLS, no auth.
+async fn handle_push_registration(
+	stream: tokio::net::TcpStream,
+	push_service: Arc<Mutex<crate::push::PushService>>,
+) {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	let mut buf = vec![0u8; 4096];
+	let mut stream = stream;
+	let n = match stream.read(&mut buf).await {
+		Ok(n) => n,
+		Err(_) => return,
+	};
+	let request = String::from_utf8_lossy(&buf[..n]);
+
+	// Only handle POST /api/register-push
+	if !request.starts_with("POST /api/register-push") {
+		let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+		let _ = stream.write_all(resp.as_bytes()).await;
+		return;
+	}
+
+	// Extract JSON body (after \r\n\r\n)
+	let body = match request.find("\r\n\r\n") {
+		Some(pos) => &request[pos + 4..],
+		None => {
+			let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+			let _ = stream.write_all(resp.as_bytes()).await;
+			return;
+		}
+	};
+
+	#[derive(serde::Deserialize)]
+	struct PushReq {
+		device_token: String,
+		platform: String,
+		#[serde(default)]
+		node_id: String,
+		#[serde(default)]
+		environment: String,
+	}
+
+	let resp = match serde_json::from_str::<PushReq>(body) {
+		Ok(req) => {
+			{
+				let ps = push_service.lock().unwrap();
+				ps.register_token(&req.device_token, &req.platform, &req.node_id, &req.environment);
+			}
+			info!("[push] Registered {} device for node {}", req.platform,
+				if req.node_id.len() > 16 { &req.node_id[..16] } else { &req.node_id });
+			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\"ok\"".to_string()
+		}
+		Err(e) => {
+			error!("[push] Invalid registration request: {}", e);
+			format!("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\n{}", e)
+		}
+	};
+	let _ = stream.write_all(resp.as_bytes()).await;
 }

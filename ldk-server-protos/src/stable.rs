@@ -60,3 +60,39 @@ pub struct EditStableChannelResponse {
 	#[prost(string, tag = "2")]
 	pub status: ::prost::alloc::string::String,
 }
+
+// RegisterPush
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterPushRequest {
+	#[prost(string, tag = "1")]
+	pub token: ::prost::alloc::string::String,
+	#[prost(string, tag = "2")]
+	pub platform: ::prost::alloc::string::String,
+	#[prost(string, tag = "3")]
+	pub node_id: ::prost::alloc::string::String,
+	#[prost(string, tag = "4")]
+	pub environment: ::prost::alloc::string::String,
+}
+
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterPushResponse {
+	#[prost(bool, tag = "1")]
+	pub ok: bool,
+}
+
+// Log endpoints
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogRequest {
+	#[prost(uint32, tag = "1")]
+	pub max_lines: u32,
+}
+
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LogResponse {
+	#[prost(string, tag = "1")]
+	pub content: ::prost::alloc::string::String,
+}

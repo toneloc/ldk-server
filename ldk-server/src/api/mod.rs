@@ -37,10 +37,11 @@ pub(crate) mod list_peers;
 pub(crate) mod onchain_receive;
 pub(crate) mod onchain_send;
 pub(crate) mod open_channel;
+pub(crate) mod register_push;
 pub(crate) mod sign_message;
 pub(crate) mod splice_channel;
 pub(crate) mod spontaneous_send;
-// STABLE_CHANNELS_DISABLED: pub(crate) mod stable_channels;
+pub(crate) mod stable_channels;
 pub(crate) mod update_channel_config;
 pub(crate) mod verify_signature;
 

@@ -40,3 +40,6 @@ pub const GRAPH_GET_NODE_PATH: &str = "GraphGetNode";
 pub const GET_PRICE_PATH: &str = "GetPrice";
 pub const LIST_STABLE_CHANNELS_PATH: &str = "ListStableChannels";
 pub const EDIT_STABLE_CHANNEL_PATH: &str = "EditStableChannel";
+pub const REGISTER_PUSH_PATH: &str = "RegisterPush";
+pub const AUDIT_LOG_PATH: &str = "AuditLog";
+pub const LDK_LOG_PATH: &str = "LdkLog";
