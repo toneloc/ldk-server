@@ -22,45 +22,29 @@ use ldk_node::bitcoin::hashes::hmac::{Hmac, HmacEngine};
 use ldk_node::bitcoin::hashes::{sha256, Hash, HashEngine};
 use ldk_node::Node;
 use ldk_server_protos::endpoints::{
-	AUDIT_LOG_PATH,
-	BOLT11_RECEIVE_PATH,
-	BOLT11_SEND_PATH,
-	BOLT12_RECEIVE_PATH,
-	BOLT12_SEND_PATH,
-	CLOSE_CHANNEL_PATH,
-	CONNECT_PEER_PATH,
-	DISCONNECT_PEER_PATH,
-	EDIT_STABLE_CHANNEL_PATH,
-	EXPORT_PATHFINDING_SCORES_PATH,
-	FORCE_CLOSE_CHANNEL_PATH,
-	GET_BALANCES_PATH,
-	GET_NODE_INFO_PATH,
-	GET_PAYMENT_DETAILS_PATH,
-	GET_PRICE_PATH,
-	GRAPH_GET_CHANNEL_PATH,
-	GRAPH_GET_NODE_PATH,
-	GRAPH_LIST_CHANNELS_PATH,
-	GRAPH_LIST_NODES_PATH,
-	LDK_LOG_PATH,
-	LIST_CHANNELS_PATH,
-	LIST_FORWARDED_PAYMENTS_PATH,
-	LIST_PAYMENTS_PATH,
-	LIST_PEERS_PATH,
-	LIST_STABLE_CHANNELS_PATH,
-	ONCHAIN_RECEIVE_PATH,
-	ONCHAIN_SEND_PATH,
-	OPEN_CHANNEL_PATH,
-	REGISTER_PUSH_PATH,
-	SIGN_MESSAGE_PATH,
-	SPLICE_IN_PATH,
-	SPLICE_OUT_PATH,
-	SPONTANEOUS_SEND_PATH,
-	UPDATE_CHANNEL_CONFIG_PATH,
-	VERIFY_SIGNATURE_PATH,
+	AUDIT_LOG_PATH, BOLT11_CLAIM_FOR_HASH_PATH, BOLT11_FAIL_FOR_HASH_PATH,
+	BOLT11_RECEIVE_FOR_HASH_PATH, BOLT11_RECEIVE_PATH,
+	BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_PATH, BOLT11_RECEIVE_VIA_JIT_CHANNEL_PATH,
+	BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH, CLOSE_CHANNEL_PATH,
+	CONNECT_PEER_PATH, DISCONNECT_PEER_PATH, EDIT_STABLE_CHANNEL_PATH,
+	EXPORT_PATHFINDING_SCORES_PATH, FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH,
+	GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH, GET_PRICE_PATH, GRAPH_GET_CHANNEL_PATH,
+	GRAPH_GET_NODE_PATH, GRAPH_LIST_CHANNELS_PATH, GRAPH_LIST_NODES_PATH, LDK_LOG_PATH,
+	LIST_CHANNELS_PATH, LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH,
+	LIST_STABLE_CHANNELS_PATH, ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH,
+	REGISTER_PUSH_PATH, SIGN_MESSAGE_PATH, SPLICE_IN_PATH, SPLICE_OUT_PATH,
+	SPONTANEOUS_SEND_PATH, UNIFIED_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH, VERIFY_SIGNATURE_PATH,
 };
 use prost::Message;
 
+use crate::api::bolt11_claim_for_hash::handle_bolt11_claim_for_hash_request;
+use crate::api::bolt11_fail_for_hash::handle_bolt11_fail_for_hash_request;
 use crate::api::bolt11_receive::handle_bolt11_receive_request;
+use crate::api::bolt11_receive_for_hash::handle_bolt11_receive_for_hash_request;
+use crate::api::bolt11_receive_via_jit_channel::{
+	handle_bolt11_receive_variable_amount_via_jit_channel_request,
+	handle_bolt11_receive_via_jit_channel_request,
+};
 use crate::api::bolt11_send::handle_bolt11_send_request;
 use crate::api::bolt12_receive::handle_bolt12_receive_request;
 use crate::api::bolt12_send::handle_bolt12_send_request;
@@ -92,6 +76,7 @@ use crate::api::stable_channels::{
 	handle_audit_log_request, handle_edit_stable_channel_request, handle_get_price_request,
 	handle_ldk_log_request, handle_list_stable_channels_request,
 };
+use crate::api::unified_send::handle_unified_send_request;
 use crate::api::update_channel_config::handle_update_channel_config_request;
 use crate::api::verify_signature::handle_verify_signature_request;
 use crate::io::persist::paginated_kv_store::PaginatedKVStore;
@@ -295,6 +280,41 @@ impl Service<Request<Incoming>> for NodeService {
 				api_key,
 				handle_bolt11_receive_request,
 			)),
+			BOLT11_RECEIVE_FOR_HASH_PATH => Box::pin(handle_request(
+				context,
+				req,
+				auth_params,
+				api_key,
+				handle_bolt11_receive_for_hash_request,
+			)),
+			BOLT11_CLAIM_FOR_HASH_PATH => Box::pin(handle_request(
+				context,
+				req,
+				auth_params,
+				api_key,
+				handle_bolt11_claim_for_hash_request,
+			)),
+			BOLT11_FAIL_FOR_HASH_PATH => Box::pin(handle_request(
+				context,
+				req,
+				auth_params,
+				api_key,
+				handle_bolt11_fail_for_hash_request,
+			)),
+			BOLT11_RECEIVE_VIA_JIT_CHANNEL_PATH => Box::pin(handle_request(
+				context,
+				req,
+				auth_params,
+				api_key,
+				handle_bolt11_receive_via_jit_channel_request,
+			)),
+			BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_PATH => Box::pin(handle_request(
+				context,
+				req,
+				auth_params,
+				api_key,
+				handle_bolt11_receive_variable_amount_via_jit_channel_request,
+			)),
 			BOLT11_SEND_PATH => Box::pin(handle_request(
 				context,
 				req,
@@ -401,6 +421,13 @@ impl Service<Request<Incoming>> for NodeService {
 				auth_params,
 				api_key,
 				handle_spontaneous_send_request,
+			)),
+			UNIFIED_SEND_PATH => Box::pin(handle_request(
+				context,
+				req,
+				auth_params,
+				api_key,
+				handle_unified_send_request,
 			)),
 			SIGN_MESSAGE_PATH => Box::pin(handle_request(
 				context,

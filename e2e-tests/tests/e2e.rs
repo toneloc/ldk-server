@@ -14,7 +14,11 @@ use e2e_tests::{
 	find_available_port, mine_and_sync, run_cli, run_cli_raw, setup_funded_channel,
 	wait_for_onchain_balance, LdkServerHandle, RabbitMqEventConsumer, TestBitcoind,
 };
+use hex_conservative::{DisplayHex, FromHex};
+use ldk_node::bitcoin::hashes::{sha256, Hash};
 use ldk_node::lightning::ln::msgs::SocketAddress;
+use ldk_node::lightning::offers::offer::Offer;
+use ldk_node::lightning_invoice::Bolt11Invoice;
 use ldk_server_client::ldk_server_protos::api::{
 	Bolt11ReceiveRequest, Bolt12ReceiveRequest, OnchainReceiveRequest,
 };
@@ -134,8 +138,14 @@ async fn test_cli_bolt11_receive() {
 	let server = LdkServerHandle::start(&bitcoind).await;
 
 	let output = run_cli(&server, &["bolt11-receive", "50000sat", "-d", "test"]);
-	let invoice = output["invoice"].as_str().unwrap();
-	assert!(invoice.starts_with("lnbcrt"), "Expected lnbcrt prefix, got: {}", invoice);
+	let invoice_str = output["invoice"].as_str().unwrap();
+	assert!(invoice_str.starts_with("lnbcrt"), "Expected lnbcrt prefix, got: {}", invoice_str);
+
+	let invoice: Bolt11Invoice = invoice_str.parse().unwrap();
+	let payment_hash = sha256::Hash::from_str(output["payment_hash"].as_str().unwrap()).unwrap();
+	assert_eq!(*invoice.payment_hash(), payment_hash);
+	let payment_secret = <[u8; 32]>::from_hex(output["payment_secret"].as_str().unwrap()).unwrap();
+	assert_eq!(invoice.payment_secret().0, payment_secret);
 }
 
 #[tokio::test]
@@ -147,8 +157,12 @@ async fn test_cli_bolt12_receive() {
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
 	let output = run_cli(&server_a, &["bolt12-receive", "test offer"]);
-	let offer = output["offer"].as_str().unwrap();
-	assert!(offer.starts_with("lno"), "Expected lno prefix, got: {}", offer);
+	let offer_str = output["offer"].as_str().unwrap();
+	assert!(offer_str.starts_with("lno"), "Expected lno prefix, got: {}", offer_str);
+
+	let offer: Offer = offer_str.parse().unwrap();
+	let offer_id = <[u8; 32]>::from_hex(output["offer_id"].as_str().unwrap()).unwrap();
+	assert_eq!(offer.id().0, offer_id);
 }
 
 #[tokio::test]
@@ -271,8 +285,8 @@ async fn test_cli_bolt11_send() {
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
 	// Set up event consumers before any payments
-	let consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
-	let consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+	let mut consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
+	let mut consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
 
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
@@ -310,6 +324,43 @@ async fn test_cli_bolt11_send() {
 }
 
 #[tokio::test]
+async fn test_cli_pay() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Pay a BOLT11 invoice via unified `pay` command
+	let invoice_resp = server_b
+		.client()
+		.bolt11_receive(Bolt11ReceiveRequest {
+			amount_msat: Some(10_000_000),
+			description: Some(Bolt11InvoiceDescription {
+				kind: Some(bolt11_invoice_description::Kind::Direct("test".to_string())),
+			}),
+			expiry_secs: 3600,
+		})
+		.await
+		.unwrap();
+	let output = run_cli(&server_a, &["pay", &invoice_resp.invoice]);
+	assert!(output.get("bolt11_payment_id").is_some());
+
+	// Pay a BOLT12 offer via unified `pay` command
+	let offer_resp = server_b
+		.client()
+		.bolt12_receive(Bolt12ReceiveRequest {
+			description: "test offer".to_string(),
+			amount_msat: None,
+			expiry_secs: None,
+			quantity: None,
+		})
+		.await
+		.unwrap();
+	let output = run_cli(&server_a, &["pay", &offer_resp.offer, "10000sat"]);
+	assert!(output.get("bolt12_payment_id").is_some());
+}
+
+#[tokio::test]
 async fn test_cli_bolt12_send() {
 	let bitcoind = TestBitcoind::new();
 	let server_a = LdkServerHandle::start(&bitcoind).await;
@@ -339,8 +390,8 @@ async fn test_cli_spontaneous_send() {
 	let server_a = LdkServerHandle::start(&bitcoind).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
-	let consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
-	let consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+	let mut consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
+	let mut consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
 
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
@@ -564,7 +615,7 @@ async fn test_forwarded_payment_event() {
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
 	// Set up RabbitMQ consumer on B before any payments
-	let consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+	let mut consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
 
 	// Open channel A -> B (1M sats, larger for JIT forwarding)
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 1_000_000).await;
@@ -633,4 +684,146 @@ async fn test_forwarded_payment_event() {
 	);
 
 	node_c.stop().unwrap();
+}
+
+#[tokio::test]
+async fn test_hodl_invoice_claim() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let mut consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
+	let mut consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Test three claim variants: (preimage, amount, hash)
+	let test_cases: Vec<([u8; 32], Option<&str>, bool)> = vec![
+		([42u8; 32], Some("10000000msat"), true),  // all args
+		([44u8; 32], Some("10000000msat"), false), // preimage + amount
+		([45u8; 32], None, true),                  // preimage + hash
+		([46u8; 32], None, false),                 // preimage only
+	];
+
+	for (preimage_bytes, amount, include_hash) in &test_cases {
+		let preimage_hex = preimage_bytes.to_lower_hex_string();
+		let payment_hash_hex =
+			sha256::Hash::hash(preimage_bytes).to_byte_array().to_lower_hex_string();
+
+		// Create hodl invoice on B
+		let invoice_resp = run_cli(
+			&server_b,
+			&[
+				"bolt11-receive-for-hash",
+				&payment_hash_hex,
+				"10000000msat",
+				"-d",
+				"hodl test",
+				"-e",
+				"3600",
+			],
+		);
+		let invoice = invoice_resp["invoice"].as_str().unwrap();
+
+		// Pay the hodl invoice from A
+		run_cli(&server_a, &["bolt11-send", invoice]);
+
+		// Verify PaymentClaimable event on B
+		let events_b = consumer_b.consume_events(1, Duration::from_secs(10)).await;
+		assert!(
+			events_b.iter().any(|e| matches!(&e.event, Some(Event::PaymentClaimable(_)))),
+			"Expected PaymentClaimable on receiver, got events: {:?}",
+			events_b.iter().map(|e| &e.event).collect::<Vec<_>>()
+		);
+
+		// Claim the payment on B
+		let mut args: Vec<&str> = vec!["bolt11-claim-for-hash", &preimage_hex];
+		if let Some(amt) = amount {
+			args.extend(["-c", amt]);
+		}
+		if *include_hash {
+			args.extend(["-p", &payment_hash_hex]);
+		}
+		run_cli(&server_b, &args);
+
+		// Verify PaymentReceived event on B
+		let events_b = consumer_b.consume_events(1, Duration::from_secs(10)).await;
+		assert!(
+			events_b.iter().any(|e| matches!(&e.event, Some(Event::PaymentReceived(_)))),
+			"Expected PaymentReceived on receiver after claim, got events: {:?}",
+			events_b.iter().map(|e| &e.event).collect::<Vec<_>>()
+		);
+
+		// Verify PaymentSuccessful on A
+		let events_a = consumer_a.consume_events(1, Duration::from_secs(10)).await;
+		assert!(
+			events_a.iter().any(|e| matches!(&e.event, Some(Event::PaymentSuccessful(_)))),
+			"Expected PaymentSuccessful on sender, got events: {:?}",
+			events_a.iter().map(|e| &e.event).collect::<Vec<_>>()
+		);
+	}
+}
+
+#[tokio::test]
+async fn test_hodl_invoice_fail() {
+	use hex_conservative::DisplayHex;
+	use ldk_node::bitcoin::hashes::{sha256, Hash};
+
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	// Set up event consumers before any payments
+	let mut consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
+	let mut consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Generate a known preimage and compute its payment hash
+	let preimage_bytes = [43u8; 32];
+	let payment_hash = sha256::Hash::hash(&preimage_bytes);
+	let payment_hash_hex = payment_hash.to_byte_array().to_lower_hex_string();
+
+	// Create hodl invoice on B
+	let invoice_resp = run_cli(
+		&server_b,
+		&[
+			"bolt11-receive-for-hash",
+			&payment_hash_hex,
+			"10000000msat",
+			"-d",
+			"hodl fail test",
+			"-e",
+			"3600",
+		],
+	);
+	let invoice = invoice_resp["invoice"].as_str().unwrap();
+
+	// Pay the hodl invoice from A
+	run_cli(&server_a, &["bolt11-send", invoice]);
+
+	// Wait for payment to arrive at B
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// Verify PaymentClaimable event on B
+	let events_b = consumer_b.consume_events(5, Duration::from_secs(10)).await;
+	assert!(
+		events_b.iter().any(|e| matches!(&e.event, Some(Event::PaymentClaimable(_)))),
+		"Expected PaymentClaimable on receiver, got events: {:?}",
+		events_b.iter().map(|e| &e.event).collect::<Vec<_>>()
+	);
+
+	// Fail the payment on B using CLI
+	run_cli(&server_b, &["bolt11-fail-for-hash", &payment_hash_hex]);
+
+	// Wait for failure to propagate
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// Verify PaymentFailed on A
+	let events_a = consumer_a.consume_events(10, Duration::from_secs(10)).await;
+	assert!(
+		events_a.iter().any(|e| matches!(&e.event, Some(Event::PaymentFailed(_)))),
+		"Expected PaymentFailed on sender after hodl rejection, got events: {:?}",
+		events_a.iter().map(|e| &e.event).collect::<Vec<_>>()
+	);
 }

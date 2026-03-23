@@ -22,7 +22,11 @@ use ldk_server_client::error::LdkServerErrorCode::{
 	AuthError, InternalError, InternalServerError, InvalidRequestError, LightningError,
 };
 use ldk_server_client::ldk_server_protos::api::{
-	Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11SendRequest, Bolt11SendResponse,
+	Bolt11ClaimForHashRequest, Bolt11ClaimForHashResponse, Bolt11FailForHashRequest,
+	Bolt11FailForHashResponse, Bolt11ReceiveForHashRequest, Bolt11ReceiveForHashResponse,
+	Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11ReceiveVariableAmountViaJitChannelRequest,
+	Bolt11ReceiveVariableAmountViaJitChannelResponse, Bolt11ReceiveViaJitChannelRequest,
+	Bolt11ReceiveViaJitChannelResponse, Bolt11SendRequest, Bolt11SendResponse,
 	Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
 	CloseChannelRequest, CloseChannelResponse, ConnectPeerRequest, ConnectPeerResponse,
 	DisconnectPeerRequest, DisconnectPeerResponse, ExportPathfindingScoresRequest,
@@ -35,8 +39,8 @@ use ldk_server_client::ldk_server_protos::api::{
 	OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse,
 	OpenChannelRequest, OpenChannelResponse, SignMessageRequest, SignMessageResponse,
 	SpliceInRequest, SpliceInResponse, SpliceOutRequest, SpliceOutResponse, SpontaneousSendRequest,
-	SpontaneousSendResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
-	VerifySignatureRequest, VerifySignatureResponse,
+	SpontaneousSendResponse, UnifiedSendRequest, UnifiedSendResponse, UpdateChannelConfigRequest,
+	UpdateChannelConfigResponse, VerifySignatureRequest, VerifySignatureResponse,
 };
 use ldk_server_client::ldk_server_protos::types::{
 	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig, PageToken,
@@ -134,6 +138,83 @@ enum Commands {
 		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
 		expiry_secs: Option<u32>,
 	},
+	#[command(
+		about = "Create a BOLT11 hodl invoice for a given payment hash (manual claim required)"
+	)]
+	Bolt11ReceiveForHash {
+		#[arg(help = "The hex-encoded 32-byte payment hash")]
+		payment_hash: String,
+		#[arg(
+			help = "Amount to request, e.g. 50sat or 50000msat. If unset, a variable-amount invoice is returned"
+		)]
+		amount: Option<Amount>,
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+	},
+	#[command(about = "Claim a held payment by providing the preimage")]
+	Bolt11ClaimForHash {
+		#[arg(help = "The hex-encoded 32-byte payment preimage")]
+		preimage: String,
+		#[arg(
+			short,
+			long,
+			help = "The claimable amount, e.g. 50sat or 50000msat, only used for verifying we are claiming the expected amount"
+		)]
+		claimable_amount: Option<Amount>,
+		#[arg(
+			short,
+			long,
+			help = "The hex-encoded 32-byte payment hash, used to verify the preimage matches"
+		)]
+		payment_hash: Option<String>,
+	},
+	#[command(about = "Fail/reject a held payment")]
+	Bolt11FailForHash {
+		#[arg(help = "The hex-encoded 32-byte payment hash")]
+		payment_hash: String,
+	},
+	#[command(about = "Create a fixed-amount BOLT11 invoice to receive via an LSPS2 JIT channel")]
+	Bolt11ReceiveViaJitChannel {
+		#[arg(help = "Amount to request, e.g. 50sat or 50000msat")]
+		amount: Amount,
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum total fee an LSP may deduct for opening the JIT channel, e.g. 50sat or 50000msat"
+		)]
+		max_total_lsp_fee_limit: Option<Amount>,
+	},
+	#[command(
+		about = "Create a variable-amount BOLT11 invoice to receive via an LSPS2 JIT channel"
+	)]
+	Bolt11ReceiveVariableAmountViaJitChannel {
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+		#[arg(long, help = "Maximum proportional fee the LSP may deduct in ppm-msat")]
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
+	},
 	#[command(about = "Pay a BOLT11 invoice")]
 	Bolt11Send {
 		#[arg(help = "A BOLT11 invoice for a payment within the Lightning Network")]
@@ -213,6 +294,32 @@ enum Commands {
 		node_id: String,
 		#[arg(help = "The amount to send, e.g. 50sat or 50000msat")]
 		amount: Amount,
+		#[arg(
+			long,
+			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of payment + 50 sats"
+		)]
+		max_total_routing_fee: Option<Amount>,
+		#[arg(long, help = "Maximum total CLTV delta we accept for the route (default: 1008)")]
+		max_total_cltv_expiry_delta: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum number of paths that may be used by MPP payments (default: 10)"
+		)]
+		max_path_count: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum share of a channel's total capacity to send over a channel, as a power of 1/2 (default: 2)"
+		)]
+		max_channel_saturation_power_of_half: Option<u32>,
+	},
+	#[command(
+		about = "Pay a BIP 21 URI, BIP 353 Human-Readable Name, BOLT11 invoice, or BOLT12 offer"
+	)]
+	Pay {
+		#[arg(help = "A BIP 21 URI, BIP 353 Human-Readable Name, BOLT11 invoice, or BOLT12 offer")]
+		uri: String,
+		#[arg(help = "Amount to send, e.g. 50sat or 50000msat. Required for variable-amount URIs")]
+		amount: Option<Amount>,
 		#[arg(
 			long,
 			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of payment + 50 sats"
@@ -527,6 +634,25 @@ async fn main() {
 		},
 		Commands::Bolt11Receive { description, description_hash, expiry_secs, amount } => {
 			let amount_msat = amount.map(|a| a.to_msat());
+			let invoice_description =
+				parse_bolt11_invoice_description(description, description_hash);
+
+			let expiry_secs = expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
+			let request =
+				Bolt11ReceiveRequest { description: invoice_description, expiry_secs, amount_msat };
+
+			handle_response_result::<_, Bolt11ReceiveResponse>(
+				client.bolt11_receive(request).await,
+			);
+		},
+		Commands::Bolt11ReceiveForHash {
+			payment_hash,
+			amount,
+			description,
+			description_hash,
+			expiry_secs,
+		} => {
+			let amount_msat = amount.map(|a| a.to_msat());
 			let invoice_description = match (description, description_hash) {
 				(Some(desc), None) => Some(Bolt11InvoiceDescription {
 					kind: Some(bolt11_invoice_description::Kind::Direct(desc)),
@@ -544,11 +670,65 @@ async fn main() {
 			};
 
 			let expiry_secs = expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
-			let request =
-				Bolt11ReceiveRequest { description: invoice_description, expiry_secs, amount_msat };
+			let request = Bolt11ReceiveForHashRequest {
+				description: invoice_description,
+				expiry_secs,
+				amount_msat,
+				payment_hash,
+			};
 
-			handle_response_result::<_, Bolt11ReceiveResponse>(
-				client.bolt11_receive(request).await,
+			handle_response_result::<_, Bolt11ReceiveForHashResponse>(
+				client.bolt11_receive_for_hash(request).await,
+			);
+		},
+		Commands::Bolt11ClaimForHash { preimage, claimable_amount, payment_hash } => {
+			handle_response_result::<_, Bolt11ClaimForHashResponse>(
+				client
+					.bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
+						payment_hash,
+						claimable_amount_msat: claimable_amount.map(|a| a.to_msat()),
+						preimage,
+					})
+					.await,
+			);
+		},
+		Commands::Bolt11FailForHash { payment_hash } => {
+			handle_response_result::<_, Bolt11FailForHashResponse>(
+				client.bolt11_fail_for_hash(Bolt11FailForHashRequest { payment_hash }).await,
+			);
+		},
+		Commands::Bolt11ReceiveViaJitChannel {
+			amount,
+			description,
+			description_hash,
+			expiry_secs,
+			max_total_lsp_fee_limit,
+		} => {
+			let request = Bolt11ReceiveViaJitChannelRequest {
+				amount_msat: amount.to_msat(),
+				description: parse_bolt11_invoice_description(description, description_hash),
+				expiry_secs: expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS),
+				max_total_lsp_fee_limit_msat: max_total_lsp_fee_limit.map(|a| a.to_msat()),
+			};
+
+			handle_response_result::<_, Bolt11ReceiveViaJitChannelResponse>(
+				client.bolt11_receive_via_jit_channel(request).await,
+			);
+		},
+		Commands::Bolt11ReceiveVariableAmountViaJitChannel {
+			description,
+			description_hash,
+			expiry_secs,
+			max_proportional_lsp_fee_limit_ppm_msat,
+		} => {
+			let request = Bolt11ReceiveVariableAmountViaJitChannelRequest {
+				description: parse_bolt11_invoice_description(description, description_hash),
+				expiry_secs: expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS),
+				max_proportional_lsp_fee_limit_ppm_msat,
+			};
+
+			handle_response_result::<_, Bolt11ReceiveVariableAmountViaJitChannelResponse>(
+				client.bolt11_receive_variable_amount_via_jit_channel(request).await,
 			);
 		},
 		Commands::Bolt11Send {
@@ -649,6 +829,34 @@ async fn main() {
 					.spontaneous_send(SpontaneousSendRequest {
 						amount_msat,
 						node_id,
+						route_parameters: Some(route_parameters),
+					})
+					.await,
+			);
+		},
+		Commands::Pay {
+			uri,
+			amount,
+			max_total_routing_fee,
+			max_total_cltv_expiry_delta,
+			max_path_count,
+			max_channel_saturation_power_of_half,
+		} => {
+			let amount_msat = amount.map(|a| a.to_msat());
+			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
+			let route_parameters = RouteParametersConfig {
+				max_total_routing_fee_msat,
+				max_total_cltv_expiry_delta: max_total_cltv_expiry_delta
+					.unwrap_or(DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA),
+				max_path_count: max_path_count.unwrap_or(DEFAULT_MAX_PATH_COUNT),
+				max_channel_saturation_power_of_half: max_channel_saturation_power_of_half
+					.unwrap_or(DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF),
+			};
+			handle_response_result::<_, UnifiedSendResponse>(
+				client
+					.unified_send(UnifiedSendRequest {
+						uri,
+						amount_msat,
 						route_parameters: Some(route_parameters),
 					})
 					.await,
@@ -955,6 +1163,26 @@ where
 		Err(e) => {
 			handle_error(e);
 		},
+	}
+}
+
+fn parse_bolt11_invoice_description(
+	description: Option<String>, description_hash: Option<String>,
+) -> Option<Bolt11InvoiceDescription> {
+	match (description, description_hash) {
+		(Some(desc), None) => Some(Bolt11InvoiceDescription {
+			kind: Some(bolt11_invoice_description::Kind::Direct(desc)),
+		}),
+		(None, Some(hash)) => Some(Bolt11InvoiceDescription {
+			kind: Some(bolt11_invoice_description::Kind::Hash(hash)),
+		}),
+		(Some(_), Some(_)) => {
+			handle_error(LdkServerError::new(
+				InternalError,
+				"Only one of description or description_hash can be set.".to_string(),
+			));
+		},
+		(None, None) => None,
 	}
 }
 

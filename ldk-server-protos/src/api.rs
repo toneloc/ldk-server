@@ -173,6 +173,161 @@ pub struct Bolt11ReceiveResponse {
 	/// to the recipient.
 	#[prost(string, tag = "1")]
 	pub invoice: ::prost::alloc::string::String,
+	/// The hex-encoded 32-byte payment hash.
+	#[prost(string, tag = "2")]
+	pub payment_hash: ::prost::alloc::string::String,
+	/// The hex-encoded 32-byte payment secret.
+	#[prost(string, tag = "3")]
+	pub payment_secret: ::prost::alloc::string::String,
+}
+/// Return a BOLT11 payable invoice for a given payment hash.
+/// The inbound payment will NOT be automatically claimed upon arrival.
+/// Instead, the payment will need to be manually claimed by calling `Bolt11ClaimForHash`
+/// or manually failed by calling `Bolt11FailForHash`.
+/// See more:
+/// - <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.Bolt11Payment.html#method.receive_for_hash>
+/// - <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.Bolt11Payment.html#method.receive_variable_amount_for_hash>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ReceiveForHashRequest {
+	/// The amount in millisatoshi to receive. If unset, a "zero-amount" or variable-amount invoice is returned.
+	#[prost(uint64, optional, tag = "1")]
+	pub amount_msat: ::core::option::Option<u64>,
+	/// An optional description to attach along with the invoice.
+	/// Will be set in the description field of the encoded payment request.
+	#[prost(message, optional, tag = "2")]
+	pub description: ::core::option::Option<super::types::Bolt11InvoiceDescription>,
+	/// Invoice expiry time in seconds.
+	#[prost(uint32, tag = "3")]
+	pub expiry_secs: u32,
+	/// The hex-encoded 32-byte payment hash to use for the invoice.
+	#[prost(string, tag = "4")]
+	pub payment_hash: ::prost::alloc::string::String,
+}
+/// The response `content` for the `Bolt11ReceiveForHash` API, when HttpStatusCode is OK (200).
+/// When HttpStatusCode is not OK (non-200), the response `content` contains a serialized `ErrorResponse`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ReceiveForHashResponse {
+	/// An invoice for a payment within the Lightning Network.
+	/// With the details of the invoice, the sender has all the data necessary to send a payment
+	/// to the recipient.
+	#[prost(string, tag = "1")]
+	pub invoice: ::prost::alloc::string::String,
+}
+/// Manually claim a payment for a given payment hash with the corresponding preimage.
+/// This should be used to claim payments created via `Bolt11ReceiveForHash`.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.Bolt11Payment.html#method.claim_for_hash>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ClaimForHashRequest {
+	/// The hex-encoded 32-byte payment hash.
+	/// If provided, it will be used to verify that the preimage matches.
+	#[prost(string, optional, tag = "1")]
+	pub payment_hash: ::core::option::Option<::prost::alloc::string::String>,
+	/// The amount in millisatoshi that is claimable.
+	/// If not provided, skips amount verification.
+	#[prost(uint64, optional, tag = "2")]
+	pub claimable_amount_msat: ::core::option::Option<u64>,
+	/// The hex-encoded 32-byte payment preimage.
+	#[prost(string, tag = "3")]
+	pub preimage: ::prost::alloc::string::String,
+}
+/// The response `content` for the `Bolt11ClaimForHash` API, when HttpStatusCode is OK (200).
+/// When HttpStatusCode is not OK (non-200), the response `content` contains a serialized `ErrorResponse`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ClaimForHashResponse {}
+/// Manually fail a payment for a given payment hash.
+/// This should be used to reject payments created via `Bolt11ReceiveForHash`.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.Bolt11Payment.html#method.fail_for_hash>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11FailForHashRequest {
+	/// The hex-encoded 32-byte payment hash.
+	#[prost(string, tag = "1")]
+	pub payment_hash: ::prost::alloc::string::String,
+}
+/// The response `content` for the `Bolt11FailForHash` API, when HttpStatusCode is OK (200).
+/// When HttpStatusCode is not OK (non-200), the response `content` contains a serialized `ErrorResponse`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11FailForHashResponse {}
+/// Return a BOLT11 payable invoice that can be used to request and receive a payment via an
+/// LSPS2 just-in-time channel.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.Bolt11Payment.html#method.receive_via_jit_channel>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ReceiveViaJitChannelRequest {
+	/// The amount in millisatoshi to request.
+	#[prost(uint64, tag = "1")]
+	pub amount_msat: u64,
+	/// An optional description to attach along with the invoice.
+	/// Will be set in the description field of the encoded payment request.
+	#[prost(message, optional, tag = "2")]
+	pub description: ::core::option::Option<super::types::Bolt11InvoiceDescription>,
+	/// Invoice expiry time in seconds.
+	#[prost(uint32, tag = "3")]
+	pub expiry_secs: u32,
+	/// Optional upper bound for the total fee an LSP may deduct when opening the JIT channel.
+	#[prost(uint64, optional, tag = "4")]
+	pub max_total_lsp_fee_limit_msat: ::core::option::Option<u64>,
+}
+/// The response `content` for the `Bolt11ReceiveViaJitChannel` API, when HttpStatusCode is OK (200).
+/// When HttpStatusCode is not OK (non-200), the response `content` contains a serialized `ErrorResponse`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ReceiveViaJitChannelResponse {
+	/// An invoice for a payment within the Lightning Network.
+	#[prost(string, tag = "1")]
+	pub invoice: ::prost::alloc::string::String,
+}
+/// Return a variable-amount BOLT11 invoice that can be used to receive a payment via an LSPS2
+/// just-in-time channel.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.Bolt11Payment.html#method.receive_variable_amount_via_jit_channel>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ReceiveVariableAmountViaJitChannelRequest {
+	/// An optional description to attach along with the invoice.
+	/// Will be set in the description field of the encoded payment request.
+	#[prost(message, optional, tag = "1")]
+	pub description: ::core::option::Option<super::types::Bolt11InvoiceDescription>,
+	/// Invoice expiry time in seconds.
+	#[prost(uint32, tag = "2")]
+	pub expiry_secs: u32,
+	/// Optional upper bound for the proportional fee, in parts-per-million millisatoshis, that an
+	/// LSP may deduct when opening the JIT channel.
+	#[prost(uint64, optional, tag = "3")]
+	pub max_proportional_lsp_fee_limit_ppm_msat: ::core::option::Option<u64>,
+}
+/// The response `content` for the `Bolt11ReceiveVariableAmountViaJitChannel` API, when HttpStatusCode is OK (200).
+/// When HttpStatusCode is not OK (non-200), the response `content` contains a serialized `ErrorResponse`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11ReceiveVariableAmountViaJitChannelResponse {
+	/// An invoice for a payment within the Lightning Network.
+	#[prost(string, tag = "1")]
+	pub invoice: ::prost::alloc::string::String,
 }
 /// Send a payment for a BOLT11 invoice.
 /// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.Bolt11Payment.html#method.send>
@@ -240,6 +395,9 @@ pub struct Bolt12ReceiveResponse {
 	/// to the recipient.
 	#[prost(string, tag = "1")]
 	pub offer: ::prost::alloc::string::String,
+	/// The hex-encoded offer id.
+	#[prost(string, tag = "2")]
+	pub offer_id: ::prost::alloc::string::String,
 }
 /// Send a payment for a BOLT12 offer.
 /// See more:
@@ -836,6 +994,56 @@ pub struct GraphListNodesResponse {
 	/// List of hex-encoded node IDs known to the network graph.
 	#[prost(string, repeated, tag = "1")]
 	pub node_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Send a payment given a BIP 21 URI or BIP 353 Human-Readable Name.
+///
+/// This method parses the provided URI string and attempts to send the payment. If the URI
+/// has an offer and/or invoice, it will try to pay the offer first followed by the invoice.
+/// If they both fail, the on-chain payment will be paid.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.UnifiedPayment.html#method.send>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnifiedSendRequest {
+	/// A BIP 21 URI or BIP 353 Human-Readable Name to pay.
+	#[prost(string, tag = "1")]
+	pub uri: ::prost::alloc::string::String,
+	/// The amount in millisatoshis to send. Required for "zero-amount" or variable-amount URIs.
+	#[prost(uint64, optional, tag = "2")]
+	pub amount_msat: ::core::option::Option<u64>,
+	/// Configuration options for payment routing and pathfinding.
+	#[prost(message, optional, tag = "3")]
+	pub route_parameters: ::core::option::Option<super::types::RouteParametersConfig>,
+}
+/// The response `content` for the `UnifiedSend` API, when HttpStatusCode is OK (200).
+/// When HttpStatusCode is not OK (non-200), the response `content` contains a serialized `ErrorResponse`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnifiedSendResponse {
+	#[prost(oneof = "unified_send_response::PaymentResult", tags = "1, 2, 3")]
+	#[cfg_attr(feature = "serde", serde(flatten))]
+	pub payment_result: ::core::option::Option<unified_send_response::PaymentResult>,
+}
+/// Nested message and enum types in `UnifiedSendResponse`.
+pub mod unified_send_response {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum PaymentResult {
+		/// An on-chain payment was made. Contains the transaction ID.
+		#[prost(string, tag = "1")]
+		Txid(::prost::alloc::string::String),
+		/// A BOLT11 payment was made. Contains the payment ID in hex-encoded form.
+		#[prost(string, tag = "2")]
+		Bolt11PaymentId(::prost::alloc::string::String),
+		/// A BOLT12 payment was made. Contains the payment ID in hex-encoded form.
+		#[prost(string, tag = "3")]
+		Bolt12PaymentId(::prost::alloc::string::String),
+	}
 }
 /// Returns information on a node with the given ID from the network graph.
 /// See more: <https://docs.rs/ldk-node/latest/ldk_node/graph/struct.NetworkGraph.html#method.node>

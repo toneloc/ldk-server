@@ -9,6 +9,7 @@ announcement_addresses = ["127.0.0.1:3001"]   # Announcement addresses
 rest_service_address = "127.0.0.1:3002"       # LDK Server REST address
 api_key = "your-secret-api-key"               # API key for REST requests
 #pathfinding_scores_source_url = ""           # External Pathfinding Scores Source
+#rgs_server_url = "https://rapidsync.lightningdevkit.org/snapshot/v2/"  # Optional: RGS URL for rapid gossip sync
 
 # Storage settings
 [storage.disk]
@@ -40,6 +41,15 @@ server_url = "https://mutinynet.com/api"
 [rabbitmq]
 connection_string = ""
 exchange_name = ""
+
+# LSPS2 Client Support
+[liquidity.lsps2_client]
+# The public key of the LSPS2 LSP we source just-in-time liquidity from.
+node_pubkey = "<lsp node pubkey>"
+# Address to connect to the LSPS2 LSP (IPv4:port, IPv6:port, OnionV3:port, or hostname:port).
+address = "<lsp ip address>:9735"
+# Optional token for authenticating to the LSP.
+# token = ""
 
 # Experimental LSPS2 Service Support
 [liquidity.lsps2_service]

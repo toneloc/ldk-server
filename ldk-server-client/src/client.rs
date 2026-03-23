@@ -16,7 +16,11 @@ use js_sys;
 use bitcoin_hashes::hmac::{Hmac, HmacEngine};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use ldk_server_protos::api::{
-	Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11SendRequest, Bolt11SendResponse,
+	Bolt11ClaimForHashRequest, Bolt11ClaimForHashResponse, Bolt11FailForHashRequest,
+	Bolt11FailForHashResponse, Bolt11ReceiveForHashRequest, Bolt11ReceiveForHashResponse,
+	Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11ReceiveVariableAmountViaJitChannelRequest,
+	Bolt11ReceiveVariableAmountViaJitChannelResponse, Bolt11ReceiveViaJitChannelRequest,
+	Bolt11ReceiveViaJitChannelResponse, Bolt11SendRequest, Bolt11SendResponse,
 	Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
 	CloseChannelRequest, CloseChannelResponse, ConnectPeerRequest, ConnectPeerResponse,
 	DisconnectPeerRequest, DisconnectPeerResponse, ExportPathfindingScoresRequest,
@@ -30,18 +34,21 @@ use ldk_server_protos::api::{
 	OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse,
 	OpenChannelRequest, OpenChannelResponse, SignMessageRequest, SignMessageResponse,
 	SpliceInRequest, SpliceInResponse, SpliceOutRequest, SpliceOutResponse, SpontaneousSendRequest,
-	SpontaneousSendResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
-	VerifySignatureRequest, VerifySignatureResponse,
+	SpontaneousSendResponse, UnifiedSendRequest, UnifiedSendResponse, UpdateChannelConfigRequest,
+	UpdateChannelConfigResponse, VerifySignatureRequest, VerifySignatureResponse,
 };
 use ldk_server_protos::endpoints::{
-	BOLT11_RECEIVE_PATH, BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH,
+	BOLT11_CLAIM_FOR_HASH_PATH, BOLT11_FAIL_FOR_HASH_PATH, BOLT11_RECEIVE_FOR_HASH_PATH,
+	BOLT11_RECEIVE_PATH, BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_PATH,
+	BOLT11_RECEIVE_VIA_JIT_CHANNEL_PATH, BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH,
 	CLOSE_CHANNEL_PATH, CONNECT_PEER_PATH, DISCONNECT_PEER_PATH, EDIT_STABLE_CHANNEL_PATH,
 	EXPORT_PATHFINDING_SCORES_PATH, FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH,
 	GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH, GET_PRICE_PATH, GRAPH_GET_CHANNEL_PATH,
 	GRAPH_GET_NODE_PATH, GRAPH_LIST_CHANNELS_PATH, GRAPH_LIST_NODES_PATH, LIST_CHANNELS_PATH,
 	LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH, LIST_STABLE_CHANNELS_PATH,
 	ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH, SIGN_MESSAGE_PATH, SPLICE_IN_PATH,
-	SPLICE_OUT_PATH, SPONTANEOUS_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH, VERIFY_SIGNATURE_PATH,
+	SPLICE_OUT_PATH, SPONTANEOUS_SEND_PATH, UNIFIED_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH,
+	VERIFY_SIGNATURE_PATH,
 };
 use ldk_server_protos::error::{ErrorCode, ErrorResponse};
 use ldk_server_protos::stable::{
@@ -204,6 +211,58 @@ impl LdkServerClient {
 		self.post_request(&request, &url).await
 	}
 
+	/// Retrieve a new BOLT11 payable invoice for a given payment hash.
+	/// The inbound payment will NOT be automatically claimed upon arrival.
+	/// For API contract/usage, refer to docs for [`Bolt11ReceiveForHashRequest`] and [`Bolt11ReceiveForHashResponse`].
+	pub async fn bolt11_receive_for_hash(
+		&self, request: Bolt11ReceiveForHashRequest,
+	) -> Result<Bolt11ReceiveForHashResponse, LdkServerError> {
+		let url = format!("https://{}/{BOLT11_RECEIVE_FOR_HASH_PATH}", self.base_url);
+		self.post_request(&request, &url).await
+	}
+
+	/// Manually claim a payment for a given payment hash with the corresponding preimage.
+	/// For API contract/usage, refer to docs for [`Bolt11ClaimForHashRequest`] and [`Bolt11ClaimForHashResponse`].
+	pub async fn bolt11_claim_for_hash(
+		&self, request: Bolt11ClaimForHashRequest,
+	) -> Result<Bolt11ClaimForHashResponse, LdkServerError> {
+		let url = format!("https://{}/{BOLT11_CLAIM_FOR_HASH_PATH}", self.base_url);
+		self.post_request(&request, &url).await
+	}
+
+	/// Manually fail a payment for a given payment hash.
+	/// For API contract/usage, refer to docs for [`Bolt11FailForHashRequest`] and [`Bolt11FailForHashResponse`].
+	pub async fn bolt11_fail_for_hash(
+		&self, request: Bolt11FailForHashRequest,
+	) -> Result<Bolt11FailForHashResponse, LdkServerError> {
+		let url = format!("https://{}/{BOLT11_FAIL_FOR_HASH_PATH}", self.base_url);
+		self.post_request(&request, &url).await
+	}
+
+	/// Retrieve a new fixed-amount BOLT11 invoice for receiving via an LSPS2 JIT channel.
+	/// For API contract/usage, refer to docs for [`Bolt11ReceiveViaJitChannelRequest`] and
+	/// [`Bolt11ReceiveViaJitChannelResponse`].
+	pub async fn bolt11_receive_via_jit_channel(
+		&self, request: Bolt11ReceiveViaJitChannelRequest,
+	) -> Result<Bolt11ReceiveViaJitChannelResponse, LdkServerError> {
+		let url = format!("https://{}/{BOLT11_RECEIVE_VIA_JIT_CHANNEL_PATH}", self.base_url);
+		self.post_request(&request, &url).await
+	}
+
+	/// Retrieve a new variable-amount BOLT11 invoice for receiving via an LSPS2 JIT channel.
+	/// For API contract/usage, refer to docs for
+	/// [`Bolt11ReceiveVariableAmountViaJitChannelRequest`] and
+	/// [`Bolt11ReceiveVariableAmountViaJitChannelResponse`].
+	pub async fn bolt11_receive_variable_amount_via_jit_channel(
+		&self, request: Bolt11ReceiveVariableAmountViaJitChannelRequest,
+	) -> Result<Bolt11ReceiveVariableAmountViaJitChannelResponse, LdkServerError> {
+		let url = format!(
+			"https://{}/{BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_PATH}",
+			self.base_url,
+		);
+		self.post_request(&request, &url).await
+	}
+
 	/// Send a payment for a BOLT11 invoice.
 	/// For API contract/usage, refer to docs for [`Bolt11SendRequest`] and [`Bolt11SendResponse`].
 	pub async fn bolt11_send(
@@ -354,6 +413,15 @@ impl LdkServerClient {
 		&self, request: SpontaneousSendRequest,
 	) -> Result<SpontaneousSendResponse, LdkServerError> {
 		let url = self.build_url(SPONTANEOUS_SEND_PATH);
+		self.post_request(&request, &url).await
+	}
+
+	/// Send a payment given a BIP 21 URI or BIP 353 Human-Readable Name.
+	/// For API contract/usage, refer to docs for [`UnifiedSendRequest`] and [`UnifiedSendResponse`].
+	pub async fn unified_send(
+		&self, request: UnifiedSendRequest,
+	) -> Result<UnifiedSendResponse, LdkServerError> {
+		let url = format!("https://{}/{UNIFIED_SEND_PATH}", self.base_url);
 		self.post_request(&request, &url).await
 	}
 

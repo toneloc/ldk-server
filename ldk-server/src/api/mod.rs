@@ -14,7 +14,11 @@ use ldk_server_protos::types::channel_config::MaxDustHtlcExposure;
 use crate::api::error::LdkServerError;
 use crate::api::error::LdkServerErrorCode::InvalidRequestError;
 
+pub(crate) mod bolt11_claim_for_hash;
+pub(crate) mod bolt11_fail_for_hash;
 pub(crate) mod bolt11_receive;
+pub(crate) mod bolt11_receive_for_hash;
+pub(crate) mod bolt11_receive_via_jit_channel;
 pub(crate) mod bolt11_send;
 pub(crate) mod bolt12_receive;
 pub(crate) mod bolt12_send;
@@ -42,6 +46,7 @@ pub(crate) mod sign_message;
 pub(crate) mod splice_channel;
 pub(crate) mod spontaneous_send;
 pub(crate) mod stable_channels;
+pub(crate) mod unified_send;
 pub(crate) mod update_channel_config;
 pub(crate) mod verify_signature;
 

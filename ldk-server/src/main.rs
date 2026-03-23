@@ -172,6 +172,18 @@ fn main() {
 		builder.set_pathfinding_scores_source(pathfinding_scores_source);
 	}
 
+	if let Some(rgs_server_url) = config_file.rgs_server_url {
+		builder.set_gossip_source_rgs(rgs_server_url);
+	}
+
+	if let Some(lsps2_client_config) = config_file.lsps2_client_config {
+		builder.set_liquidity_source_lsps2(
+			lsps2_client_config.node_id,
+			lsps2_client_config.address,
+			lsps2_client_config.token,
+		);
+	}
+
 	// LSPS2 support is highly experimental and for testing purposes only.
 	#[cfg(feature = "experimental-lsps2-support")]
 	builder.set_liquidity_provider_lsps2(
@@ -408,12 +420,13 @@ fn main() {
 								Arc::clone(&paginated_store)).await;
 						},
 						Event::PaymentClaimable {payment_id, ..} => {
-							if let Some(payment_details) = event_node.payment(&payment_id) {
-								let payment = payment_to_proto(payment_details);
-								upsert_payment_details(&event_node, Arc::clone(&paginated_store), &payment);
-							} else {
-								error!("Unable to find payment with paymentId: {payment_id}");
-							}
+							publish_event_and_upsert_payment(&payment_id,
+								|payment_ref| event_envelope::Event::PaymentClaimable(events::PaymentClaimable {
+									payment: Some(payment_ref.clone()),
+								}),
+								&event_node,
+								Arc::clone(&event_publisher),
+								Arc::clone(&paginated_store)).await;
 						},
 						Event::PaymentForwarded {
 							prev_channel_id,
