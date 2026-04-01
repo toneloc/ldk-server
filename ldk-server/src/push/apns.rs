@@ -79,19 +79,21 @@ impl ApnsService {
             _ => "Processing payment...",
         };
 
-        let builder = DefaultNotificationBuilder::new()
+        let mut payload = DefaultNotificationBuilder::new()
             .set_title(title)
             .set_body(body)
             .set_mutable_content()
-            .set_sound("default");
+            .set_sound("default")
+            .build(token, NotificationOptions {
+                apns_topic: Some(APNS_TOPIC),
+                apns_priority: Some(Priority::High),
+                ..Default::default()
+            });
 
-        let options = NotificationOptions {
-            apns_topic: Some(APNS_TOPIC),
-            apns_priority: Some(Priority::High),
-            ..Default::default()
-        };
-
-        let payload = builder.build(token, options);
+        // Add custom data so the NSE can read the payment direction
+        let mut stability_data = std::collections::HashMap::new();
+        stability_data.insert("direction", direction);
+        let _ = payload.add_custom_data("stability", &stability_data);
 
         match client.send(payload).await {
             Ok(response) => info!("[apns] Push sent to {}: {:?}", &token[..8], response),

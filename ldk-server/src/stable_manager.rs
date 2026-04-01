@@ -294,22 +294,10 @@ impl StableChannelManager {
 				continue;
 			}
 
-			// Derive backing_sats from channel balance (same as check_stability)
-			let user_sats = node
-				.list_channels()
-				.iter()
-				.find(|c| c.user_channel_id.0 == sc.user_channel_id)
-				.map(|c| {
-					let unspendable = c.unspendable_punishment_reserve.unwrap_or(0);
-					let lsp_sats = (c.outbound_capacity_msat / 1000) + unspendable;
-					c.channel_value_sats.saturating_sub(lsp_sats)
-				})
-				.unwrap_or(0);
-			let derived_backing = user_sats.saturating_sub(sc.native_sats);
-
 			// Quick drift check -- does this channel need a stability payment?
-			let stable_usd_value = if derived_backing > 0 {
-				(derived_backing as f64 / 100_000_000.0) * current_price
+			// Use backing_sats directly (set at trade time, reset after payments)
+			let stable_usd_value = if sc.backing_sats > 0 {
+				(sc.backing_sats as f64 / 100_000_000.0) * current_price
 			} else {
 				sc.stable_receiver_usd.0
 			};
@@ -789,10 +777,19 @@ impl StableChannelManager {
 				// Send SYNC_V1 to sync the user after stable deduction
 				self.send_sync_message(node, sc_user_channel_id, new_expected_usd, sc_counterparty);
 			} else {
+				// Payment fully covered by native — update native_sats to reflect the spend
+				sc.native_sats = native_sats.saturating_sub(total_sats);
+				stable::recompute_native(sc);
+				// Set cooldown — stability check can see intermediate states during HTLC forwarding
+				sc.last_stability_payment = std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap_or_default()
+					.as_secs() as i64;
 				info!(
-					"[forwarded] channel {} spent {} sats from native BTC ({} native available), stable ${:.2} unchanged",
-					prev_channel_id, total_sats, native_sats, sc.expected_usd.0
+					"[forwarded] channel {} spent {} sats from native BTC ({} -> {} native), stable ${:.2} unchanged",
+					prev_channel_id, total_sats, native_sats, sc.native_sats, sc.expected_usd.0
 				);
+				self.save_stable_channels();
 			}
 		}
 	}
