@@ -1,56 +1,256 @@
-# ldk-server-config.toml
+# LDK Server Configuration
 
-# Lightning node settings
+# Configuration Priority (highest to lowest):
+# 1. Command-line arguments: cargo run --bin ldk-server -- --help
+# 2. Environment variables: LDK_SERVER_* prefix (e.g., LDK_SERVER_NODE_NETWORK=testnet)
+# 3. Config file values (this file)
+# 4. Built-in defaults
+
+# Common Environment Variables:
+# - LDK_SERVER_NODE_NETWORK
+# - LDK_SERVER_NODE_LISTENING_ADDRESS
+# - LDK_SERVER_NODE_REST_SERVICE_ADDRESS
+# - LDK_SERVER_NODE_ALIAS
+# - LDK_SERVER_STORAGE_DIR_PATH
+
+# Documentation: https://docs.rs/ldk-node/latest/ldk_node/
+
 [node]
-network = "signet"                            # Bitcoin network to use (mutinynet)
-alias = "ldk-regtest"                         # REQUIRED for announcement (<=32 bytes, printable)
-listening_addresses = ["127.0.0.1:3001"]      # Lightning node listening addresses
-announcement_addresses = ["127.0.0.1:3001"]   # Announcement addresses
-rest_service_address = "127.0.0.1:3002"       # LDK Server REST address
-api_key = "your-secret-api-key"               # API key for REST requests
 
-# Storage settings
+# Bitcoin network to use: "bitcoin" (mainnet), "testnet", "signet", or "regtest"
+# Default: signet
+# For signet: Use public block explorer like mutinynet.com
+# For regtest: Use local bitcoind RPC (see [bitcoind] section)
+network = "signet"
+
+# Node alias (max 32 bytes, printable ASCII characters only)
+# Used for Lightning Network announcements
+# Visible to other peers when discovering routes
+# Default: "ldk-server"
+alias = "ldk-regtest"
+
+# Lightning network listening addresses (can specify multiple)
+# Format: "host:port"
+# This is where other Lightning peers can connect to your node
+# Default: ["127.0.0.1:3001"]
+# For public deployment: Use "0.0.0.0:port" or actual public IP
+listening_addresses = ["127.0.0.1:3001"]
+
+# Announced addresses (publicly reachable, for gossiping to network)
+# Can differ from listening_addresses for NAT scenarios
+# Format: "host:port"
+# Default: ["127.0.0.1:3001"]
+# For home node: Can leave as is for local network
+# For public node: Use actual public IP or domain
+announcement_addresses = ["127.0.0.1:3001"]
+
+# REST API service address (where clients connect to this server)
+# Format: "host:port"
+# Default: "127.0.0.1:3002"
+# For local development: "127.0.0.1:3002"
+# For Umbrel app: Usually "0.0.0.0:3002" with reverse proxy
+rest_service_address = "127.0.0.1:3002"
+
+# API authentication key for REST requests
+# REQUIRED: Set a strong random value for production
+# Client applications must include this in a header when calling endpoints
+# Default: (no default - should be set)
+api_key = "your-secret-api-key"
+
 [storage.disk]
-dir_path = "/tmp/ldk-server/"                 # Path for LDK and BDK data persistence
 
-# Logging
+# Path for LDK and BDK data persistence
+# Stores: node keys, channel state, payment history, block chain graph
+# Default: "/tmp/ldk-server/"
+# Requirements:
+#   - Must be writable by the ldk-server process
+#   - Should be on persistent storage (not /tmp for production)
+#   - Should have adequate disk space (typically <500MB for small nodes)
+# For Umbrel app: Should be in Umbrel's persistent volume
+# For production: Use dedicated SSD partition for performance
+dir_path = "/tmp/ldk-server/"
+
 [log]
+
+# Log level: "Error", "Warn", "Info", "Debug", "Trace"
+# Default: "Info"
+# Recommendations:
+#   - "Error"/"Warn": Production (minimal output)
+#   - "Info": Safe for production (standard messages)
+#   - "Debug": Development and troubleshooting
+#   - "Trace": Deep debugging (generates lots of output)
 level = "Debug"
+
+# Optional: Path to log file
+# Default: (not set - logs to stderr)
+# If set, logs will be written to this file
+# For production: Set to a persistent path (e.g., "/var/log/ldk-server/ldk-server.log")
+# Leave unset for containerized/systemd deployments (let orchestrator handle logs)
 file_path = "/tmp/ldk-server/ldk-server.log"
 
-# TLS
 [tls]
-#cert_path = "/path/to/tls.crt"
-#key_path = "/path/to/tls.key"
-hosts = ["localhost"]
 
 # ─────────────────────────────────────────────
 # CHAIN SOURCE (EXACTLY ONE)
 # Regtest ⇒ bitcoind
 # ─────────────────────────────────────────────
+# Optional: Path to TLS certificate file (PEM format)
+# If both cert_path and key_path are provided, TLS is enabled
+# If not provided, self-signed certificate will be generated
+# Default: (not set - auto-generated in storage.disk.dir_path)
+# For production: Use valid certificate from Let's Encrypt or trusted CA
+# cert_path = "/path/to/tls.crt"
+
+# Optional: Path to TLS private key file (PEM format)
+# Required if cert_path is set
+# Default: (not set - auto-generated in storage.disk.dir_path)
+# key_path = "/path/to/tls.key"
+
+# Hostnames for TLS certificate validation
+# Used in Server Name Indication (SNI) for TLS
+# Default: ["localhost"]
+# For Umbrel: May need to include the actual hostname or domain
+hosts = ["localhost"]
 
 [esplora]
-server_url = "https://mutinynet.com/api"  
 
 # ─────────────────────────────────────────────
 # Optional / features
 # ─────────────────────────────────────────────
+# Esplora block explorer API endpoint
+# Recommended for simplicity - uses public APIs
+#
+# Public endpoints (recommended):
+# - Mainnet: "https://blockstream.info/api"
+# - Testnet: "https://blockstream.info/testnet/api"
+# - Signet: "https://mutinynet.com/api"
+#
+# Or run your own Esplora instance for privacy
+# Default for signet: "https://mutinynet.com/api"
+server_url = "https://mutinynet.com/api"
+
+# Alternative: Electrum chain source
+# Uncomment to use Electrum instead of Esplora
+# [electrum]
+# # Electrum server endpoint
+# # Default port: 50001
+# # For testnet: Append "?network=testnet"
+# # Example running locally: "127.0.0.1:50001"
+# server_url = "electrum.example.com:50001"
+
+# Alternative: Local bitcoind RPC (best for regtest or self-hosted)
+# Uncomment to use bitcoind instead of Esplora
+# [bitcoind]
+# # Local bitcoind RPC endpoint
+# rpc_address = "127.0.0.1:18332"
+# # Bitcoin RPC credentials from bitcoind config
+# rpc_user = "bitcoin"
+# rpc_password = "password"
 
 [rabbitmq]
+
+# RabbitMQ connection string for event publishing
+# Format: "amqp://user:password@host:port/"
+# Default: "" (disabled)
+# Leave empty to disable event publishing
+# For testing: "amqp://guest:guest@127.0.0.1:5672/"
 connection_string = ""
+
+# RabbitMQ exchange name for publishing events
+# Only used if connection_string is set
+# Default: "" (no default - required if using RabbitMQ)
+# Example: "ldk_server_events"
 exchange_name = ""
 
 # Experimental LSPS2 Service Support
 [liquidity.lsps2_service]
+
+# Enable LSPS2 liquidity provider support (advertise to peers)
+# Default: false
+# IMPORTANT: Set to true to enable LSP functionality in Stable Channels
 advertise_service = false
 
+# Channel opening fee in parts per million (ppm)
+# 1000 ppm = 0.1% fee on channel opening
+# Example: 1000 ppm on 10M sats = 100k sats fee
+# Default: 1000
+# Typical range: 500-5000 (0.05% - 0.5%)
 channel_opening_fee_ppm = 1000
+
+# Over-provisioning factor for channel capacity
+# 500000 ppm = 50% over-provisioning
+# Means LSP keeps 50% buffer in channels for its own usage
+# Example: Open 100M channel, keep 50M buffer, give 50M to client
+# Default: 500000 (50%)
+# Typical range: 300000-1000000 (30%-100%)
 channel_over_provisioning_ppm = 500000
+
+# Minimum fee for channel opening (in millisats)
+# Even if ppm formula results in less, charge at least this much
+# 10000000 msats = 0.1 BTC (10M sats)
+# Default: 10000000
+# Typical: 1000000-100000000 (0.01-1 BTC)
 min_channel_opening_fee_msat = 10000000
+
+# Minimum channel lifetime (in blocks)
+# ~4320 blocks ≈ 30 days on Bitcoin mainnet (1 block ≈ 10 minutes)
+# ~240 blocks ≈ 30 minutes on Lightning (signet - faster confirmations)
+# Channels must remain open for at least this duration
+# Default: 4320 (≈30 days)
+# Adjust for your business model (lower = more flexible, higher = more stable)
 min_channel_lifetime = 4320
+
+# Maximum client-requested CLTV expiry delta
+# CLTV = CheckLockTimeVerify (payment expiry constraint)
+# Limits how long clients can request payment timeouts
+# Typical range: 576-2016 blocks (≈4 hours - 14 hours)
+# Default: 1440 (≈10 hours on mainnet)
+# Lower = faster feedback, Higher = more time for routing
 max_client_to_self_delay = 1440
+
+# Minimum payment size (in millisats)
+# Reject payments smaller than this amount
+# 10000000 msats = 0.1 BTC (10M sats)
+# Default: 10000000
+# Used to avoid overhead from tiny payments
 min_payment_size_msat = 10000000
+
+# Maximum payment size (in millisats)
+# Reject payments larger than this amount
+# 25000000000 msats = 250 BTC (25B sats)
+# Default: 25000000000 (250 BTC)
+# Used to limit exposure/risk per payment
 max_payment_size_msat = 25000000000
+
+# Trust relationship with clients
+# false = Strict: Clients must prove payment before channel opening
+# true = Trusting: Open channels based on client requests
+# Default: false (recommended for LSP)
+# Set to true only if you trust your clients (e.g., internal deployment)
 client_trusts_lsp = false
 
-# require_token = ""
+# Optional: Token requirement for accessing LSP service
+# If set, clients must provide this token to use the service
+# Useful for restricting access to specific users
+# Default: (not set - service open to all)
+# Uncomment and set value to enable: require_token = "token-string"
+
+# Network Configuration Examples
+
+# Mainnet reference (Bitcoin):
+#   network = "bitcoin"
+#   esplora: server_url = "https://blockstream.info/api"
+#   Adjust channel fees/lifetimes for real value
+#
+# Testnet reference:
+#   network = "testnet"
+#   esplora: server_url = "https://blockstream.info/testnet/api"
+#
+# Signet reference (recommended for testing):
+#   network = "signet"
+#   esplora: server_url = "https://mutinynet.com/api"
+#
+# Regtest reference (local development):
+#   network = "regtest"
+#   bitcoind: server_url = "127.0.0.1:18443"  (local regtest port)
+#   Add bitcoind RPC credentials below
