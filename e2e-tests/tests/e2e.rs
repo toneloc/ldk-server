@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use e2e_tests::{
 	find_available_port, mine_and_sync, run_cli, run_cli_raw, setup_funded_channel,
-	wait_for_onchain_balance, LdkServerHandle, RabbitMqEventConsumer, TestBitcoind,
+	wait_for_onchain_balance, wait_for_usable_channel, LdkServerHandle, RabbitMqEventConsumer, TestBitcoind,
 };
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_server_client::ldk_server_protos::api::{
-	Bolt11ReceiveRequest, Bolt12ReceiveRequest, OnchainReceiveRequest,
+	Bolt11ReceiveRequest, Bolt12ReceiveRequest, OnchainReceiveRequest, GetBalancesRequest, GetNodeInfoRequest, ListChannelsRequest,
 };
 use ldk_server_client::ldk_server_protos::types::{
 	bolt11_invoice_description, Bolt11InvoiceDescription,
@@ -610,4 +610,159 @@ async fn test_forwarded_payment_event() {
 	);
 
 	node_c.stop().unwrap();
+}
+
+// === Edge Cases and Stress Tests ===
+
+#[tokio::test]
+async fn test_node_restart_persistence() {
+	let bitcoind = TestBitcoind::new();
+	let mut server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Query balance
+	let bal_before = server_a.client().get_balances(GetBalancesRequest {}).await.unwrap();
+
+	// Restart
+	server_a.restart().await;
+
+	// Wait for chain sync
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 1).await;
+	wait_for_usable_channel(server_a.client(), &bitcoind, Duration::from_secs(60)).await;
+
+	// Query balance again
+	let bal_after = server_a.client().get_balances(GetBalancesRequest {}).await.unwrap();
+
+	assert_eq!(bal_before.total_lightning_balance_sats, bal_after.total_lightning_balance_sats);
+	assert_eq!(bal_before.spendable_onchain_balance_sats, bal_after.spendable_onchain_balance_sats);
+}
+
+#[tokio::test]
+async fn test_concurrent_api_contention() {
+	use futures_util::future::join_all;
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+
+	let mut tasks = vec![];
+	// 5 read-only tasks hammering state
+	for _ in 0..5 {
+		let client = server_a.client().clone();
+		tasks.push(tokio::spawn(async move {
+			for _ in 0..20 {
+				let _ = client.get_node_info(GetNodeInfoRequest {}).await;
+				let _ = client.get_balances(GetBalancesRequest {}).await;
+				let _ = client.list_channels(ListChannelsRequest {}).await;
+			}
+		}));
+	}
+
+	// 1 heavy write task
+	let write_client = server_a.client().clone();
+	tasks.push(tokio::spawn(async move {
+		for _ in 0..10 {
+			let _ = write_client.onchain_receive(OnchainReceiveRequest {}).await;
+		}
+	}));
+
+	join_all(tasks).await;
+	// Verify server is still alive
+	let info = server_a.client().get_node_info(GetNodeInfoRequest {}).await.unwrap();
+	assert_eq!(info.node_id, server_a.node_id());
+}
+
+#[tokio::test]
+async fn test_event_consumer_overload() {
+	use futures_util::future::join_all;
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
+
+	let invalid_node_id = "020000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+	let mut tasks = vec![];
+	for _ in 0..50 {
+		let client = server_a.client().clone();
+		let dest = invalid_node_id.clone();
+		tasks.push(tokio::spawn(async move {
+			let _ = client.spontaneous_send(ldk_server_protos::api::SpontaneousSendRequest {
+				node_id: dest,
+				amount_msat: 1000,
+				route_parameters: None,
+			}).await;
+		}));
+	}
+
+	join_all(tasks).await;
+
+	// Verify PaymentFailed events emit rapidly without crashing
+	let events = consumer_a.consume_events(50, Duration::from_secs(10)).await;
+	assert!(!events.is_empty(), "Expected at least some PaymentFailed events to be captured");
+}
+
+#[tokio::test]
+async fn test_invalid_onchain_address() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+
+	// Mainnet address on a Regtest node
+	let invalid_address = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string();
+
+	let result = server_a.client().onchain_send(ldk_server_protos::api::OnchainSendRequest {
+		address: invalid_address,
+		amount_sats: Some(100_000),
+		fee_rate_sat_per_vb: None,
+		send_all: None,
+	}).await;
+
+	assert!(result.is_err(), "Expected onchain_send to fail for a mainnet address on regtest");
+}
+
+#[tokio::test]
+async fn test_expired_invoice_payment() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Generate invoice with 1 second expiry
+	let invoice_resp = server_b.client().bolt11_receive(Bolt11ReceiveRequest {
+		amount_msat: Some(10_000_000),
+		description: Some(Bolt11InvoiceDescription {
+			kind: Some(bolt11_invoice_description::Kind::Direct("test".to_string())),
+		}),
+		expiry_secs: 1,
+	}).await.unwrap();
+
+	// Wait 2 seconds for it to expire
+	tokio::time::sleep(Duration::from_secs(2)).await;
+
+	let result = server_a.client().bolt11_send(ldk_server_protos::api::Bolt11SendRequest {
+		invoice: invoice_resp.invoice,
+		amount_msat: None,
+		route_parameters: None,
+	}).await;
+
+	// Expected to fail because the invoice is inherently expired before the node attempts to construct the route
+	assert!(result.is_err(), "Expected bolt11_send to fail for an expired invoice");
+}
+
+#[tokio::test]
+async fn test_invalid_auth_token() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+
+	let tls_cert_pem = std::fs::read(&server_a.tls_cert_path).unwrap();
+	
+	let bad_client = ldk_server_client::client::LdkServerClient::new(
+		server_a.base_url(),
+		"invalid_api_key_deadbeef".to_string(),
+		&tls_cert_pem
+	).unwrap();
+
+	let result = bad_client.get_node_info(GetNodeInfoRequest {}).await;
+
+	assert!(result.is_err(), "Expected get_node_info to fail with explicitly invalid API key");
 }

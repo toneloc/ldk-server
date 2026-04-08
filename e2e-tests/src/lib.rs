@@ -224,6 +224,52 @@ client_trusts_lsp = true
 	pub fn base_url(&self) -> String {
 		format!("127.0.0.1:{}", self.rest_port)
 	}
+
+	/// Stops the server gracefully by sending SIGTERM.
+	pub async fn stop(&mut self) {
+		if let Some(mut child) = self.child.take() {
+			let pid = child.id().to_string();
+			let _ = Command::new("kill").arg(&pid).output();
+			let _ = child.wait();
+		}
+	}
+
+	/// Restarts the server using the existing configuration and storage directory.
+	pub async fn restart(&mut self) {
+		self.stop().await;
+
+		let config_path = self.storage_dir.join("config.toml");
+		let server_binary = server_binary_path();
+		let mut child = Command::new(&server_binary)
+			.arg(config_path.to_str().unwrap())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.unwrap_or_else(|e| {
+				panic!("Failed to restart ldk-server binary at {:?}: {}", server_binary, e)
+			});
+
+		let stdout = child.stdout.take().unwrap();
+		std::thread::spawn(move || {
+			let reader = BufReader::new(stdout);
+			for line in reader.lines().map_while(Result::ok) {
+				eprintln!("[ldk-server stdout] {}", line);
+			}
+		});
+		let stderr = child.stderr.take().unwrap();
+		std::thread::spawn(move || {
+			let reader = BufReader::new(stderr);
+			for line in reader.lines().map_while(Result::ok) {
+				if line.contains("Failed to retrieve fee rate estimates") {
+					continue;
+				}
+				eprintln!("[ldk-server stderr] {}", line);
+			}
+		});
+
+		self.child = Some(child);
+		wait_for_server_ready(self, Duration::from_secs(60)).await;
+	}
 }
 
 impl Drop for LdkServerHandle {
