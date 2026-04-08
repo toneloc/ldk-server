@@ -474,6 +474,7 @@ async fn publish_event_and_upsert_payment(
 
 		let event = payment_to_event(&payment);
 		let event_name = get_event_name(&event);
+		upsert_payment_details(event_node, Arc::clone(&paginated_store), &payment);
 		match event_publisher.publish(EventEnvelope { event: Some(event) }).await {
 			Ok(_) => {},
 			Err(e) => {
@@ -481,8 +482,6 @@ async fn publish_event_and_upsert_payment(
 				return;
 			},
 		};
-
-		upsert_payment_details(event_node, Arc::clone(&paginated_store), &payment);
 	} else {
 		error!("Unable to find payment with paymentId: {payment_id}");
 	}
