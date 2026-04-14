@@ -68,19 +68,33 @@ impl TestBitcoind {
 	}
 
 	/// Returns (host, port, user, password) for the bitcoind RPC.
-	pub fn rpc_details(&self) -> (String, u16, String, String) {
+	pub fn rpc_details(&self) -> Result<(String, u16, String, String), String> {
 		let rpc_url = self.rpc_url();
 		let rpc_address = rpc_url.strip_prefix("http://").unwrap_or(&rpc_url);
 		let rpc_parts: Vec<&str> = rpc_address.splitn(2, ':').collect();
-		let host = rpc_parts[0].to_string();
-		let port: u16 = rpc_parts[1].parse().unwrap();
+		
+		let host = rpc_parts.first()
+			.ok_or("RPC address missing host".to_string())?
+			.to_string();
+		
+		let port: u16 = rpc_parts.get(1)
+			.ok_or("RPC address missing port".to_string())?
+			.parse()
+			.map_err(|e: std::num::ParseIntError| format!("Failed to parse RPC port: {}", e))?;
 
-		let cookie_content = std::fs::read_to_string(self.rpc_cookie()).unwrap();
-		let mut parts = cookie_content.splitn(2, ':');
-		let user = parts.next().unwrap().to_string();
-		let password = parts.next().unwrap().to_string();
+		let cookie_path = self.rpc_cookie();
+		let cookie_content = std::fs::read_to_string(&cookie_path)
+			.map_err(|e| format!("Failed to read RPC cookie from {:?}: {}", cookie_path, e))?;
+		
+		let mut parts = cookie_content.trim().splitn(2, ':');
+		let user = parts.next()
+			.ok_or("RPC cookie missing username (expected 'user:password' format)".to_string())?
+			.to_string();
+		let password = parts.next()
+			.ok_or("RPC cookie missing password (expected 'user:password' format)".to_string())?
+			.to_string();
 
-		(host, port, user, password)
+		Ok((host, port, user, password))
 	}
 }
 
@@ -106,7 +120,8 @@ impl LdkServerHandle {
 		let rest_port = find_available_port();
 		let p2p_port = find_available_port();
 
-		let (rpc_host, rpc_port_num, rpc_user, rpc_password) = bitcoind.rpc_details();
+		let (rpc_host, rpc_port_num, rpc_user, rpc_password) = bitcoind.rpc_details()
+			.expect("Failed to get bitcoind RPC details");
 		let rpc_address = format!("{rpc_host}:{rpc_port_num}");
 
 		let exchange_name = format!("e2e_test_exchange_{rest_port}");

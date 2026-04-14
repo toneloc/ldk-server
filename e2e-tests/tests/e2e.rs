@@ -566,7 +566,8 @@ async fn test_forwarded_payment_event() {
 	};
 
 	let mut builder_c = ldk_node::Builder::from_config(config_c);
-	let (rpc_host, rpc_port, rpc_user, rpc_password) = bitcoind.rpc_details();
+	let (rpc_host, rpc_port, rpc_user, rpc_password) = bitcoind.rpc_details()
+		.expect("Failed to get bitcoind RPC details");
 	builder_c.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
 
 	// Set B as LSPS2 LSP for C
