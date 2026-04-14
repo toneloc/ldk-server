@@ -15,8 +15,11 @@ use e2e_tests::{
 	wait_for_onchain_balance, LdkServerHandle, RabbitMqEventConsumer, TestBitcoind,
 };
 use ldk_node::lightning::ln::msgs::SocketAddress;
+use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::error::LdkServerErrorCode;
 use ldk_server_client::ldk_server_protos::api::{
-	Bolt11ReceiveRequest, Bolt12ReceiveRequest, OnchainReceiveRequest,
+	Bolt11ReceiveRequest, Bolt12ReceiveRequest, CloseChannelRequest, GetNodeInfoRequest,
+	OnchainReceiveRequest,
 };
 use ldk_server_client::ldk_server_protos::types::{
 	bolt11_invoice_description, Bolt11InvoiceDescription,
@@ -31,6 +34,50 @@ async fn test_cli_get_node_info() {
 	let output = run_cli(&server, &["get-node-info"]);
 	assert!(output.get("node_id").is_some());
 	assert_eq!(output["node_id"], server.node_id());
+}
+
+#[tokio::test]
+async fn test_e2e_auth_and_invalid_request_paths() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+
+	let node_info = server
+		.client()
+		.get_node_info(GetNodeInfoRequest {})
+		.await
+		.expect("valid API key should authenticate");
+	assert_eq!(node_info.node_id, server.node_id());
+
+	let tls_cert_pem = std::fs::read(&server.tls_cert_path).expect("tls cert should be readable");
+	let invalid_client = LdkServerClient::new(
+		server.base_url(),
+		"this-is-the-wrong-api-key".to_string(),
+		&tls_cert_pem,
+	)
+	.expect("test client must be constructible");
+
+	let auth_err = invalid_client
+		.get_node_info(GetNodeInfoRequest {})
+		.await
+		.expect_err("request with invalid API key must fail");
+	assert_eq!(auth_err.error_code, LdkServerErrorCode::AuthError);
+	assert_eq!(auth_err.message, "Invalid credentials");
+
+	let invalid_request_err = server
+		.client()
+		.close_channel(CloseChannelRequest {
+			user_channel_id: "not-a-u128".to_string(),
+			counterparty_node_id:
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+					.to_string(),
+		})
+		.await
+		.expect_err("invalid request must be rejected by API validation");
+	assert_eq!(
+		invalid_request_err.error_code,
+		LdkServerErrorCode::InvalidRequestError
+	);
+	assert_eq!(invalid_request_err.message, "Invalid UserChannelId.");
 }
 
 #[tokio::test]
