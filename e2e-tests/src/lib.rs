@@ -67,20 +67,34 @@ impl TestBitcoind {
 		self.bitcoind.params.cookie_file.clone()
 	}
 
-	/// Returns (host, port, user, password) for the bitcoind RPC.
-	pub fn rpc_details(&self) -> (String, u16, String, String) {
+	/// Returns `(host, port, user, password)` for the bitcoind RPC, or an
+	/// error describing which parsing step failed.
+	///
+	/// This method previously used `.unwrap()` on several unvalidated
+	/// operations (port parsing, cookie file read, and splitting the
+	/// cookie contents). On malformed input those produced cryptic panics
+	/// that made E2E setup failures hard to diagnose. See issue #8.
+	pub fn rpc_details(
+		&self,
+	) -> Result<(String, u16, String, String), Box<dyn std::error::Error + Send + Sync>> {
 		let rpc_url = self.rpc_url();
 		let rpc_address = rpc_url.strip_prefix("http://").unwrap_or(&rpc_url);
-		let rpc_parts: Vec<&str> = rpc_address.splitn(2, ':').collect();
-		let host = rpc_parts[0].to_string();
-		let port: u16 = rpc_parts[1].parse().unwrap();
 
-		let cookie_content = std::fs::read_to_string(self.rpc_cookie()).unwrap();
-		let mut parts = cookie_content.splitn(2, ':');
-		let user = parts.next().unwrap().to_string();
-		let password = parts.next().unwrap().to_string();
+		let (host, port_str) = rpc_address
+			.split_once(':')
+			.ok_or_else(|| format!("rpc address is missing ':' separator: {rpc_address}"))?;
+		let port: u16 =
+			port_str.parse().map_err(|e| format!("failed to parse rpc port '{port_str}': {e}"))?;
 
-		(host, port, user, password)
+		let cookie_path = self.rpc_cookie();
+		let cookie_content = std::fs::read_to_string(&cookie_path)
+			.map_err(|e| format!("failed to read bitcoind cookie file {cookie_path:?}: {e}"))?;
+
+		let (user, password) = cookie_content.split_once(':').ok_or_else(|| {
+			format!("bitcoind cookie file {cookie_path:?} does not contain 'user:password'")
+		})?;
+
+		Ok((host.to_string(), port, user.to_string(), password.to_string()))
 	}
 }
 
@@ -106,7 +120,8 @@ impl LdkServerHandle {
 		let rest_port = find_available_port();
 		let p2p_port = find_available_port();
 
-		let (rpc_host, rpc_port_num, rpc_user, rpc_password) = bitcoind.rpc_details();
+		let (rpc_host, rpc_port_num, rpc_user, rpc_password) =
+			bitcoind.rpc_details().expect("failed to get bitcoind rpc details");
 		let rpc_address = format!("{rpc_host}:{rpc_port_num}");
 
 		let exchange_name = format!("e2e_test_exchange_{rest_port}");
