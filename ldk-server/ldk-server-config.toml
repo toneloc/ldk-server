@@ -7,18 +7,21 @@ alias = "ldk-regtest"                         # REQUIRED for announcement (<=32 
 listening_addresses = ["127.0.0.1:3001"]      # Lightning node listening addresses
 announcement_addresses = ["127.0.0.1:3001"]   # Announcement addresses
 rest_service_address = "127.0.0.1:3002"       # LDK Server REST address
-api_key = "your-secret-api-key"               # API key for REST requests
+# API key is auto-generated to <storage_dir>/<network>/api_key on first run.
+# The CLI reads it from its default location (~/.ldk-server/<network>/api_key)
+# when --api-key is omitted; if you change storage.disk.dir_path below, pass
+# the key explicitly with --api-key or point the CLI at this file via -c.
 #pathfinding_scores_source_url = ""           # External Pathfinding Scores Source
 #rgs_server_url = "https://rapidsync.lightningdevkit.org/snapshot/v2/"  # Optional: RGS URL for rapid gossip sync
 
-# Storage settings
+# Storage settings — replace with a writable directory on your system.
 [storage.disk]
-dir_path = "/Users/t/Library/Application Support/ldk-server/"
+dir_path = "/path/to/ldk-server/storage/"
 
 # Logging
 [log]
 level = "Debug"
-file_path = "/Users/t/Library/Application Support/ldk-server/ldk-server.log"
+file_path = "/path/to/ldk-server/ldk-server.log"
 
 # TLS
 [tls]
@@ -42,26 +45,21 @@ server_url = "https://mutinynet.com/api"
 connection_string = ""
 exchange_name = ""
 
-# LSPS2 Client Support
-[liquidity.lsps2_client]
-# The public key of the LSPS2 LSP we source just-in-time liquidity from.
-node_pubkey = "<lsp node pubkey>"
-# Address to connect to the LSPS2 LSP (IPv4:port, IPv6:port, OnionV3:port, or hostname:port).
-address = "<lsp ip address>:9735"
-# Optional token for authenticating to the LSP.
+# LSPS2 Client Support — uncomment and fill in real values to enable.
+# [liquidity.lsps2_client]
+# node_pubkey = "<lsp node pubkey>"
+# address = "<lsp ip address>:9735"
 # token = ""
 
-# Experimental LSPS2 Service Support
-[liquidity.lsps2_service]
-advertise_service = false
-
-channel_opening_fee_ppm = 1000
-channel_over_provisioning_ppm = 500000
-min_channel_opening_fee_msat = 10000000
-min_channel_lifetime = 4320
-max_client_to_self_delay = 1440
-min_payment_size_msat = 10000000
-max_payment_size_msat = 25000000000
-client_trusts_lsp = false
-
+# Experimental LSPS2 Service Support — uncomment to advertise as an LSP.
+# [liquidity.lsps2_service]
+# advertise_service = false
+# channel_opening_fee_ppm = 1000
+# channel_over_provisioning_ppm = 500000
+# min_channel_opening_fee_msat = 10000000
+# min_channel_lifetime = 4320
+# max_client_to_self_delay = 1440
+# min_payment_size_msat = 10000000
+# max_payment_size_msat = 25000000000
+# client_trusts_lsp = false
 # require_token = ""

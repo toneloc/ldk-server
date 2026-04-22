@@ -42,9 +42,16 @@ You can configure the node via a TOML file, environment variables, or CLI argume
 
 ### Building
 ```
-git clone https://github.com/lightningdevkit/ldk-server.git
+git clone https://github.com/toneloc/ldk-server.git
 cargo build
 ```
+
+This fork pins `stable-channels` as a local path dependency in `ldk-server/Cargo.toml`. Clone `toneloc/stable-channels` to the location that path resolves to before running `cargo build`. From the repository root:
+```
+cd ldk-server
+git clone https://github.com/toneloc/stable-channels.git ../../../2026/stable-channels
+```
+The `ldk-server/Cargo.toml` entry (`path = "../../../2026/stable-channels"`) is relative to the crate directory one level deeper; the clone command above is the equivalent from the repo root.
 
 ### Running
 - Using a config file:
@@ -65,10 +72,10 @@ export LDK_SERVER_STORAGE_DIR_PATH=/path/to/storage
 cargo run --bin ldk-server
 ```
 
-Interact with the node using CLI:
+Interact with the node using CLI. When `--api-key` is omitted, the CLI reads the key from its default storage path (`~/.ldk-server/<network>/api_key`); if your daemon uses a non-default `storage.disk.dir_path`, either pass the key explicitly with `--api-key <hex>` or point the CLI at the same config with `-c /path/to/config.toml`:
 ```
-ldk-server-cli -b localhost:3002 --api-key your-secret-api-key --tls-cert /path/to/tls_cert.pem onchain-receive # To generate onchain-receive address.
-ldk-server-cli -b localhost:3002 --api-key your-secret-api-key --tls-cert /path/to/tls_cert.pem help # To print help/available commands.
+ldk-server-cli -b localhost:3002 --tls-cert /path/to/tls_cert.pem onchain-receive # To generate onchain-receive address.
+ldk-server-cli -b localhost:3002 --tls-cert /path/to/tls_cert.pem help # To print help/available commands.
 ```
 
 ### Shell Completions
