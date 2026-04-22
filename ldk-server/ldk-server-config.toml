@@ -8,7 +8,9 @@ listening_addresses = ["127.0.0.1:3001"]      # Lightning node listening address
 announcement_addresses = ["127.0.0.1:3001"]   # Announcement addresses
 rest_service_address = "127.0.0.1:3002"       # LDK Server REST address
 # API key is auto-generated to <storage_dir>/<network>/api_key on first run.
-# The CLI reads it from there automatically when --api-key is omitted.
+# The CLI reads it from its default location (~/.ldk-server/<network>/api_key)
+# when --api-key is omitted; if you change storage.disk.dir_path below, pass
+# the key explicitly with --api-key or point the CLI at this file via -c.
 #pathfinding_scores_source_url = ""           # External Pathfinding Scores Source
 #rgs_server_url = "https://rapidsync.lightningdevkit.org/snapshot/v2/"  # Optional: RGS URL for rapid gossip sync
 
