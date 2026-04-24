@@ -269,7 +269,8 @@ fn main() {
 
 	runtime.spawn(async {
 		loop {
-			let _ = stable_channels::price_feeds::get_cached_price();
+			let _ =
+				tokio::task::spawn_blocking(stable_channels::price_feeds::get_cached_price).await;
 			tokio::time::sleep(Duration::from_secs(30)).await;
 		}
 	});
@@ -318,6 +319,7 @@ fn main() {
 		let mut stability_interval = tokio::time::interval(Duration::from_secs(
 			stable_channels::constants::STABILITY_CHECK_INTERVAL_SECS,
 		));
+		stability_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
 		systemd::notify_ready();
 
@@ -383,10 +385,15 @@ fn main() {
 								"PAYMENT_RECEIVED: with id {:?}, hash {}, amount_msat {}",
 								payment_id, payment_hash, amount_msat
 							);
-							{
-								let mut mgr = stable_manager.lock().unwrap();
-								mgr.handle_payment_received(amount_msat, custom_records, &event_node);
-							}
+							// Keep event queue sequencing in this branch via
+							// publish_event_and_upsert_payment(), while stable-channel side
+							// effects run on the blocking pool and do not pin the async runtime.
+							let payment_manager = Arc::clone(&stable_manager);
+							let payment_node = Arc::clone(&event_node);
+							tokio::task::spawn_blocking(move || {
+								let mut mgr = payment_manager.lock().unwrap();
+								mgr.handle_payment_received(amount_msat, custom_records, &payment_node);
+							});
 							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
 
 							publish_event_and_upsert_payment(&payment_id,
@@ -546,41 +553,50 @@ fn main() {
 					}
 				}
 				_ = stability_interval.tick() => {
-					let (payment_sent, push_targets) = {
-						let mut mgr = stable_manager.lock().unwrap();
-						let price = stable_channels::price_feeds::get_cached_price();
-						if price > 0.0 { mgr.btc_price = price; }
+					let stable_mgr = Arc::clone(&stable_manager);
+					let push_svc = Arc::clone(&push_service);
+					let tick_node = Arc::clone(&event_node);
+					let tick_rt = Arc::clone(&runtime);
+					tokio::task::spawn_blocking(move || {
+						let (payment_sent, push_targets) = {
+							let mut mgr = stable_mgr.lock().unwrap();
+							let price = stable_channels::price_feeds::get_cached_price();
+							if price > 0.0 {
+								mgr.btc_price = price;
+							}
+							let current_price = if price > 0.0 { price } else { mgr.btc_price };
 
-						// Get push targets before stability check
-						let targets = mgr.get_stability_push_targets(&event_node);
+							let targets = mgr.get_stability_push_targets_with_price(&tick_node, current_price);
 
-						// Filter by push service cooldown and send notifications
-						let mut ps = push_service.lock().unwrap();
-						let filtered: Vec<_> = targets.into_iter().filter(|t| ps.should_notify(&t.node_id)).collect();
-						for t in &filtered {
-							ps.notify(&t.node_id, &t.direction);
+							let mut ps = push_svc.lock().unwrap();
+							let filtered: Vec<_> =
+								targets.into_iter().filter(|t| ps.should_notify(&t.node_id)).collect();
+							for t in &filtered {
+								ps.notify(&t.node_id, &t.direction);
+							}
+
+							let sent =
+								mgr.check_and_update_stable_channels_with_price(&tick_node, current_price);
+							(sent, filtered)
+						};
+
+						if !push_targets.is_empty() {
+							let sm = Arc::clone(&stable_mgr);
+							let en = Arc::clone(&tick_node);
+							tick_rt.spawn(async move {
+								tokio::time::sleep(Duration::from_secs(15)).await;
+								let _ = tokio::task::spawn_blocking(move || {
+									let mut mgr = sm.lock().unwrap();
+									mgr.check_and_update_stable_channels(&en);
+								})
+								.await;
+							});
 						}
 
-						// Run stability check
-						let sent = mgr.check_and_update_stable_channels(&event_node);
-						(sent, filtered)
-					};
-
-					// If we sent push notifications, wait for NSE to reconnect, then retry
-					if !push_targets.is_empty() {
-						let sm = Arc::clone(&stable_manager);
-						let en = Arc::clone(&event_node);
-						runtime.spawn(async move {
-							tokio::time::sleep(Duration::from_secs(15)).await;
-							let mut mgr = sm.lock().unwrap();
-							mgr.check_and_update_stable_channels(&en);
-						});
-					}
-
-					// After a stability payment, allow LDK to persist
-					if payment_sent {
-						tokio::time::sleep(Duration::from_secs(2)).await;
-					}
+						if payment_sent {
+							std::thread::sleep(Duration::from_secs(2));
+						}
+					});
 				}
 				_ = tokio::signal::ctrl_c() => {
 					info!("Received CTRL-C, shutting down..");
