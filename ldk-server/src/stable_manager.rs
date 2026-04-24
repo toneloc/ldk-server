@@ -10,7 +10,7 @@ use serde::Deserialize;
 use stable_channels::audit::audit_event;
 use stable_channels::constants::*;
 use stable_channels::db::Database;
-use stable_channels::price_feeds::get_cached_price;
+use stable_channels::price_feeds::{get_cached_price, get_cached_price_no_fetch};
 use stable_channels::stable;
 use stable_channels::types::{Bitcoin, StableChannel, USD};
 
@@ -111,7 +111,7 @@ impl StableChannelManager {
 		let audit_path = format!("{}/audit_log.txt", data_dir_str);
 		stable_channels::audit::set_audit_log_path(&audit_path);
 
-		let btc_price = get_cached_price();
+		let btc_price = get_cached_price_no_fetch();
 
 		Self { stable_channels: Vec::new(), db, btc_price, data_dir: data_dir_str }
 	}
@@ -237,6 +237,12 @@ impl StableChannelManager {
 
 	pub fn check_and_update_stable_channels(&mut self, node: &Node) -> bool {
 		let current_price = get_cached_price();
+		self.check_and_update_stable_channels_with_price(node, current_price)
+	}
+
+	pub fn check_and_update_stable_channels_with_price(
+		&mut self, node: &Node, current_price: f64,
+	) -> bool {
 		if current_price > 0.0 {
 			self.btc_price = current_price;
 		}
@@ -281,6 +287,12 @@ impl StableChannelManager {
 	/// The caller should send a push notification to each and retry after a delay.
 	pub fn get_stability_push_targets(&self, node: &Node) -> Vec<StabilityPushTarget> {
 		let current_price = get_cached_price();
+		self.get_stability_push_targets_with_price(node, current_price)
+	}
+
+	pub fn get_stability_push_targets_with_price(
+		&self, node: &Node, current_price: f64,
+	) -> Vec<StabilityPushTarget> {
 		if current_price <= 0.0 {
 			return Vec::new();
 		}
