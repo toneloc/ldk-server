@@ -25,15 +25,15 @@ use ldk_server_protos::endpoints::{
 	AUDIT_LOG_PATH, BOLT11_CLAIM_FOR_HASH_PATH, BOLT11_FAIL_FOR_HASH_PATH,
 	BOLT11_RECEIVE_FOR_HASH_PATH, BOLT11_RECEIVE_PATH,
 	BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_PATH, BOLT11_RECEIVE_VIA_JIT_CHANNEL_PATH,
-	BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH, CLOSE_CHANNEL_PATH,
-	CONNECT_PEER_PATH, DISCONNECT_PEER_PATH, EDIT_STABLE_CHANNEL_PATH,
-	EXPORT_PATHFINDING_SCORES_PATH, FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH,
-	GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH, GET_PRICE_PATH, GRAPH_GET_CHANNEL_PATH,
-	GRAPH_GET_NODE_PATH, GRAPH_LIST_CHANNELS_PATH, GRAPH_LIST_NODES_PATH, LDK_LOG_PATH,
-	LIST_CHANNELS_PATH, LIST_FORWARDED_PAYMENTS_PATH, LIST_PAYMENTS_PATH, LIST_PEERS_PATH,
-	LIST_STABLE_CHANNELS_PATH, ONCHAIN_RECEIVE_PATH, ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH,
-	REGISTER_PUSH_PATH, SIGN_MESSAGE_PATH, SPLICE_IN_PATH, SPLICE_OUT_PATH,
-	SPONTANEOUS_SEND_PATH, UNIFIED_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH, VERIFY_SIGNATURE_PATH,
+	BOLT11_SEND_PATH, BOLT12_RECEIVE_PATH, BOLT12_SEND_PATH, CLOSE_CHANNEL_PATH, CONNECT_PEER_PATH,
+	DISCONNECT_PEER_PATH, EDIT_STABLE_CHANNEL_PATH, EXPORT_PATHFINDING_SCORES_PATH,
+	FORCE_CLOSE_CHANNEL_PATH, GET_BALANCES_PATH, GET_NODE_INFO_PATH, GET_PAYMENT_DETAILS_PATH,
+	GET_PRICE_PATH, GRAPH_GET_CHANNEL_PATH, GRAPH_GET_NODE_PATH, GRAPH_LIST_CHANNELS_PATH,
+	GRAPH_LIST_NODES_PATH, LDK_LOG_PATH, LIST_CHANNELS_PATH, LIST_FORWARDED_PAYMENTS_PATH,
+	LIST_PAYMENTS_PATH, LIST_PEERS_PATH, LIST_STABLE_CHANNELS_PATH, ONCHAIN_RECEIVE_PATH,
+	ONCHAIN_SEND_PATH, OPEN_CHANNEL_PATH, REGISTER_PUSH_PATH, SIGN_MESSAGE_PATH, SPLICE_IN_PATH,
+	SPLICE_OUT_PATH, SPONTANEOUS_SEND_PATH, UNIFIED_SEND_PATH, UPDATE_CHANNEL_CONFIG_PATH,
+	VERIFY_SIGNATURE_PATH,
 };
 use prost::Message;
 
@@ -68,10 +68,10 @@ use crate::api::list_peers::handle_list_peers_request;
 use crate::api::onchain_receive::handle_onchain_receive_request;
 use crate::api::onchain_send::handle_onchain_send_request;
 use crate::api::open_channel::handle_open_channel;
+use crate::api::register_push::handle_register_push_request;
 use crate::api::sign_message::handle_sign_message_request;
 use crate::api::splice_channel::{handle_splice_in_request, handle_splice_out_request};
 use crate::api::spontaneous_send::handle_spontaneous_send_request;
-use crate::api::register_push::handle_register_push_request;
 use crate::api::stable_channels::{
 	handle_audit_log_request, handle_edit_stable_channel_request, handle_get_price_request,
 	handle_ldk_log_request, handle_list_stable_channels_request,
@@ -117,19 +117,10 @@ pub struct NodeService {
 
 impl NodeService {
 	pub(crate) fn new(
-		node: Arc<Node>,
-		paginated_kv_store: Arc<dyn PaginatedKVStore>,
-		api_key: String,
-		stable_manager: SharedStableManager,
-		push_service: SharedPushService,
+		node: Arc<Node>, paginated_kv_store: Arc<dyn PaginatedKVStore>, api_key: String,
+		stable_manager: SharedStableManager, push_service: SharedPushService,
 	) -> Self {
-		Self {
-			node,
-			paginated_kv_store,
-			api_key,
-			stable_manager,
-			push_service,
-		}
+		Self { node, paginated_kv_store, api_key, stable_manager, push_service }
 	}
 }
 
@@ -513,13 +504,9 @@ impl Service<Request<Incoming>> for NodeService {
 				api_key,
 				handle_audit_log_request,
 			)),
-			LDK_LOG_PATH => Box::pin(handle_request(
-				context,
-				req,
-				auth_params,
-				api_key,
-				handle_ldk_log_request,
-			)),
+			LDK_LOG_PATH => {
+				Box::pin(handle_request(context, req, auth_params, api_key, handle_ldk_log_request))
+			},
 			path => {
 				let error = format!("Unknown request: {}", path).into_bytes();
 				Box::pin(async {

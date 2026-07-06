@@ -9,10 +9,10 @@
 
 mod api;
 mod io;
+pub mod push;
 mod service;
 pub mod stable_manager;
 mod util;
-pub mod push;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -78,6 +78,12 @@ pub fn get_default_data_dir() -> Option<PathBuf> {
 }
 
 fn main() {
+	// The dependency graph enables both the `ring` and `aws-lc-rs` rustls backends,
+	// so rustls cannot pick a process-default provider on its own.
+	tokio_rustls::rustls::crypto::ring::default_provider()
+		.install_default()
+		.expect("failed to install rustls ring CryptoProvider");
+
 	let args_config = ArgsConfig::parse();
 
 	let mut ldk_node_config = Config::default();
@@ -357,7 +363,7 @@ fn main() {
 								error!("Failed to mark event as handled: {e}");
 							}
 						},
-						Event::SplicePending { channel_id, user_channel_id, counterparty_node_id, new_funding_txo, .. } => {
+						Event::SpliceNegotiated { channel_id, user_channel_id, counterparty_node_id, new_funding_txo, .. } => {
 							let txid_str = new_funding_txo.txid.to_string();
 							let vout = new_funding_txo.vout;
 							info!(
@@ -372,7 +378,7 @@ fn main() {
 								error!("Failed to mark event as handled: {e}");
 							}
 						},
-						Event::SpliceFailed { channel_id, .. } => {
+						Event::SpliceNegotiationFailed { channel_id, .. } => {
 							info!("SPLICE_FAILED: channel {}", channel_id);
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
@@ -429,17 +435,24 @@ fn main() {
 								Arc::clone(&paginated_store)).await;
 						},
 						Event::PaymentForwarded {
-							prev_channel_id,
-							next_channel_id,
-							prev_user_channel_id,
-							next_user_channel_id,
-							prev_node_id,
-							next_node_id,
-							total_fee_earned_msat,
-							skimmed_fee_msat,
-							claim_from_onchain_tx,
-							outbound_amount_forwarded_msat
-						} => {
+								prev_htlcs,
+								next_htlcs,
+								total_fee_earned_msat,
+								skimmed_fee_msat,
+								claim_from_onchain_tx,
+								outbound_amount_forwarded_msat
+							} => {
+								// ldk-node now reports forwards as HTLC-locator sets (one inbound / one outbound
+								// for source-routed forwards). Recover the ids the handlers below expect.
+								let (prev_channel_id, next_channel_id, prev_user_channel_id, next_user_channel_id, prev_node_id, next_node_id) =
+									match (prev_htlcs.first(), next_htlcs.first()) {
+										(Some(prev), Some(next)) => (prev.channel_id, next.channel_id, prev.user_channel_id, next.user_channel_id, prev.node_id, next.node_id),
+										_ => {
+											info!("PAYMENT_FORWARDED with empty HTLC locator set; skipping");
+											if let Err(e) = event_node.event_handled() { error!("Failed to mark event as handled: {e}"); }
+											continue;
+										}
+									};
 
 							info!("PAYMENT_FORWARDED: with outbound_amount_forwarded_msat {}, total_fee_earned_msat: {}, inbound channel: {}, outbound channel: {}",
 								outbound_amount_forwarded_msat.unwrap_or(0), total_fee_earned_msat.unwrap_or(0), prev_channel_id, next_channel_id
@@ -683,8 +696,7 @@ fn load_or_generate_api_key(storage_dir: &Path) -> std::io::Result<String> {
 /// Handle plain HTTP push registration from mobile apps.
 /// Accepts JSON POST to /api/register-push — no TLS, no auth.
 async fn handle_push_registration(
-	stream: tokio::net::TcpStream,
-	push_service: Arc<Mutex<crate::push::PushService>>,
+	stream: tokio::net::TcpStream, push_service: Arc<Mutex<crate::push::PushService>>,
 ) {
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -710,7 +722,7 @@ async fn handle_push_registration(
 			let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
 			let _ = stream.write_all(resp.as_bytes()).await;
 			return;
-		}
+		},
 	};
 
 	#[derive(serde::Deserialize)]
@@ -729,14 +741,17 @@ async fn handle_push_registration(
 				let ps = push_service.lock().unwrap();
 				ps.register_token(&req.device_token, &req.platform, &req.node_id, &req.environment);
 			}
-			info!("[push] Registered {} device for node {}", req.platform,
-				if req.node_id.len() > 16 { &req.node_id[..16] } else { &req.node_id });
+			info!(
+				"[push] Registered {} device for node {}",
+				req.platform,
+				if req.node_id.len() > 16 { &req.node_id[..16] } else { &req.node_id }
+			);
 			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\"ok\"".to_string()
-		}
+		},
 		Err(e) => {
 			error!("[push] Invalid registration request: {}", e);
 			format!("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\n{}", e)
-		}
+		},
 	};
 	let _ = stream.write_all(resp.as_bytes()).await;
 }

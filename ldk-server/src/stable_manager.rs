@@ -18,8 +18,8 @@ use serde_json::json;
 
 /// A stability payment that needs a push notification to wake the peer.
 pub struct StabilityPushTarget {
-	pub node_id: String,    // Lightning pubkey hex
-	pub direction: String,  // "lsp_to_user" or "user_to_lsp"
+	pub node_id: String,   // Lightning pubkey hex
+	pub direction: String, // "lsp_to_user" or "user_to_lsp"
 }
 
 // ============================================================================
@@ -67,10 +67,7 @@ fn get_output_sats(txid: &str, vout: u32) -> Option<u64> {
 	});
 
 	let credentials = format!("{}:{}", rpc_user, rpc_pass);
-	let auth_value = format!(
-		"Basic {}",
-		openssl::base64::encode_block(credentials.as_bytes())
-	);
+	let auth_value = format!("Basic {}", openssl::base64::encode_block(credentials.as_bytes()));
 
 	let client = reqwest::blocking::Client::new();
 	let response = client
@@ -126,9 +123,14 @@ impl StableChannelManager {
 				"[stable] saving channel={} user_channel_id={} expected_usd={} backing_sats={} native_sats={}",
 				ch_id, uch_id, sc.expected_usd.0, sc.backing_sats, sc.native_sats
 			);
-			if let Err(e) =
-				self.db.save_channel(&ch_id, &uch_id, sc.expected_usd.0, sc.backing_sats, sc.native_sats, sc.note.as_deref())
-			{
+			if let Err(e) = self.db.save_channel(
+				&ch_id,
+				&uch_id,
+				sc.expected_usd.0,
+				sc.backing_sats,
+				sc.native_sats,
+				sc.note.as_deref(),
+			) {
 				error!("[stable] ERROR saving channel {} to DB: {}", ch_id, e);
 			}
 		}
@@ -270,9 +272,7 @@ impl StableChannelManager {
 
 	/// Check if a peer is connected by looking for a usable channel with them.
 	pub fn is_peer_connected(&self, node: &Node, user_channel_id: u128) -> bool {
-		node.list_channels()
-			.iter()
-			.any(|c| c.user_channel_id.0 == user_channel_id && c.is_usable)
+		node.list_channels().iter().any(|c| c.user_channel_id.0 == user_channel_id && c.is_usable)
 	}
 
 	// ---- Push targets -------------------------------------------------------
@@ -320,11 +320,8 @@ impl StableChannelManager {
 				// LSP is_stable_receiver=false, so:
 				//   - Price dropped -> user below expected -> LSP pays user -> lsp_to_user
 				//   - Price rose -> user above expected -> user pays LSP -> user_to_lsp
-				let direction = if is_receiver_below_expected {
-					"lsp_to_user"
-				} else {
-					"user_to_lsp"
-				};
+				let direction =
+					if is_receiver_below_expected { "lsp_to_user" } else { "user_to_lsp" };
 
 				targets.push(StabilityPushTarget {
 					node_id: sc.counterparty.to_string(),
@@ -339,7 +336,9 @@ impl StableChannelManager {
 
 	/// Send authoritative expected_usd to the user after a stable deduction.
 	/// Ensures both sides agree on the stable position value.
-	fn send_sync_message(&self, node: &Node, user_channel_id: u128, expected_usd: f64, counterparty: PublicKey) {
+	fn send_sync_message(
+		&self, node: &Node, user_channel_id: u128, expected_usd: f64, counterparty: PublicKey,
+	) {
 		let payload = json!({
 			"type": SYNC_MESSAGE_TYPE,
 			"user_channel_id": format!("{}", user_channel_id),
@@ -374,7 +373,7 @@ impl StableChannelManager {
 						"payment_id": format!("{}", payment_id),
 					}),
 				);
-			}
+			},
 			Err(e) => {
 				audit_event(
 					"SYNC_MESSAGE_FAILED",
@@ -384,22 +383,22 @@ impl StableChannelManager {
 						"error": format!("{e}"),
 					}),
 				);
-			}
+			},
 		}
 	}
 
 	// ---- Event handlers -----------------------------------------------------
 
-	pub fn handle_channel_ready(&mut self, channel_id: ChannelId, user_channel_id: u128, node: &Node) {
+	pub fn handle_channel_ready(
+		&mut self, channel_id: ChannelId, user_channel_id: u128, node: &Node,
+	) {
 		if let Some(chan) = node.list_channels().into_iter().find(|c| c.channel_id == channel_id) {
 			let funded_usd =
 				chan.channel_value_sats as f64 / 2.0 / SATS_IN_BTC as f64 * self.btc_price;
 
 			// Check if a stable channel already exists for this user_channel_id (splice case)
-			let existing = self
-				.stable_channels
-				.iter_mut()
-				.find(|sc| sc.user_channel_id == user_channel_id);
+			let existing =
+				self.stable_channels.iter_mut().find(|sc| sc.user_channel_id == user_channel_id);
 
 			if let Some(sc) = existing {
 				// Splice: update channel_id but preserve expected_usd and other state
@@ -444,7 +443,12 @@ impl StableChannelManager {
 
 				// Send SYNC_V1 if stable balance was deducted during splice
 				if usd_deducted.is_some() {
-					self.send_sync_message(node, user_channel_id, new_expected_usd, sync_counterparty);
+					self.send_sync_message(
+						node,
+						user_channel_id,
+						new_expected_usd,
+						sync_counterparty,
+					);
 				}
 
 				info!(
@@ -542,8 +546,8 @@ impl StableChannelManager {
 	}
 
 	pub fn handle_splice_pending(
-		&mut self, channel_id: ChannelId, user_channel_id: u128,
-		new_funding_txid: &str, new_funding_vout: u32, node: &Node,
+		&mut self, channel_id: ChannelId, user_channel_id: u128, new_funding_txid: &str,
+		new_funding_vout: u32, node: &Node,
 	) {
 		audit_event(
 			"SPLICE_PENDING",
@@ -602,11 +606,8 @@ impl StableChannelManager {
 										"btc_price": price,
 									}),
 								);
-								sync_info = Some((
-									sc.user_channel_id,
-									sc.expected_usd.0,
-									sc.counterparty,
-								));
+								sync_info =
+									Some((sc.user_channel_id, sc.expected_usd.0, sc.counterparty));
 							}
 						}
 						if let Some((ucid, eusd, cp)) = sync_info {
@@ -624,7 +625,7 @@ impl StableChannelManager {
 						}
 						self.save_stable_channels();
 					}
-				}
+				},
 				None => {
 					// Tx not yet in mempool or RPC error -- trade message + ChannelReady will handle it
 					info!(
@@ -638,7 +639,7 @@ impl StableChannelManager {
 							"vout": new_funding_vout,
 						}),
 					);
-				}
+				},
 			}
 		}
 	}
@@ -721,11 +722,9 @@ impl StableChannelManager {
 			.find(|c| c.channel_id == prev_channel_id)
 			.map(|c| c.user_channel_id.0);
 
-		if let Some(sc) = prev_user_ch_id.and_then(|uid| {
-			self.stable_channels
-				.iter_mut()
-				.find(|sc| sc.user_channel_id == uid)
-		}) {
+		if let Some(sc) = prev_user_ch_id
+			.and_then(|uid| self.stable_channels.iter_mut().find(|sc| sc.user_channel_id == uid))
+		{
 			if sc.expected_usd.0 <= 0.0 || self.btc_price <= 0.0 {
 				return;
 			}
@@ -745,8 +744,13 @@ impl StableChannelManager {
 			let old_expected = sc.expected_usd.0;
 			let native_sats = sc.native_sats;
 
+			// list_channels() reflects the balance AFTER the forward settled, but
+			// reconcile_forwarded expects the pre-spend balance — add the spend back
+			// or native is understated and stable is over-deducted.
+			let user_sats_before = user_total_sats.saturating_add(total_sats);
+
 			if let Some(usd_deducted) =
-				stable::reconcile_forwarded(sc, user_total_sats, total_sats, self.btc_price)
+				stable::reconcile_forwarded(sc, user_sats_before, total_sats, self.btc_price)
 			{
 				let overflow_sats = total_sats.saturating_sub(native_sats);
 				let new_expected_usd = sc.expected_usd.0;
@@ -854,9 +858,7 @@ impl StableChannelManager {
 		let channel_opt = if let Some(ref cid) = payload.channel_id {
 			channels.iter().find(|c| c.channel_id.to_string() == *cid)
 		} else {
-			channels
-				.iter()
-				.find(|c| format!("{}", c.user_channel_id.0) == user_ch_id_str)
+			channels.iter().find(|c| format!("{}", c.user_channel_id.0) == user_ch_id_str)
 		};
 
 		let channel = match channel_opt {
@@ -903,8 +905,10 @@ impl StableChannelManager {
 		);
 
 		// 6) Apply new expected_usd to StableChannel (match by user_channel_id)
-		if let Some(sc) =
-			self.stable_channels.iter_mut().find(|sc| sc.user_channel_id == channel.user_channel_id.0)
+		if let Some(sc) = self
+			.stable_channels
+			.iter_mut()
+			.find(|sc| sc.user_channel_id == channel.user_channel_id.0)
 		{
 			// Refresh balances
 			let (ok, _) = stable::update_balances(node, sc);
@@ -1075,7 +1079,7 @@ fn read_tail_lines(path: &str, max_lines: usize) -> String {
 			let all: Vec<&str> = content.lines().collect();
 			let start = all.len().saturating_sub(max_lines);
 			all[start..].join("\n")
-		}
+		},
 		Err(e) => format!("Error reading {}: {}", path, e),
 	}
 }

@@ -36,7 +36,7 @@ use ldk_server_protos::types::pending_sweep_balance::BalanceType::{
 	AwaitingThresholdConfirmations, BroadcastAwaitingConfirmation, PendingBroadcast,
 };
 use ldk_server_protos::types::{
-	bolt11_invoice_description, Channel, ForwardedPayment, LspFeeLimits, OutPoint, Payment, Peer,
+	bolt11_invoice_description, Channel, ForwardedPayment, OutPoint, Payment, Peer,
 };
 
 use crate::api::error::LdkServerError;
@@ -159,31 +159,28 @@ pub(crate) fn payment_kind_to_proto(
 				status: Some(confirmation_status_to_proto(status)),
 			})),
 		},
-		PaymentKind::Bolt11 { hash, preimage, secret } => ldk_server_protos::types::PaymentKind {
-			kind: Some(Bolt11(ldk_server_protos::types::Bolt11 {
-				hash: hash.to_string(),
-				preimage: preimage.map(|p| p.to_string()),
-				secret: secret.map(|s| Bytes::copy_from_slice(&s.0)),
-			})),
-		},
-		PaymentKind::Bolt11Jit {
-			hash,
-			preimage,
-			secret,
-			lsp_fee_limits,
-			counterparty_skimmed_fee_msat,
-		} => ldk_server_protos::types::PaymentKind {
-			kind: Some(Bolt11Jit(ldk_server_protos::types::Bolt11Jit {
-				hash: hash.to_string(),
-				preimage: preimage.map(|p| p.to_string()),
-				secret: secret.map(|s| Bytes::copy_from_slice(&s.0)),
-				lsp_fee_limits: Some(LspFeeLimits {
-					max_total_opening_fee_msat: lsp_fee_limits.max_total_opening_fee_msat,
-					max_proportional_opening_fee_ppm_msat: lsp_fee_limits
-						.max_proportional_opening_fee_ppm_msat,
-				}),
-				counterparty_skimmed_fee_msat,
-			})),
+		PaymentKind::Bolt11 { hash, preimage, secret, counterparty_skimmed_fee_msat } => {
+			// ldk-node merged Bolt11Jit into Bolt11; a JIT payment is a Bolt11 with a
+			// counterparty-skimmed fee. Keep the proto Bolt11Jit shape for those
+			// (lsp_fee_limits is no longer carried by the payment kind, so it is omitted).
+			let hash = hash.to_string();
+			let preimage = preimage.map(|p| p.to_string());
+			let secret = secret.map(|s| Bytes::copy_from_slice(&s.0));
+			if counterparty_skimmed_fee_msat.is_some() {
+				ldk_server_protos::types::PaymentKind {
+					kind: Some(Bolt11Jit(ldk_server_protos::types::Bolt11Jit {
+						hash,
+						preimage,
+						secret,
+						lsp_fee_limits: None,
+						counterparty_skimmed_fee_msat,
+					})),
+				}
+			} else {
+				ldk_server_protos::types::PaymentKind {
+					kind: Some(Bolt11(ldk_server_protos::types::Bolt11 { hash, preimage, secret })),
+				}
+			}
 		},
 		PaymentKind::Bolt12Offer { hash, preimage, secret, offer_id, payer_note, quantity } => {
 			ldk_server_protos::types::PaymentKind {

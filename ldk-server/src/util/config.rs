@@ -507,6 +507,7 @@ impl From<LSPS2ServiceTomlConfig> for LSPS2ServiceConfig {
 			max_payment_size_msat,
 			client_trusts_lsp,
 			require_token,
+			disable_client_reserve: false,
 		}
 	}
 }
@@ -833,6 +834,7 @@ mod tests {
 				min_payment_size_msat: 10000000,
 				max_payment_size_msat: 25000000000,
 				client_trusts_lsp: true,
+				disable_client_reserve: false,
 			}),
 			log_level: LevelFilter::Trace,
 			log_file_path: Some("/var/log/ldk-server.log".to_string()),
@@ -1269,6 +1271,7 @@ mod tests {
 				min_payment_size_msat: 10000000,
 				max_payment_size_msat: 25000000000,
 				client_trusts_lsp: true,
+				disable_client_reserve: false,
 			}),
 			log_level: LevelFilter::Trace,
 			log_file_path: Some("/var/log/ldk-server.log".to_string()),

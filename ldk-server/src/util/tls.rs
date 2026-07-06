@@ -462,6 +462,9 @@ mod tests {
 
 	#[test]
 	fn test_generate_and_load_roundtrip() {
+		// Tests bypass main(), which normally installs the process-default provider.
+		let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
 		let temp_dir = std::env::temp_dir();
 		let mut suffix_bytes = [0u8; 8];
 		getrandom::getrandom(&mut suffix_bytes).unwrap();
