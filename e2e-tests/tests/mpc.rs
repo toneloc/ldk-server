@@ -37,13 +37,30 @@ struct MpcParties {
 	p2_addr: String,
 	keystore_a: PathBuf,
 	keystore_b: PathBuf,
+	/// Key files: client PSK (LDK Server <-> A), peer PSK (A <-> B), share keys (at rest).
+	keys_dir: PathBuf,
+	/// BIP 84 account xpub of server A's on-chain wallet, allow-listed on Party B.
+	payout_xpub: Option<String>,
 }
 
-fn spawn_party(role: &str, listen: &str, peer: Option<&str>, keystore: &Path) -> Child {
+fn spawn_party(
+	role: &str, listen: &str, peer: Option<&str>, keystore: &Path, keys_dir: &Path,
+	payout_xpub: Option<&str>,
+) -> Child {
 	let mut cmd = Command::new(mpc_party_binary_path());
 	cmd.args(["--role", role, "--listen", listen, "--keystore", keystore.to_str().unwrap()]);
 	if let Some(peer) = peer {
 		cmd.args(["--peer", peer]);
+	}
+	cmd.arg("--peer-auth-key-file").arg(keys_dir.join("peer.psk"));
+	cmd.arg("--share-key-file").arg(keys_dir.join(format!("share-{role}.key")));
+	if role == "p1" {
+		cmd.arg("--auth-key-file").arg(keys_dir.join("client.psk"));
+	}
+	if let Some(xpub) = payout_xpub {
+		cmd.args(["--payout-xpub", xpub, "--payout-lookahead", "200"]);
+		// Pay-per-update cap generous enough for the test payments (10M msat max per hop).
+		cmd.args(["--max-balance-decrease-sat", "20000"]);
 	}
 	let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
 	let stderr = child.stderr.take().unwrap();
@@ -70,19 +87,63 @@ impl MpcParties {
 		let keystore_a = tempfile::tempdir().unwrap().into_path();
 		#[allow(deprecated)]
 		let keystore_b = tempfile::tempdir().unwrap().into_path();
+		#[allow(deprecated)]
+		let keys_dir = tempfile::tempdir().unwrap().into_path();
 		let p1_addr = format!("127.0.0.1:{}", find_available_port());
 		let p2_addr = format!("127.0.0.1:{}", find_available_port());
-		let mut parties =
-			MpcParties { p1: None, p2: None, p1_addr, p2_addr, keystore_a, keystore_b };
-		parties.spawn_all();
+		let mut parties = MpcParties {
+			p1: None,
+			p2: None,
+			p1_addr,
+			p2_addr,
+			keystore_a,
+			keystore_b,
+			keys_dir,
+			payout_xpub: None,
+		};
+		// Party A first: LDK Server only needs A at startup. Party B is started once the
+		// server has exported its wallet xpub (see `start_b`), so B can allow-list it.
+		parties.spawn_a();
 		parties
 	}
 
-	fn spawn_all(&mut self) {
-		self.p2 = Some(spawn_party("p2", &self.p2_addr, None, &self.keystore_b));
-		wait_for_port(&self.p2_addr);
-		self.p1 = Some(spawn_party("p1", &self.p1_addr, Some(&self.p2_addr), &self.keystore_a));
+	fn spawn_a(&mut self) {
+		self.p1 = Some(spawn_party(
+			"p1",
+			&self.p1_addr,
+			Some(&self.p2_addr),
+			&self.keystore_a,
+			&self.keys_dir,
+			None,
+		));
 		wait_for_port(&self.p1_addr);
+	}
+
+	/// Starts Party B with `payout_xpub` allow-listed.
+	fn start_b(&mut self, payout_xpub: &str) {
+		self.payout_xpub = Some(payout_xpub.to_string());
+		self.spawn_b();
+	}
+
+	fn spawn_b(&mut self) {
+		self.p2 = Some(spawn_party(
+			"p2",
+			&self.p2_addr,
+			None,
+			&self.keystore_b,
+			&self.keys_dir,
+			self.payout_xpub.as_deref(),
+		));
+		wait_for_port(&self.p2_addr);
+	}
+
+	fn spawn_all(&mut self) {
+		self.spawn_b();
+		self.spawn_a();
+	}
+
+	fn client_psk_path(&self) -> PathBuf {
+		self.keys_dir.join("client.psk")
 	}
 
 	fn kill_all(&mut self) {
@@ -100,6 +161,7 @@ impl MpcParties {
 	}
 
 	fn share_count(dir: &Path) -> usize {
+		// Shares are encrypted at rest; only count them.
 		std::fs::read_dir(dir)
 			.unwrap()
 			.filter_map(|e| e.ok())
@@ -112,7 +174,16 @@ impl MpcParties {
 		let mut keys = Vec::new();
 		for entry in std::fs::read_dir(&self.keystore_a).unwrap().filter_map(|e| e.ok()) {
 			if entry.path().extension().map(|x| x == "share").unwrap_or(false) {
-				let blob = ldk_server_mpc::cbmpc::KeyBlob(std::fs::read(entry.path()).unwrap());
+				let bytes = std::fs::read(entry.path()).unwrap();
+				assert!(
+					ldk_server_mpc::secure::AtRestKey::is_encrypted(&bytes),
+					"share not encrypted"
+				);
+				let share_key: [u8; 32] =
+					std::fs::read(self.keys_dir.join("share-p1.key")).unwrap().try_into().unwrap();
+				let plain =
+					ldk_server_mpc::secure::AtRestKey::new(&share_key).open(&bytes).unwrap();
+				let blob = ldk_server_mpc::cbmpc::KeyBlob(plain);
 				keys.push(PublicKey::from_slice(&blob.public_key_compressed().unwrap()).unwrap());
 			}
 		}
@@ -125,12 +196,15 @@ impl Drop for MpcParties {
 		self.kill_all();
 		let _ = std::fs::remove_dir_all(&self.keystore_a);
 		let _ = std::fs::remove_dir_all(&self.keystore_b);
+		let _ = std::fs::remove_dir_all(&self.keys_dir);
 	}
 }
 
-async fn start_mpc_server(bitcoind: &TestBitcoind, parties: &MpcParties) -> LdkServerHandle {
+/// Starts the MPC-backed server, then Party B with the server's wallet xpub allow-listed.
+async fn start_mpc_server(bitcoind: &TestBitcoind, parties: &mut MpcParties) -> LdkServerHandle {
 	let party_address = parties.p1_addr.clone();
-	LdkServerHandle::start_with_config(bitcoind, move |params| {
+	let auth_key_path = parties.client_psk_path();
+	let server = LdkServerHandle::start_with_config(bitcoind, move |params| {
 		let mut config = TestConfigBuilder::new(params).alias(Some("mpc-node")).build();
 		// The on-chain wallet gets its own mnemonic so it is not derivable from the node seed.
 		let wallet_mnemonic = params.storage_dir.join("onchain_wallet_mnemonic");
@@ -139,10 +213,16 @@ async fn start_mpc_server(bitcoind: &TestBitcoind, parties: &MpcParties) -> LdkS
 			&format!("[node]\nonchain_wallet_mnemonic_path = \"{}\"\n", wallet_mnemonic.display()),
 			1,
 		);
-		config.push_str(&format!("\n[mpc]\nparty_address = \"{party_address}\"\n"));
+		config.push_str(&format!(
+			"\n[mpc]\nparty_address = \"{party_address}\"\ncoverage = \"all\"\nauth_key_path = \"{}\"\n",
+			auth_key_path.display()
+		));
 		config
 	})
-	.await
+	.await;
+	let xpub = std::fs::read_to_string(server.storage_dir.join("onchain_wallet_xpub")).unwrap();
+	parties.start_b(xpub.trim());
+	server
 }
 
 /// Asserts the MPC server's on-chain wallet mnemonic exists and differs from the node mnemonic.
@@ -204,17 +284,19 @@ async fn wait_for_spender(bitcoind: &TestBitcoind, funding_txid: &str, vout: u32
 async fn test_mpc_channel_open_pay_and_coop_close() {
 	let bitcoind = TestBitcoind::new();
 	let mut parties = MpcParties::start();
-	let server_a = start_mpc_server(&bitcoind, &parties).await;
+	let server_a = start_mpc_server(&bitcoind, &mut parties).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
 	assert_separate_wallet_mnemonic(&server_a);
 	let user_channel_id = setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
 	// Exactly one distributed key was generated and each party holds one share.
-	assert_eq!(MpcParties::share_count(&parties.keystore_a), 1);
-	assert_eq!(MpcParties::share_count(&parties.keystore_b), 1);
+	// Five distributed keys (funding, payment, delayed-payment, HTLC, revocation) were
+	// generated for the channel and each party holds one share of each.
+	assert_eq!(MpcParties::share_count(&parties.keystore_a), 5);
+	assert_eq!(MpcParties::share_count(&parties.keystore_b), 5);
 	let mpc_pubkeys = parties.party_a_pubkeys();
-	assert_eq!(mpc_pubkeys.len(), 1);
+	assert_eq!(mpc_pubkeys.len(), 5);
 
 	// Payments in both directions (each commitment update is signed via MPC on server A).
 	send_bolt11_payment(&server_a, &server_b, 10_000_000).await;
@@ -230,7 +312,7 @@ async fn test_mpc_channel_open_pay_and_coop_close() {
 	let channels = wait_for_channels(&server_a, 1, Duration::from_secs(30)).await;
 	let funding = channels[0].funding_txo.clone().expect("funding txo");
 	send_bolt11_payment(&server_b, &server_a, 500_000).await;
-	assert_eq!(MpcParties::share_count(&parties.keystore_a), 1, "no new keys after restart");
+	assert_eq!(MpcParties::share_count(&parties.keystore_a), 5, "no new keys after restart");
 
 	let balances_before = server_a.client().get_balances(GetBalancesRequest {}).await.unwrap();
 
@@ -243,9 +325,8 @@ async fn test_mpc_channel_open_pay_and_coop_close() {
 	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
 	wait_for_channels(&server_a, 0, Duration::from_secs(30)).await;
 	assert!(
-		pubkeys.contains(&mpc_pubkeys[0]),
-		"closing tx multisig {pubkeys:?} does not contain MPC key {}",
-		mpc_pubkeys[0]
+		pubkeys.iter().any(|pk| mpc_pubkeys.contains(pk)),
+		"closing tx multisig {pubkeys:?} does not contain any MPC key {mpc_pubkeys:?}"
 	);
 
 	let balances_after = server_a.client().get_balances(GetBalancesRequest {}).await.unwrap();
@@ -256,8 +337,8 @@ async fn test_mpc_channel_open_pay_and_coop_close() {
 #[tokio::test]
 async fn test_mpc_channel_force_close() {
 	let bitcoind = TestBitcoind::new();
-	let parties = MpcParties::start();
-	let server_a = start_mpc_server(&bitcoind, &parties).await;
+	let mut parties = MpcParties::start();
+	let server_a = start_mpc_server(&bitcoind, &mut parties).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
 	let user_channel_id = setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
@@ -272,7 +353,10 @@ async fn test_mpc_channel_force_close() {
 	assert!(output.is_object());
 	let commitment_tx = wait_for_spender(&bitcoind, &funding.txid, funding.vout).await;
 	let pubkeys = funding_multisig_pubkeys(&commitment_tx);
-	assert!(pubkeys.contains(&mpc_pubkeys[0]), "commitment tx not signed under MPC key");
+	assert!(
+		pubkeys.iter().any(|pk| mpc_pubkeys.contains(pk)),
+		"commitment tx not signed under MPC key"
+	);
 
 	wait_for_force_close_claims(
 		&bitcoind,

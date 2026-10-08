@@ -1,9 +1,15 @@
 # ldk-server-mpc: Coinbase 2-of-2 MPC channel signing for LDK Server
 
-Proof of concept that puts the Lightning **channel funding key** of an LDK Server node under
-Coinbase's [`cb-mpc`](https://github.com/coinbase/cb-mpc) two-party ECDSA (ECDSA-2P).
-Two independent MPC processes each hold one key share; the complete private key is never
-assembled anywhere. All Lightning channel state stays in LDK Server / LDK Node.
+Puts **every Lightning channel key** of an LDK Server node under Coinbase's
+[`cb-mpc`](https://github.com/coinbase/cb-mpc) two-party ECDSA (ECDSA-2P): the funding key,
+the payment, delayed-payment, HTLC and revocation basepoints, and the per-commitment secrets.
+Two independent MPC processes each hold one share of every key; the complete private keys are
+never assembled anywhere. Party B enforces a signing policy (recomputed sighashes, key-kind
+binding, BOLT 3 derivation checks, monotonic commitment numbers, ordered secret release,
+balance tracking, payout allow-list). All Lightning channel state stays in LDK Server / LDK
+Node; the parties keep only key shares and the policy counters.
+
+`coverage = "funding"` keeps the original funding-key-only mode.
 
 ## Architecture
 
@@ -99,42 +105,46 @@ Legacy overview (same thing, flattened):
 
 ## What is MPC-backed and what is not
 
-| Key / operation                                   | Backing                         |
-|---------------------------------------------------|---------------------------------|
-| Funding key (2-of-2 funding multisig)             | **cb-mpc 2-of-2 (A + B)**       |
-| `sign_counterparty_commitment` (funding sig)      | MPC                             |
-| `sign_holder_commitment`                          | MPC                             |
-| `sign_closing_transaction`                        | MPC                             |
-| `sign_holder_keyed_anchor_input`                  | MPC                             |
-| `sign_channel_announcement_with_funding_key`      | MPC                             |
-| `sign_splice_shared_input` / spliced funding key  | MPC (fresh DKG per splice)      |
-| HTLC signatures inside `sign_counterparty_commitment` | local (`InMemorySigner`)    |
-| Revocation, payment, delayed-payment, HTLC basepoints | local                       |
-| Per-commitment secrets / points (`commitment_seed`)   | local                       |
-| Justice / HTLC claim / anchor-HTLC transactions   | local                           |
-| Node identity key, gossip, BOLT12, onion keys     | local (`KeysManager`)           |
-| On-chain wallet (BDK)                             | local, unchanged                |
+With `coverage = "all"` (default):
 
-This is **funding-key protection only**. Without Party B, a compromised LDK Server host
-cannot produce a funding-multisig signature (new commitment, cooperative close, splice,
-keyed anchor, announcement). It still holds every local key, so it can:
+| Key / operation                                        | Backing                                   |
+|--------------------------------------------------------|-------------------------------------------|
+| Funding key (2-of-2 funding multisig), spliced funding keys | **cb-mpc 2-of-2 (A + B)**, fresh DKG per splice |
+| Payment point (`to_remote`)                            | MPC (static key)                          |
+| Delayed-payment basepoint and per-commitment keys      | MPC; per-commitment key = share + BOLT 3 tweak |
+| HTLC basepoint and per-commitment keys                 | MPC; same                                 |
+| Revocation basepoint and revocation keys               | MPC; `share * H1 + secret * H2` on shares |
+| Per-commitment secrets / points (`commitment_seed`)    | **Party B only**, released under policy   |
+| Commitment, closing, anchor, announcement, splice sigs | MPC                                       |
+| HTLC signatures (commitment updates, HTLC txs, claims) | MPC (one session per HTLC, in parallel)   |
+| Justice transactions                                   | MPC                                       |
+| Sweeps of `to_remote` / delayed `to_local` outputs     | MPC                                       |
+| Node identity key, gossip, BOLT12, onion keys          | local (`KeysManager`)                     |
+| On-chain wallet (BDK)                                  | local; own mnemonic (`onchain_wallet_mnemonic_path`) |
 
-- broadcast an already-signed old commitment (the signature exists; MPC cannot revoke it),
-- leak per-commitment secrets, enabling the counterparty to claim revoked states,
-- force-close with the already-signed latest commitment, wait out the delay, and sweep the
-  confirmed `to_local` and HTLC outputs with the delayed-payment and HTLC keys to any
-  address. The normal sweep destination is the BDK wallet, which is derived from the same
-  seed, so "the funds return to our on-chain wallet" offers no protection against a host
-  compromise,
-- claim or time out HTLCs,
-- and ask Party B for any funding-key signature, since the only policy is `AllowAllPolicy`
-  and the signing context is not verified.
+With `coverage = "funding"` only the first row is MPC-backed and everything else is the
+local `InMemorySigner`.
 
-The result is a custody split for the funding key, not a validating signer. The local keys
-stayed local because the cb-mpc public ECDSA-2P API has no share-tweak/derivation
-operation, and the per-commitment keys are tweaked basepoints (revocation keys use a
-two-sided multiplicative tweak). Full coverage needs tweak support (or derivation inside
-the parties) plus a state-tracking policy on Party B.
+### What this protects
+
+With full coverage and Party B's policy, an attacker who controls the LDK Server host (seed,
+database, process) cannot, without Party B:
+
+- sign any new commitment, closing, splice, anchor or announcement (funding key);
+- sign HTLC or justice transactions, or sweep channel outputs (all other keys);
+- obtain a per-commitment secret ahead of its state being superseded (Party B releases a
+  secret only after LDK has validated a newer holder commitment);
+- get Party B to sign an old holder commitment (monotonic commitment numbers), a commitment
+  that drops our balance by more than the configured cap, a cooperative close that does not
+  pay our tracked balance to an allow-listed script, or a sweep to a non-allow-listed script;
+- feed Party B a fake transaction: Party B recomputes every sighash from the transaction,
+  input, value and witness script it is given, and verifies key derivations against the
+  per-commitment point / revealed secret.
+
+What a host compromise can still do: broadcast the latest *already-signed* holder
+commitment (a force-close; the resulting outputs can only be swept to allow-listed scripts via
+MPC), stall the node, leak the node identity key, and spend the on-chain wallet (its mnemonic
+is still on the host; see remaining work).
 
 ## Components
 
@@ -158,32 +168,47 @@ the parties) plus a state-tracking policy on Party B.
   Every signature is verified against the aggregate key and normalized to low-S before it
   is returned.
 - `src/client.rs` – `MpcClient`, blocking with bounded connect/request/DKG timeouts.
-- `src/policy.rs` – `SigningPolicy` trait with the only implementation `AllowAllPolicy`.
-  The `SigningContext` (op kind, channel keys id, channel value, commitment number, funding
-  outpoint, splice parent) is informational metadata supplied by LDK and is **not
-  verified** by the parties.
-- `src/bin/party.rs` – `ldk-server-mpc-party --role p1|p2 ...`.
+- `src/policy.rs` – `ChannelPolicy`, run by both parties (Party B authoritatively, Party A
+  as a first line). Per channel it records the key id of each key kind at DKG time and the
+  commitment / balance state. It verifies, for every signature: the recomputed sighash, the
+  key kind for the operation, the BOLT 3 derivation, commitment-number monotonicity, our
+  balance (located by script, not by metadata) against `--max-balance-decrease-sat`, and
+  payout destinations (`--payout-xpub`, `--payout-address`) for closes and sweeps. Party B
+  also holds the commitment-seed master secret and serves per-commitment points and secrets.
+- `src/secure.rs` – PSK-authenticated, forward-secret encrypted framing (X25519 +
+  HKDF-SHA256 + AES-256-GCM) for both links, and AES-256-GCM encryption of shares and the
+  master secret at rest.
+- `src/bin/party.rs` – `ldk-server-mpc-party --role p1|p2 ...` with `--auth-key-file`,
+  `--peer-auth-key-file`, `--share-key-file`, `--payout-xpub`, `--payout-address`,
+  `--max-balance-decrease-sat`, `--max-closing-fee-sat`.
 - `src/bin/bench.rs` – `ldk-server-mpc-bench` latency benchmark.
 
 ### LDK integration points
 
 - **ldk-node patch** (`contrib/patches/ldk-node-external-funding-signer.patch`, applied in
   the sibling checkout `../ldk-node`, wired via `[patch]` in the workspace `Cargo.toml`):
-  - `ldk_node::signer::ExternalFundingSigner` trait (`funding_pubkey`,
-    `sign_with_funding_key`).
-  - `ldk_node::signer::NodeChannelSigner`, the node's `SignerProvider::EcdsaSigner`. It
-    wraps `InMemorySigner` and overrides `pubkeys().funding_pubkey`,
-    `new_funding_pubkey` and the six funding-key signing methods when an external signer
-    is configured. Everything else delegates to `InMemorySigner`.
-  - `Builder::set_external_funding_signer(Arc<dyn ExternalFundingSigner>)`.
+  - `ldk_node::signer::ExternalChannelSigner` trait: `channel_pubkeys`, `funding_pubkey`,
+    `per_commitment_point`, `release_commitment_secret`, the two validation notices and
+    batch `sign(requests)`. Every `SignRequest` carries the full transaction, input, value,
+    witness script, sighash type and channel parameters.
+  - `ldk_node::signer::NodeChannelSigner`, the node's `SignerProvider::EcdsaSigner`. With
+    `KeyCoverage::AllChannelKeys` every `ChannelSigner`/`EcdsaChannelSigner` method and the
+    `OutputSpender` sweeps go to the external signer; with `FundingOnly` just the funding
+    key does.
+  - `Builder::set_external_channel_signer`, `Builder::set_onchain_wallet_entropy`, and a
+    5-second `signer_unblocked` poke so signatures that failed while the MPC was unreachable
+    are retried.
   - Signers are restored through `SignerProvider::derive_channel_signer(channel_keys_id)`,
     so no serialization format changes.
-- **ldk-server** (`ldk-server/src/mpc_signer.rs`): `MpcFundingSigner` maps
-  `channel_keys_id` (+ optional splice parent txid) to an MPC key id with a tagged SHA-256,
-  calls `EnsureKey` (idempotent; runs DKG on first use) for public keys and `Sign` for
-  signatures, caching public keys in memory.
-- Config: `[mpc] party_address = "127.0.0.1:7701"` (or `--mpc-party-address` /
-  `LDK_SERVER_MPC_PARTY_ADDRESS`), optional `request_timeout_secs`, `dkg_timeout_secs`.
+- **ldk-server** (`ldk-server/src/mpc_signer.rs`): `MpcChannelSigner` maps
+  `channel_keys_id` to one MPC key id per key kind (tagged SHA-256) and a policy channel
+  id, runs the five DKGs in parallel on first use, derives the public keys for tweaked
+  requests locally to verify signatures, and keeps undeliverable state notices in an
+  ordered retry queue (an `Err` from LDK's validation callbacks would close the channel).
+- Config: `[mpc] party_address = "127.0.0.1:7701"`, `coverage = "all" | "funding"`,
+  `auth_key_path = "<32-byte PSK file from Party A's --auth-key-file>"`, optional
+  `request_timeout_secs`, `dkg_timeout_secs`. LDK Server writes the wallet's BIP 84 account
+  xpub to `<storage>/onchain_wallet_xpub` for Party B's `--payout-xpub`.
 - **Separate on-chain wallet seed**: `[node] onchain_wallet_mnemonic_path = "<file>"` (or
   `--node-onchain-wallet-mnemonic-path` / `LDK_SERVER_NODE_ONCHAIN_WALLET_MNEMONIC_PATH`).
   The ldk-node patch adds `Builder::set_onchain_wallet_entropy`, which derives the BDK
@@ -191,18 +216,23 @@ the parties) plus a state-tracking policy on Party B.
   keys keep using the node mnemonic. Without it, LDK Node derives both from one seed, so a
   stolen node seed also controls every sweep destination. Fresh nodes only.
 
-cb-mpc does not expose additive tweaks for ECDSA-2P keys, so spliced channels do not tweak
-the base key (as `InMemorySigner` does); instead `new_funding_pubkey` triggers a fresh
+Per-commitment keys use two small additions to cb-mpc
+(`contrib/patches/cb-mpc-additive-tweak-derivation.patch`): `ecdsa_2p::derive_additive_tweak`
+(`key + t`, the non-hardened step of cb-mpc's own HD keyset derivation with an explicit
+scalar) and `ecdsa_2p::derive_mul_add` (`key * m + a`, for revocation keys; both shares are
+scaled and P1's Paillier ciphertext is scaled homomorphically). Both are local and need no
+round trip; derived blobs are ephemeral and never refreshed. Spliced funding keys use a fresh
 DKG keyed by `(channel_keys_id, splice_parent_funding_txid)`.
 
 ## Building
 
-1. Build cb-mpc and its custom OpenSSL (one-time; macOS arm64 shown, see cb-mpc's README
-   for Linux):
+1. Build cb-mpc (with the derivation patch) and its custom OpenSSL (one-time; macOS arm64
+   shown, see cb-mpc's README for Linux):
 
    ```bash
    git clone https://github.com/coinbase/cb-mpc ../cb-mpc
-   cd ../cb-mpc && git submodule update --init vendors/secp256k1
+   cd ../cb-mpc && git checkout 0b71670 && git submodule update --init vendors/secp256k1
+   git am ../ldk-server/contrib/patches/cb-mpc-additive-tweak-derivation.patch
    pip3 install --user cmake            # if cmake is not installed
    export CBMPC_OPENSSL_ROOT=$PWD/openssl-3.6.4-install
    bash scripts/openssl/build-static-openssl-macos-m1.sh
@@ -227,12 +257,21 @@ DKG keyed by `(channel_keys_id, splice_parent_funding_txid)`.
 ## Running
 
 ```bash
-# 1 + 2: start the parties (separate processes, separate keystores)
-contrib/mpc-signet/run-mpc-parties.sh
-# 3: key shares are generated lazily on first channel open (EnsureKey -> DKG)
-# 4: start LDK Server with an [mpc] section, on a FRESH storage dir
-target/release/ldk-server contrib/mpc-signet/ldk-server-signet-mpc.toml
+# 1: Party A (creates client.psk / peer.psk / share key files if missing)
+ldk-server-mpc-party --role p1 --listen 127.0.0.1:7701 --peer 127.0.0.1:7702 \
+  --keystore mpc/a --auth-key-file mpc/client.psk --peer-auth-key-file mpc/peer.psk \
+  --share-key-file mpc/share-a.key
+# 2: LDK Server (fresh storage dir) with [mpc] party_address / auth_key_path and
+#    [node] onchain_wallet_mnemonic_path; it writes <storage>/onchain_wallet_xpub
+ldk-server my-config.toml
+# 3: Party B with the wallet xpub allow-listed (copy peer.psk to Party B's host)
+ldk-server-mpc-party --role p2 --listen 127.0.0.1:7702 --keystore mpc/b \
+  --peer-auth-key-file mpc/peer.psk --share-key-file mpc/share-b.key \
+  --payout-xpub "$(cat <storage>/onchain_wallet_xpub)" --max-balance-decrease-sat 100000
+# 4: key shares are generated on first channel open (five DKGs per channel, in parallel)
 ```
+
+`contrib/mpc-signet/run-mpc-parties.sh` starts both parties on one machine for a demo.
 
 Enable MPC only on a fresh node. Existing channels were created with locally derived
 funding keys; `derive_channel_signer` would hand them an MPC pubkey that does not match
@@ -253,28 +292,35 @@ cd e2e-tests && cargo test --test mpc -- --test-threads=1   # regtest, downloads
 - `tests/service.rs`: full client→P1→P2 path over TCP: DKG + sign + restart/share
   restoration, invalid key id, MPC process unavailable (client and P2), bounded signing
   timeout, repeated and concurrent requests, P2 refusing DKG for an existing key id.
-- `e2e-tests/tests/mpc.rs`: two `ldk-server` processes on regtest, server A with MPC: open
-  channel, pay both directions, restart MPC parties, restart LDK Server, cooperative close
-  (closing tx's 2-of-2 redeem script contains the DKG'd key), and a separate holder
-  force-close test.
+- `tests/service.rs` also covers PSK-secured links (correct, wrong and missing PSK) and
+  encrypted shares / master secret.
+- `src/policy.rs` unit tests: sighash mismatch, key-kind mismatch, HTLC and revocation
+  derivation checks, commitment monotonicity with the balance cap, secret release ordering,
+  closing allow-list with balance, sweep destinations.
+- `e2e-tests/tests/mpc.rs`: two `ldk-server` processes on regtest, server A with full MPC
+  coverage, PSK links, encrypted shares and Party B allow-listing the wallet xpub: open
+  channel (five DKGs), pay both directions, restart MPC parties, restart LDK Server,
+  cooperative close (closing tx's 2-of-2 redeem script contains a DKG'd key), and a separate
+  holder force-close test.
 
 ## Security notes / remaining work
 
-- Key shares are stored **unencrypted** on disk. cb-mpc recommends envelope encryption
-  with an external KMS/HSM. The P1 blob also contains Paillier private material.
-- Transport between parties and from LDK Server to P1 is plain TCP on localhost. For
-  anything beyond one machine, add mutual TLS and authentication.
-- No policy: `AllowAllPolicy` signs anything P1 is asked to sign. The signing context is
-  unverified metadata.
-- Party identifiers (`--p1-name/--p2-name`) are cb-mpc `pid`s and must be stable and
-  unique per deployment.
-- Only the funding key is MPC-backed (see table above). Full coverage would need
-  per-commitment key derivation (`derive_private_key` tweaks) on MPC shares, which the
-  cb-mpc public ECDSA-2P API does not expose.
-- The separate on-chain wallet seed still lives on the LDK Server host. The next step is to
-  keep it off-host (hardware signer / separate PSBT signing service) and have Party B only
-  sign sweeps to pre-approved destinations.
+- **On-chain wallet mnemonic is still on the LDK Server host.** With
+  `onchain_wallet_mnemonic_path` it is at least not derivable from the node seed, and Party B
+  only signs closes/sweeps to that wallet's addresses, so a host compromise can force funds
+  *into* the wallet but not elsewhere. Moving on-chain signing off-host (PSBT signer, HSM) is
+  the remaining step to make channel funds unreachable from the host.
+- **Party B must run on separate infrastructure** with its own administrator. On one machine
+  the two parties are a process boundary, not a trust boundary.
+- **Share keys and PSKs are files.** They are generated with `0600` permissions and should be
+  kept on a different medium than the keystore (or in a KMS/HSM).
+- **Policy scope.** The balance cap is a per-update delta, not a price-based rule; HTLC
+  accounting (which HTLCs may be settled) is not enforced. Counterparty revocation notices are
+  recorded but not verified.
+- **cb-mpc full API.** The two derivation functions use cb-mpc's internal key representation
+  (the same arithmetic as its HD keyset derivation) and are outside the public API's
+  bug-bounty surface. Derived blobs must never be refreshed.
+- **Availability.** Nothing in a channel (including force-close and sweeps) works without
+  Party B. Signatures that fail while the MPC is unreachable are retried via the periodic
+  `signer_unblocked`; state notices are queued and replayed in order.
 - Key refresh (`cbmpc_ecdsa_2p_refresh`) is wrapped but not exposed through the service.
-- Signing is synchronous with timeouts. On a timeout the signer returns `Err`, which LDK
-  treats as "signer unavailable"; LDK Node does not currently call `signer_unblocked`, so
-  a stuck channel requires a restart.
