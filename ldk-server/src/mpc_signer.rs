@@ -40,22 +40,31 @@ pub(crate) struct MpcChannelSigner {
 }
 
 impl MpcChannelSigner {
-	pub(crate) fn new(config: &MpcConfig) -> Self {
-		let client = MpcClient::new(config.party_address).with_timeouts(
+	pub(crate) fn new(config: &MpcConfig) -> Result<Self, String> {
+		let mut client = MpcClient::new(config.party_address).with_timeouts(
 			Duration::from_secs(5),
 			Duration::from_secs(config.request_timeout_secs),
 			Duration::from_secs(config.dkg_timeout_secs),
 		);
+		match &config.auth_key_path {
+			Some(path) => {
+				let psk =
+					ldk_server_mpc::secure::load_or_create_key_file(std::path::Path::new(path))
+						.map_err(|e| format!("failed to load MPC auth key {path}: {e}"))?;
+				client = client.with_psk(psk);
+			},
+			None => log::warn!("mpc.auth_key_path not set: the link to MPC Party A is plain TCP"),
+		}
 		let coverage = match config.coverage {
 			MpcCoverage::Funding => KeyCoverage::FundingOnly,
 			MpcCoverage::All => KeyCoverage::AllChannelKeys,
 		};
-		MpcChannelSigner {
+		Ok(MpcChannelSigner {
 			client,
 			coverage,
 			secp: Secp256k1::new(),
 			pubkeys: Mutex::new(HashMap::new()),
-		}
+		})
 	}
 
 	/// Checks the MPC service is reachable.

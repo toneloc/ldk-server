@@ -273,7 +273,13 @@ fn main() {
 	}
 
 	if let Some(mpc_config) = &config_file.mpc_config {
-		let mpc_signer = crate::mpc_signer::MpcChannelSigner::new(mpc_config);
+		let mpc_signer = match crate::mpc_signer::MpcChannelSigner::new(mpc_config) {
+			Ok(signer) => signer,
+			Err(e) => {
+				error!("{e}");
+				std::process::exit(-1);
+			},
+		};
 		if let Err(e) = mpc_signer.ping() {
 			error!("MPC party A at {} is unreachable: {e}", mpc_config.party_address);
 			std::process::exit(-1);
