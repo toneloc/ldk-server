@@ -6,6 +6,30 @@ whose only purpose is to test putting Lightning channel keys under Coinbase's
 Server; for the daemon itself use upstream. Upstream's README, API docs and contribution
 guide are unchanged under `docs/`, `ldk-server-grpc/` and `CONTRIBUTING.md`.
 
+## In short
+
+A Lightning node normally keeps every channel key on one machine, so whoever controls that
+machine controls the funds. This fork splits every channel key of an LDK Server node between
+two separate processes using Coinbase's cb-mpc 2-of-2 ECDSA: neither process ever holds a
+complete key, and every signature needs both. The second process is not a rubber stamp. It
+rebuilds each transaction from the bytes it is given, checks the key and the channel state,
+keeps the revocation secrets itself, tracks the node's balance, and refuses to sign old
+states, balance-draining updates, or closes and sweeps to addresses it does not know.
+
+This runs real Lightning end to end: channel open, payments in both directions, restarts,
+cooperative close and force-close, on regtest with every key split and on signet against a
+third-party LND node with the funding-key version. Compared with stock LDK Server, the host
+is left with only the node's network identity and a receiving wallet; it cannot move channel
+funds without the second party's agreement. This is what VLS or LND's remote signer offer,
+done with Coinbase's MPC library on today's non-taproot channels.
+
+Two caveats. It is a proof of concept: one evening of work, both parties on one machine,
+reviewed by no one but its author, with a policy that covers the big cases but not HTLC
+accounting, and two small key-derivation helpers added outside cb-mpc's audited public API.
+And the on-chain wallet is the one key still on the host: channel funds can now only be sent
+into that wallet, but once there the host can spend them. Moving that last signer off-host is
+ordinary engineering and the next step. Do not use this with real funds.
+
 ## What it does
 
 Every channel key of an LDK Server node (funding, payment, delayed-payment, HTLC and
