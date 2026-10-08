@@ -11,12 +11,15 @@ network = "signet"
 listening_addresses = ["127.0.0.1:19735"]
 alias = "ldk-mpc-signet"
 grpc_service_address = "127.0.0.1:13536"
+# Derive the on-chain wallet from its own mnemonic (generated on first start) so it is not
+# derivable from the node mnemonic. Fresh nodes only.
+onchain_wallet_mnemonic_path = "/tmp/ldk-server-mpc-signet/onchain_wallet_mnemonic"
 
 [storage.disk]
 dir_path = "/tmp/ldk-server-mpc-signet/"
 
 [esplora]
-server_url = "https://blockstream.info/signet/api"
+server_url = "https://mempool.space/signet/api"
 
 [log]
 level = "Debug"

@@ -1,8 +1,8 @@
 From 29e0793316030aaa3c585dc8a6259f627b4b558d Mon Sep 17 00:00:00 2001
 From: toneloc <3665696+toneloc@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 22:52:46 -0400
-Subject: [PATCH] Add ExternalFundingSigner hook for externally held channel
- funding keys
+Subject: [PATCH 1/2] Add ExternalFundingSigner hook for externally held
+ channel funding keys
 
 Introduces `signer::NodeChannelSigner`, a wrapper around LDK's
 `InMemorySigner` that routes the channel funding key (pubkey and all
@@ -721,6 +721,120 @@ index 3e43398..804e2c9 100644
  	}
  
  	fn get_destination_script(&self, _channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
+-- 
+2.50.1 (Apple Git-155)
+
+
+From dea58d083b911d902058f97e4f192dc46ab787c5 Mon Sep 17 00:00:00 2001
+From: toneloc <3665696+toneloc@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 23:53:40 -0400
+Subject: [PATCH 2/2] Allow deriving the on-chain wallet from separate entropy
+
+Builder::set_onchain_wallet_entropy makes the BDK wallet descriptors use
+their own seed while Lightning keys keep using the node entropy, so that
+neither seed is derivable from the other.
+
+AI tooling disclosure: written with Claude Code assistance.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/builder.rs | 41 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/src/builder.rs b/src/builder.rs
+index 2f4776c..e1c4dcc 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -328,6 +328,7 @@ impl std::error::Error for BuildError {}
+ pub struct NodeBuilder {
+ 	config: Config,
+ 	external_funding_signer: Option<ExternalFundingSignerHandle>,
++	onchain_wallet_seed_bytes: Option<[u8; 64]>,
+ 	chain_data_source_config: Option<ChainDataSourceConfig>,
+ 	gossip_source_config: Option<GossipSourceConfig>,
+ 	liquidity_source_config: Option<LiquiditySourceConfig>,
+@@ -368,6 +369,7 @@ impl NodeBuilder {
+ 			pathfinding_scores_sync_config,
+ 			probing_config,
+ 			external_funding_signer: None,
++			onchain_wallet_seed_bytes: None,
+ 		}
+ 	}
+ 
+@@ -714,6 +716,17 @@ impl NodeBuilder {
+ 		self
+ 	}
+ 
++	/// Derives the on-chain (BDK) wallet from `entropy` instead of from the node entropy
++	/// passed to `build`. The Lightning keys (node identity, channel keys) keep using the
++	/// node entropy, so a compromise of one seed does not expose the other.
++	///
++	/// Only enable this on a fresh node: an existing on-chain wallet derived from the node
++	/// entropy will no longer be visible.
++	pub fn set_onchain_wallet_entropy(&mut self, entropy: NodeEntropy) -> &mut Self {
++		self.onchain_wallet_seed_bytes = Some(entropy.to_seed_bytes());
++		self
++	}
++
+ 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
+ 	/// previously configured.
+ 	#[cfg(feature = "storage-sqlite")]
+@@ -980,6 +993,7 @@ impl NodeBuilder {
+ 			self.probing_config.as_ref(),
+ 			self.async_payments_role,
+ 			self.external_funding_signer.clone().map(|h| h.0),
++			self.onchain_wallet_seed_bytes,
+ 			seed_bytes,
+ 			runtime,
+ 			logger,
+@@ -1323,6 +1337,12 @@ impl Builder {
+ 	pub fn set_external_funding_signer(&self, signer: Arc<dyn ExternalFundingSigner>) {
+ 		self.inner.write().expect("lock").set_external_funding_signer(signer);
+ 	}
++
++	/// Derives the on-chain wallet from separate entropy. See
++	/// [`NodeBuilder::set_onchain_wallet_entropy`].
++	pub fn set_onchain_wallet_entropy(&self, entropy: Arc<NodeEntropy>) {
++		self.inner.write().expect("lock").onchain_wallet_seed_bytes = Some(entropy.to_seed_bytes());
++	}
+ }
+ 
+ #[cfg(all(feature = "uniffi", feature = "storage-sqlite"))]
+@@ -1534,8 +1554,9 @@ fn build_with_store_internal(
+ 	liquidity_source_config: Option<&LiquiditySourceConfig>,
+ 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
+ 	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
+-	external_funding_signer: Option<Arc<dyn ExternalFundingSigner>>, seed_bytes: [u8; 64],
+-	runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
++	external_funding_signer: Option<Arc<dyn ExternalFundingSigner>>,
++	onchain_wallet_seed_bytes: Option<[u8; 64]>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
++	logger: Arc<Logger>, kv_store: Arc<DynStore>,
+ ) -> Result<Node, BuildError> {
+ 	optionally_install_rustls_cryptoprovider();
+ 
+@@ -1758,8 +1779,20 @@ fn build_with_store_internal(
+ 		BuildError::WalletSetupFailed
+ 	})?;
+ 
+-	let descriptor = Bip84(xprv, KeychainKind::External);
+-	let change_descriptor = Bip84(xprv, KeychainKind::Internal);
++	// The on-chain wallet may use its own entropy so that it is not derivable from the
++	// Lightning node seed (and vice versa).
++	let wallet_xprv = match onchain_wallet_seed_bytes {
++		Some(wallet_seed_bytes) => {
++			log_debug!(logger, "On-chain wallet uses separate entropy from the node seed");
++			bitcoin::bip32::Xpriv::new_master(config.network, &wallet_seed_bytes).map_err(|e| {
++				log_error!(logger, "Failed to derive on-chain wallet master secret: {}", e);
++				BuildError::WalletSetupFailed
++			})?
++		},
++		None => xprv,
++	};
++	let descriptor = Bip84(wallet_xprv, KeychainKind::External);
++	let change_descriptor = Bip84(wallet_xprv, KeychainKind::Internal);
+ 	let mut wallet_persister =
+ 		KVStoreWalletPersister::new(Arc::clone(&kv_store), Arc::clone(&logger));
+ 	let wallet_opt = runtime
 -- 
 2.50.1 (Apple Git-155)
 

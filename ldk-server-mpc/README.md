@@ -184,6 +184,12 @@ the parties) plus a state-tracking policy on Party B.
   signatures, caching public keys in memory.
 - Config: `[mpc] party_address = "127.0.0.1:7701"` (or `--mpc-party-address` /
   `LDK_SERVER_MPC_PARTY_ADDRESS`), optional `request_timeout_secs`, `dkg_timeout_secs`.
+- **Separate on-chain wallet seed**: `[node] onchain_wallet_mnemonic_path = "<file>"` (or
+  `--node-onchain-wallet-mnemonic-path` / `LDK_SERVER_NODE_ONCHAIN_WALLET_MNEMONIC_PATH`).
+  The ldk-node patch adds `Builder::set_onchain_wallet_entropy`, which derives the BDK
+  wallet descriptors from that mnemonic while node identity, channel keys and LSPS/LNURL
+  keys keep using the node mnemonic. Without it, LDK Node derives both from one seed, so a
+  stolen node seed also controls every sweep destination. Fresh nodes only.
 
 cb-mpc does not expose additive tweaks for ECDSA-2P keys, so spliced channels do not tweak
 the base key (as `InMemorySigner` does); instead `new_funding_pubkey` triggers a fresh
@@ -265,6 +271,9 @@ cd e2e-tests && cargo test --test mpc -- --test-threads=1   # regtest, downloads
 - Only the funding key is MPC-backed (see table above). Full coverage would need
   per-commitment key derivation (`derive_private_key` tweaks) on MPC shares, which the
   cb-mpc public ECDSA-2P API does not expose.
+- The separate on-chain wallet seed still lives on the LDK Server host. The next step is to
+  keep it off-host (hardware signer / separate PSBT signing service) and have Party B only
+  sign sweeps to pre-approved destinations.
 - Key refresh (`cbmpc_ecdsa_2p_refresh`) is wrapped but not exposed through the service.
 - Signing is synchronous with timeouts. On a timeout the signer returns `Err`, which LDK
   treats as "signer unavailable"; LDK Node does not currently call `signer_unblocked`, so

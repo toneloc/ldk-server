@@ -22,7 +22,18 @@ const MNEMONIC_FILE_SIZE_LIMIT: usize = 1024;
 
 pub(crate) fn load_or_generate_node_entropy(storage_dir: &Path) -> io::Result<NodeEntropy> {
 	let mnemonic_path = storage_dir.join(DEFAULT_MNEMONIC_FILE);
+	load_or_generate_entropy_at(&mnemonic_path, "on-chain funds and Lightning channels")
+}
 
+/// Loads or generates the BIP39 mnemonic backing the on-chain wallet when it is configured
+/// to use entropy separate from the node seed (`node.onchain_wallet_mnemonic_path`).
+pub(crate) fn load_or_generate_onchain_wallet_entropy(
+	mnemonic_path: &Path,
+) -> io::Result<NodeEntropy> {
+	load_or_generate_entropy_at(mnemonic_path, "on-chain funds")
+}
+
+fn load_or_generate_entropy_at(mnemonic_path: &Path, protects: &str) -> io::Result<NodeEntropy> {
 	let mnemonic = match read_to_string_with_limit(&mnemonic_path, MNEMONIC_FILE_SIZE_LIMIT) {
 		Ok(raw) => Mnemonic::from_str(raw.trim()).map_err(|e| {
 			io::Error::new(
@@ -37,8 +48,9 @@ pub(crate) fn load_or_generate_node_entropy(storage_dir: &Path) -> io::Result<No
 			let mnemonic = Mnemonic::generate(24).map_err(io::Error::other)?;
 			write_new(&mnemonic_path, format!("{}\n", mnemonic).as_bytes(), 0o600)?;
 			info!(
-				"Generated new BIP39 mnemonic at {}. Back up this file securely — it is required to recover on-chain funds.",
-				mnemonic_path.display()
+				"Generated new BIP39 mnemonic at {}. Back up this file securely — it is required to recover {}.",
+				mnemonic_path.display(),
+				protects
 			);
 			mnemonic
 		},
@@ -68,6 +80,26 @@ mod tests {
 		let _ = fs::remove_dir_all(&dir);
 		fs::create_dir_all(&dir).unwrap();
 		dir
+	}
+
+	#[test]
+	fn onchain_wallet_entropy_is_independent_of_node_entropy() {
+		let dir = tempdir("wallet");
+		load_or_generate_node_entropy(&dir).unwrap();
+		let wallet_path = dir.join("onchain_wallet_mnemonic");
+		load_or_generate_onchain_wallet_entropy(&wallet_path).unwrap();
+		assert!(wallet_path.exists(), "wallet mnemonic was not created");
+		let perms = fs::metadata(&wallet_path).unwrap().permissions();
+		assert_eq!(perms.mode() & 0o777, 0o600, "expected 0600 permissions");
+
+		let node_mnemonic = fs::read_to_string(dir.join(DEFAULT_MNEMONIC_FILE)).unwrap();
+		let wallet_mnemonic = fs::read_to_string(&wallet_path).unwrap();
+		assert_eq!(wallet_mnemonic.trim().split_whitespace().count(), 24);
+		assert_ne!(node_mnemonic, wallet_mnemonic, "wallet mnemonic must not equal node mnemonic");
+
+		// Reloading keeps the same wallet mnemonic.
+		load_or_generate_onchain_wallet_entropy(&wallet_path).unwrap();
+		assert_eq!(fs::read_to_string(&wallet_path).unwrap(), wallet_mnemonic);
 	}
 
 	#[test]

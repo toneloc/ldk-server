@@ -300,6 +300,19 @@ fn main() {
 		},
 	};
 
+	if let Some(path) = &config_file.onchain_wallet_mnemonic_path {
+		let wallet_entropy =
+			match crate::util::entropy::load_or_generate_onchain_wallet_entropy(Path::new(path)) {
+				Ok(entropy) => entropy,
+				Err(e) => {
+					error!("Failed to load or generate on-chain wallet mnemonic at {path}: {e}");
+					std::process::exit(-1);
+				},
+			};
+		info!("On-chain wallet is derived from a separate mnemonic at {path}");
+		builder.set_onchain_wallet_entropy(wallet_entropy);
+	}
+
 	let uses_postgres =
 		matches!(config_file.ldk_node_storage, LdkNodeStorageConfig::Postgres { .. });
 	let node = match build_node(builder, node_entropy, config_file.ldk_node_storage) {

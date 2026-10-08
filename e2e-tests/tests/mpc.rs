@@ -132,10 +132,26 @@ async fn start_mpc_server(bitcoind: &TestBitcoind, parties: &MpcParties) -> LdkS
 	let party_address = parties.p1_addr.clone();
 	LdkServerHandle::start_with_config(bitcoind, move |params| {
 		let mut config = TestConfigBuilder::new(params).alias(Some("mpc-node")).build();
+		// The on-chain wallet gets its own mnemonic so it is not derivable from the node seed.
+		let wallet_mnemonic = params.storage_dir.join("onchain_wallet_mnemonic");
+		config = config.replacen(
+			"[node]\n",
+			&format!("[node]\nonchain_wallet_mnemonic_path = \"{}\"\n", wallet_mnemonic.display()),
+			1,
+		);
 		config.push_str(&format!("\n[mpc]\nparty_address = \"{party_address}\"\n"));
 		config
 	})
 	.await
+}
+
+/// Asserts the MPC server's on-chain wallet mnemonic exists and differs from the node mnemonic.
+fn assert_separate_wallet_mnemonic(server: &LdkServerHandle) {
+	let node = std::fs::read_to_string(server.storage_dir.join("keys_mnemonic")).unwrap();
+	let wallet =
+		std::fs::read_to_string(server.storage_dir.join("onchain_wallet_mnemonic")).unwrap();
+	assert_eq!(wallet.trim().split_whitespace().count(), 24);
+	assert_ne!(node, wallet, "on-chain wallet mnemonic must differ from the node mnemonic");
 }
 
 /// Returns the 2-of-2 funding redeem script pubkeys of the first input spending a P2WSH
@@ -191,6 +207,7 @@ async fn test_mpc_channel_open_pay_and_coop_close() {
 	let server_a = start_mpc_server(&bitcoind, &parties).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
+	assert_separate_wallet_mnemonic(&server_a);
 	let user_channel_id = setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
 	// Exactly one distributed key was generated and each party holds one share.

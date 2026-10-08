@@ -186,6 +186,12 @@ the same seed), settle HTLCs, and Party B signs whatever
 it is asked (`AllowAllPolicy`, unverified context). Treat it as a custody split for the
 funding key, not a validating signer. See the crate README for details.
 
+Because of this, the on-chain wallet should not share a seed with the Lightning node. Set
+`onchain_wallet_mnemonic_path` in `[node]` (or `--node-onchain-wallet-mnemonic-path`) and
+LDK Server derives the BDK wallet from a separate BIP39 mnemonic at that path (generated on
+first start), so a compromise of the node mnemonic does not expose on-chain funds and vice
+versa. Enable it only on a fresh node.
+
 #### Measured performance (Apple M4, both parties on one machine, cb-mpc `0b71670`)
 
 | Operation                              | p50     | p95     | p99     | Throughput |

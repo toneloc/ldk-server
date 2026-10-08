@@ -86,6 +86,9 @@ pub struct Config {
 	pub tor_config: Option<TorConfig>,
 	pub hrn_config: HumanReadableNamesConfig,
 	pub mpc_config: Option<MpcConfig>,
+	/// If set, the on-chain wallet is derived from the BIP39 mnemonic at this path (generated
+	/// on first start) instead of from the node mnemonic.
+	pub onchain_wallet_mnemonic_path: Option<String>,
 }
 
 /// Configuration of the external 2-of-2 MPC funding-key signer (`[mpc]` section).
@@ -193,6 +196,7 @@ struct ConfigBuilder {
 	tor_proxy_address: Option<String>,
 	hrn: Option<HrnTomlConfig>,
 	mpc: Option<MpcTomlConfig>,
+	onchain_wallet_mnemonic_path: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -206,6 +210,8 @@ impl ConfigBuilder {
 			self.grpc_service_address =
 				node.grpc_service_address.or(self.grpc_service_address.clone());
 			self.alias = node.alias.or(self.alias.clone());
+			self.onchain_wallet_mnemonic_path =
+				node.onchain_wallet_mnemonic_path.or(self.onchain_wallet_mnemonic_path.clone());
 			self.pathfinding_scores_source_url =
 				node.pathfinding_scores_source_url.or(self.pathfinding_scores_source_url.clone());
 			self.async_payments_role =
@@ -424,6 +430,10 @@ impl ConfigBuilder {
 
 		if let Some(tor_proxy_address) = &args.tor_proxy_address {
 			self.tor_proxy_address = Some(tor_proxy_address.clone());
+		}
+
+		if let Some(path) = &args.node_onchain_wallet_mnemonic_path {
+			self.onchain_wallet_mnemonic_path = Some(path.clone());
 		}
 
 		if let Some(mpc_party_address) = &args.mpc_party_address {
@@ -789,6 +799,7 @@ impl ConfigBuilder {
 			tor_config: tor_proxy_address.map(|proxy_address| TorConfig { proxy_address }),
 			hrn_config,
 			mpc_config,
+			onchain_wallet_mnemonic_path: self.onchain_wallet_mnemonic_path,
 		})
 	}
 }
@@ -825,6 +836,7 @@ struct NodeConfig {
 	enable_zero_fee_commitments: Option<bool>,
 	forwarded_payment_tracking_mode: Option<String>,
 	rgs_server_url: Option<String>,
+	onchain_wallet_mnemonic_path: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1471,6 +1483,13 @@ pub struct ArgsConfig {
 		help = "Address of MPC Party A (cb-mpc P1). When set, channel funding keys are generated and used via 2-of-2 MPC. Only enable on a fresh node."
 	)]
 	mpc_party_address: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_NODE_ONCHAIN_WALLET_MNEMONIC_PATH",
+		help = "Path of a BIP39 mnemonic file (created if missing) used to derive the on-chain wallet instead of the node mnemonic. Only enable on a fresh node."
+	)]
+	node_onchain_wallet_mnemonic_path: Option<String>,
 }
 
 impl ArgsConfig {
@@ -1648,6 +1667,7 @@ mod tests {
 			metrics_password: None,
 			tor_proxy_address: None,
 			mpc_party_address: None,
+			node_onchain_wallet_mnemonic_path: None,
 			log_to_file: Some(true),
 			log_max_size_mb: Some(50),
 			log_rotation_interval_hours: Some(24),
@@ -1691,6 +1711,7 @@ mod tests {
 			metrics_password: None,
 			tor_proxy_address: None,
 			mpc_party_address: None,
+			node_onchain_wallet_mnemonic_path: None,
 			log_to_file: Some(true),
 			log_max_size_mb: None,
 			log_rotation_interval_hours: None,
@@ -1808,6 +1829,7 @@ mod tests {
 			}),
 			hrn_config: HumanReadableNamesConfig::default(),
 			mpc_config: None,
+			onchain_wallet_mnemonic_path: None,
 		};
 
 		assert_eq!(config.listening_addrs, expected.listening_addrs);
@@ -2784,6 +2806,7 @@ mod tests {
 			tor_config: None,
 			hrn_config: HumanReadableNamesConfig::default(),
 			mpc_config: None,
+			onchain_wallet_mnemonic_path: None,
 			log_max_size_bytes: 50 * 1024 * 1024,
 			log_rotation_interval_secs: 24 * 60 * 60,
 			log_max_files: 5,
@@ -2919,6 +2942,7 @@ mod tests {
 			}),
 			hrn_config: HumanReadableNamesConfig::default(),
 			mpc_config: None,
+			onchain_wallet_mnemonic_path: None,
 			log_max_size_bytes: 50 * 1024 * 1024,
 			log_rotation_interval_secs: 24 * 60 * 60,
 			log_max_files: 5,
