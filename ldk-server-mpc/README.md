@@ -115,10 +115,22 @@ Legacy overview (same thing, flattened):
 | Node identity key, gossip, BOLT12, onion keys     | local (`KeysManager`)           |
 | On-chain wallet (BDK)                             | local, unchanged                |
 
-This is **funding-key protection only**. A compromised LDK Server host can still, for
-example, sign a revoked commitment's HTLC transactions or leak per-commitment secrets. It
-cannot, however, produce a funding-multisig signature (commitment, closing, splice, anchor)
-without MPC Party B's cooperation.
+This is **funding-key protection only**. Without Party B, a compromised LDK Server host
+cannot produce a funding-multisig signature (new commitment, cooperative close, splice,
+keyed anchor, announcement). It still holds every local key, so it can:
+
+- broadcast an already-signed old commitment (the signature exists; MPC cannot revoke it),
+- leak per-commitment secrets, enabling the counterparty to claim revoked states,
+- sweep confirmed `to_local` and HTLC outputs with the delayed-payment and HTLC keys,
+- claim or time out HTLCs,
+- and ask Party B for any funding-key signature, since the only policy is `AllowAllPolicy`
+  and the signing context is not verified.
+
+The result is a custody split for the funding key, not a validating signer. The local keys
+stayed local because the cb-mpc public ECDSA-2P API has no share-tweak/derivation
+operation, and the per-commitment keys are tweaked basepoints (revocation keys use a
+two-sided multiplicative tweak). Full coverage needs tweak support (or derivation inside
+the parties) plus a state-tracking policy on Party B.
 
 ## Components
 

@@ -177,7 +177,12 @@ flowchart TB
 | Per-commitment secrets, justice and HTLC claim txs     | local                      |
 | Node identity, gossip, BOLT12, on-chain wallet (BDK)   | local, unchanged           |
 
-This is funding-key protection only; see the crate README for the security notes.
+This is **funding-key protection only**. An attacker who controls the LDK Server host
+cannot produce new commitment, closing or splice signatures on their own, but still holds
+every local key: they can broadcast an already-signed old state, leak per-commitment
+secrets, sweep confirmed `to_local`/HTLC outputs and settle HTLCs, and Party B signs whatever
+it is asked (`AllowAllPolicy`, unverified context). Treat it as a custody split for the
+funding key, not a validating signer. See the crate README for details.
 
 #### Measured performance (Apple M4, both parties on one machine, cb-mpc `0b71670`)
 
