@@ -15,7 +15,7 @@ use crate::protocol::{
 	ChannelId, Derivation, ErrorCode, KeyId, KeyKind, Request, Response, SignItem, SigningContext,
 	SigningOp,
 };
-use crate::transport::{read_frame, write_frame};
+use crate::secure::Conn;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -64,6 +64,8 @@ pub struct MpcClient {
 	request_timeout: Duration,
 	/// Read timeout for `EnsureKey`, which may run a DKG.
 	dkg_timeout: Duration,
+	/// Pre-shared key for the authenticated, encrypted link to Party A.
+	psk: Option<[u8; 32]>,
 }
 
 impl MpcClient {
@@ -73,7 +75,14 @@ impl MpcClient {
 			connect_timeout: Duration::from_secs(5),
 			request_timeout: Duration::from_secs(30),
 			dkg_timeout: Duration::from_secs(120),
+			psk: None,
 		}
+	}
+
+	/// Authenticates and encrypts the link with a 32-byte pre-shared key (see `secure`).
+	pub fn with_psk(mut self, psk: [u8; 32]) -> Self {
+		self.psk = Some(psk);
+		self
 	}
 
 	pub fn with_timeouts(mut self, connect: Duration, request: Duration, dkg: Duration) -> Self {
@@ -88,12 +97,13 @@ impl MpcClient {
 	}
 
 	fn call(&self, req: &Request, read_timeout: Duration) -> Result<Response, ClientError> {
-		let mut stream = TcpStream::connect_timeout(&self.addr, self.connect_timeout)?;
+		let stream = TcpStream::connect_timeout(&self.addr, self.connect_timeout)?;
 		stream.set_nodelay(true)?;
 		stream.set_write_timeout(Some(self.request_timeout))?;
 		stream.set_read_timeout(Some(read_timeout))?;
-		write_frame(&mut stream, &req.encode())?;
-		let frame = read_frame(&mut stream)?;
+		let mut conn = Conn::new(stream, self.psk.as_ref(), true)?;
+		conn.write_frame(&req.encode())?;
+		let frame = conn.read_frame()?;
 		let resp = Response::decode(&frame).map_err(|e| ClientError::Protocol(e.to_string()))?;
 		if let Response::Error { code, message } = resp {
 			return Err(ClientError::Remote { code, message });

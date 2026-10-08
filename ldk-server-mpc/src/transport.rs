@@ -1,7 +1,6 @@
 //! Transports for the cb-mpc protocol messages between the two parties.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -34,36 +33,35 @@ pub fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
 	Ok(buf)
 }
 
-/// A framed transport over an established TCP connection to the other party.
+/// A framed transport over an established (optionally PSK-secured) connection to the other
+/// party.
 ///
-/// The protocol library drives the socket strictly in lock-step (send/recv alternate), so a
-/// single mutex-protected stream is sufficient.
+/// The protocol library drives the connection strictly in lock-step (send/recv alternate), so a
+/// single mutex-protected connection is sufficient.
 pub struct TcpTransport {
-	stream: Mutex<TcpStream>,
+	conn: Mutex<crate::secure::Conn>,
 }
 
 impl TcpTransport {
-	pub fn new(stream: TcpStream, timeout: Duration) -> std::io::Result<Self> {
-		stream.set_nodelay(true)?;
-		stream.set_read_timeout(Some(timeout))?;
-		stream.set_write_timeout(Some(timeout))?;
-		Ok(TcpTransport { stream: Mutex::new(stream) })
+	pub fn new(conn: crate::secure::Conn, timeout: Duration) -> std::io::Result<Self> {
+		conn.set_timeouts(timeout)?;
+		Ok(TcpTransport { conn: Mutex::new(conn) })
 	}
 
-	pub fn into_inner(self) -> TcpStream {
-		self.stream.into_inner().unwrap_or_else(|e| e.into_inner())
+	pub fn into_inner(self) -> crate::secure::Conn {
+		self.conn.into_inner().unwrap_or_else(|e| e.into_inner())
 	}
 }
 
 impl Transport for TcpTransport {
 	fn send(&self, msg: &[u8]) -> Result<(), TransportError> {
-		let mut s = self.stream.lock().map_err(|_| TransportError("poisoned".into()))?;
-		write_frame(&mut *s, msg).map_err(Into::into)
+		let mut c = self.conn.lock().map_err(|_| TransportError("poisoned".into()))?;
+		c.write_frame(msg).map_err(Into::into)
 	}
 
 	fn recv(&self) -> Result<Vec<u8>, TransportError> {
-		let mut s = self.stream.lock().map_err(|_| TransportError("poisoned".into()))?;
-		read_frame(&mut *s).map_err(Into::into)
+		let mut c = self.conn.lock().map_err(|_| TransportError("poisoned".into()))?;
+		c.read_frame().map_err(Into::into)
 	}
 }
 

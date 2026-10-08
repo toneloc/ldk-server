@@ -102,6 +102,9 @@ pub struct MpcConfig {
 	pub dkg_timeout_secs: u64,
 	/// Which channel keys are MPC-backed.
 	pub coverage: MpcCoverage,
+	/// Path of the 32-byte pre-shared key file authenticating and encrypting the link to
+	/// Party A (the same file Party A was started with as `--auth-key-file`).
+	pub auth_key_path: Option<String>,
 }
 
 /// Which channel keys the MPC parties hold.
@@ -453,6 +456,7 @@ impl ConfigBuilder {
 				request_timeout_secs: None,
 				dkg_timeout_secs: None,
 				coverage: None,
+				auth_key_path: None,
 			});
 			mpc.party_address = mpc_party_address.clone();
 		}
@@ -771,23 +775,25 @@ impl ConfigBuilder {
 						format!("Invalid mpc.party_address configured: {}", e),
 					)
 				})?;
-				let coverage =
-					match mpc.coverage.as_deref().map(|c| c.to_ascii_lowercase()) {
-						None => MpcCoverage::All,
-						Some(c) if c == "all" => MpcCoverage::All,
-						Some(c) if c == "funding" => MpcCoverage::Funding,
-						Some(other) => return Err(io::Error::new(
+				let coverage = match mpc.coverage.as_deref().map(|c| c.to_ascii_lowercase()) {
+					None => MpcCoverage::All,
+					Some(c) if c == "all" => MpcCoverage::All,
+					Some(c) if c == "funding" => MpcCoverage::Funding,
+					Some(other) => {
+						return Err(io::Error::new(
 							io::ErrorKind::InvalidInput,
 							format!(
 								"Invalid mpc.coverage `{other}`: expected \"all\" or \"funding\""
 							),
-						)),
-					};
+						))
+					},
+				};
 				Some(MpcConfig {
 					party_address,
 					request_timeout_secs: mpc.request_timeout_secs.unwrap_or(30),
 					dkg_timeout_secs: mpc.dkg_timeout_secs.unwrap_or(120),
 					coverage,
+					auth_key_path: mpc.auth_key_path,
 				})
 			},
 			None => None,
@@ -963,6 +969,7 @@ struct MpcTomlConfig {
 	request_timeout_secs: Option<u64>,
 	dkg_timeout_secs: Option<u64>,
 	coverage: Option<String>,
+	auth_key_path: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]

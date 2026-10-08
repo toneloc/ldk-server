@@ -66,6 +66,18 @@ struct Args {
 	/// Maximum a cooperative close may pay us below our last tracked balance, in sats.
 	#[arg(long, default_value_t = 10_000)]
 	max_closing_fee_sat: u64,
+	/// 32-byte pre-shared key file authenticating/encrypting the LDK Server link (Party A).
+	/// Created if missing; copy it to LDK Server (`[mpc] auth_key_path`).
+	#[arg(long, env = "LDK_MPC_AUTH_KEY_FILE")]
+	auth_key_file: Option<PathBuf>,
+	/// 32-byte pre-shared key file authenticating/encrypting the Party A ⇄ Party B link.
+	/// Created if missing; must have the same content on both parties.
+	#[arg(long, env = "LDK_MPC_PEER_AUTH_KEY_FILE")]
+	peer_auth_key_file: Option<PathBuf>,
+	/// 32-byte key file encrypting key shares and the master secret at rest. Created if
+	/// missing. Keep it separate from the keystore.
+	#[arg(long, env = "LDK_MPC_SHARE_KEY_FILE")]
+	share_key_file: Option<PathBuf>,
 }
 
 struct StderrLogger;
@@ -117,6 +129,19 @@ fn main() {
 		max_closing_fee_sat: args.max_closing_fee_sat,
 	};
 
+	let load_key = |path: &Option<PathBuf>, what: &str| -> Option<[u8; 32]> {
+		path.as_ref().map(|p| match ldk_server_mpc::secure::load_or_create_key_file(p) {
+			Ok(k) => k,
+			Err(e) => {
+				eprintln!("failed to load {what} key file {}: {e}", p.display());
+				std::process::exit(2);
+			},
+		})
+	};
+	let client_psk = load_key(&args.auth_key_file, "auth");
+	let peer_psk = load_key(&args.peer_auth_key_file, "peer auth");
+	let share_key = load_key(&args.share_key_file, "share");
+
 	let cfg = PartyConfig {
 		party: args.role,
 		listen_addr: args.listen,
@@ -127,6 +152,9 @@ fn main() {
 		protocol_timeout: Duration::from_secs(args.protocol_timeout_secs),
 		client_timeout: Duration::from_secs(args.client_timeout_secs),
 		policy,
+		client_psk,
+		peer_psk,
+		share_key,
 	};
 	let service = match PartyService::new(cfg) {
 		Ok(s) => s,

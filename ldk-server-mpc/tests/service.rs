@@ -41,6 +41,9 @@ fn start_party(
 		protocol_timeout: Duration::from_secs(30),
 		client_timeout: Duration::from_secs(60),
 		policy: Default::default(),
+		client_psk: None,
+		peer_psk: None,
+		share_key: None,
 	};
 	let svc = PartyService::new(cfg).unwrap();
 	let s = Arc::clone(&svc);
@@ -222,4 +225,82 @@ fn p2_refuses_dkg_for_existing_key_id() {
 	let err = client.ensure_key(&key_id).unwrap_err();
 	assert!(matches!(err, ClientError::Remote { code: ErrorCode::KeyMismatch, .. }), "{err}");
 	assert_eq!(p2.store().count().unwrap(), 1);
+}
+
+#[test]
+fn psk_secured_links_and_encrypted_shares() {
+	use ldk_server_mpc::secure::AtRestKey;
+	let client_psk = [0xa1u8; 32];
+	let peer_psk = [0xb2u8; 32];
+	let share_key = [0xc3u8; 32];
+	let ks_a = tmp_dir("sa");
+	let ks_b = tmp_dir("sb");
+	let start = |party: Party, peer: Option<SocketAddr>, keystore: PathBuf| {
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		let cfg = PartyConfig {
+			party,
+			listen_addr: addr,
+			peer_addr: peer,
+			keystore_dir: keystore,
+			p1_name: "test-party-a".into(),
+			p2_name: "test-party-b".into(),
+			protocol_timeout: Duration::from_secs(30),
+			client_timeout: Duration::from_secs(60),
+			policy: Default::default(),
+			client_psk: Some(client_psk),
+			peer_psk: Some(peer_psk),
+			share_key: Some(share_key),
+		};
+		let svc = PartyService::new(cfg).unwrap();
+		let s = Arc::clone(&svc);
+		thread::spawn(move || s.serve_on(listener).unwrap());
+		(svc, addr)
+	};
+	let (_p2, p2_addr) = start(Party::P2, None, ks_b.clone());
+	let (_p1, p1_addr) = start(Party::P1, Some(p2_addr), ks_a.clone());
+	let secp = Secp256k1::new();
+
+	// Correct PSK: works end to end.
+	let client = MpcClient::new(p1_addr).with_psk(client_psk);
+	let key_id = [0x61u8; 32];
+	let pk = client.ensure_key(&key_id).unwrap();
+	let sig = client.sign(&secp, &key_id, &[0x62u8; 32], None, Some(&pk)).unwrap();
+	secp.verify_ecdsa(&Message::from_digest([0x62u8; 32]), &sig, &pk).unwrap();
+
+	// Shares and the master secret are encrypted on disk.
+	for dir in [&ks_a, &ks_b] {
+		for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+			let name = entry.file_name().to_string_lossy().to_string();
+			if name.ends_with(".share") || name == "master.secret" {
+				let bytes = std::fs::read(entry.path()).unwrap();
+				assert!(AtRestKey::is_encrypted(&bytes), "{name} not encrypted");
+				assert!(AtRestKey::new(&share_key).open(&bytes).is_ok());
+			}
+		}
+	}
+
+	// Wrong / missing PSK: rejected before any request is served.
+	let bad = MpcClient::new(p1_addr).with_psk([0xffu8; 32]);
+	assert!(matches!(bad.ping().unwrap_err(), ClientError::Io(_)));
+	let plain = MpcClient::new(p1_addr);
+	assert!(plain.ping().is_err());
+
+	// Restart with the wrong share key: shares cannot be read.
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	let cfg = PartyConfig {
+		party: Party::P2,
+		listen_addr: listener.local_addr().unwrap(),
+		peer_addr: None,
+		keystore_dir: ks_b.clone(),
+		p1_name: "test-party-a".into(),
+		p2_name: "test-party-b".into(),
+		protocol_timeout: Duration::from_secs(30),
+		client_timeout: Duration::from_secs(60),
+		policy: Default::default(),
+		client_psk: None,
+		peer_psk: Some(peer_psk),
+		share_key: Some([0x00u8; 32]),
+	};
+	assert!(PartyService::new(cfg).is_err(), "wrong share key must fail to open the master secret");
 }

@@ -35,7 +35,8 @@ use crate::protocol::{
 	frame_kind, ChannelId, Derivation, ErrorCode, FrameKind, KeyId, KeyKind, Reader, Request,
 	Response, SessionAck, SessionDone, SessionOp, SessionStart, SignItem, Writer,
 };
-use crate::transport::{read_frame, write_frame, TcpTransport};
+use crate::secure::{AtRestKey, Conn};
+use crate::transport::TcpTransport;
 
 #[derive(Clone, Debug)]
 pub struct PartyConfig {
@@ -52,6 +53,12 @@ pub struct PartyConfig {
 	/// I/O timeout for client connections.
 	pub client_timeout: Duration,
 	pub policy: PolicyConfig,
+	/// Pre-shared key authenticating and encrypting the LDK Server ⇄ Party A link.
+	pub client_psk: Option<[u8; 32]>,
+	/// Pre-shared key authenticating and encrypting the Party A ⇄ Party B link.
+	pub peer_psk: Option<[u8; 32]>,
+	/// Key encrypting share blobs and the master secret at rest.
+	pub share_key: Option<[u8; 32]>,
 }
 
 /// On-disk key-share store: one file per key, `<hex key_id>.share`.
@@ -61,12 +68,45 @@ pub struct PartyConfig {
 pub struct KeyStore {
 	dir: PathBuf,
 	cache: Mutex<HashMap<KeyId, Arc<KeyBlob>>>,
+	at_rest: Option<AtRestKey>,
 }
 
 impl KeyStore {
 	pub fn open(dir: &Path) -> io::Result<Self> {
+		Self::open_with_key(dir, None)
+	}
+
+	/// With a share key, blobs and the master secret are AES-256-GCM encrypted at rest; the
+	/// share key itself should live on a different medium (or a KMS/HSM) than the shares.
+	pub fn open_with_key(dir: &Path, share_key: Option<[u8; 32]>) -> io::Result<Self> {
 		fs::create_dir_all(dir)?;
-		Ok(KeyStore { dir: dir.to_path_buf(), cache: Mutex::new(HashMap::new()) })
+		Ok(KeyStore {
+			dir: dir.to_path_buf(),
+			cache: Mutex::new(HashMap::new()),
+			at_rest: share_key.map(|k| AtRestKey::new(&k)),
+		})
+	}
+
+	fn unseal(&self, bytes: Vec<u8>, what: &str) -> io::Result<Vec<u8>> {
+		match (&self.at_rest, AtRestKey::is_encrypted(&bytes)) {
+			(Some(k), true) => k.open(&bytes),
+			(Some(_), false) => {
+				log::warn!("{what} is stored unencrypted although a share key is configured");
+				Ok(bytes)
+			},
+			(None, true) => Err(io::Error::new(
+				io::ErrorKind::PermissionDenied,
+				format!("{what} is encrypted but no share key is configured"),
+			)),
+			(None, false) => Ok(bytes),
+		}
+	}
+
+	fn seal(&self, bytes: &[u8]) -> io::Result<Vec<u8>> {
+		match &self.at_rest {
+			Some(k) => k.seal(bytes),
+			None => Ok(bytes.to_vec()),
+		}
 	}
 
 	fn path(&self, key_id: &KeyId) -> PathBuf {
@@ -79,7 +119,7 @@ impl KeyStore {
 		}
 		match fs::read(self.path(key_id)) {
 			Ok(bytes) => {
-				let blob = Arc::new(KeyBlob(bytes));
+				let blob = Arc::new(KeyBlob(self.unseal(bytes, "key share")?));
 				self.cache.lock().unwrap().insert(*key_id, Arc::clone(&blob));
 				Ok(Some(blob))
 			},
@@ -98,7 +138,7 @@ impl KeyStore {
 		{
 			let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
 			use std::io::Write;
-			f.write_all(&blob.0)?;
+			f.write_all(&self.seal(&blob.0)?)?;
 			f.sync_all()?;
 		}
 		fs::rename(&tmp, &path)?;
@@ -118,9 +158,15 @@ impl KeyStore {
 	pub fn load_or_create_master_secret(&self) -> io::Result<[u8; 32]> {
 		let path = self.dir.join("master.secret");
 		match fs::read(&path) {
-			Ok(bytes) if bytes.len() == 32 => Ok(bytes.try_into().unwrap()),
-			Ok(_) => {
-				Err(io::Error::new(io::ErrorKind::InvalidData, "master.secret must be 32 bytes"))
+			Ok(bytes) => {
+				let bytes = self.unseal(bytes, "master secret")?;
+				if bytes.len() != 32 {
+					return Err(io::Error::new(
+						io::ErrorKind::InvalidData,
+						"master.secret must be 32 bytes",
+					));
+				}
+				Ok(bytes.try_into().unwrap())
 			},
 			Err(e) if e.kind() == io::ErrorKind::NotFound => {
 				use bitcoin::secp256k1::rand::RngCore;
@@ -135,7 +181,7 @@ impl KeyStore {
 						use std::os::unix::fs::PermissionsExt;
 						f.set_permissions(fs::Permissions::from_mode(0o600))?;
 					}
-					f.write_all(&secret)?;
+					f.write_all(&self.seal(&secret)?)?;
 					f.sync_all()?;
 				}
 				fs::rename(&tmp, &path)?;
@@ -208,7 +254,13 @@ impl PartyService {
 		if cfg.party == Party::P1 && cfg.peer_addr.is_none() {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "P1 requires a peer address"));
 		}
-		let store = KeyStore::open(&cfg.keystore_dir)?;
+		let store = KeyStore::open_with_key(&cfg.keystore_dir, cfg.share_key)?;
+		if cfg.share_key.is_none() {
+			log::warn!("no share key configured: key shares are stored unencrypted");
+		}
+		if cfg.peer_psk.is_none() {
+			log::warn!("no peer pre-shared key configured: the party link is plain TCP");
+		}
 		// Only Party B holds the commitment-seed master secret.
 		let master =
 			if cfg.party == Party::P2 { Some(store.load_or_create_master_secret()?) } else { None };
@@ -282,11 +334,17 @@ impl PartyService {
 		Ok(())
 	}
 
-	fn handle_connection(self: &Arc<Self>, mut stream: TcpStream) -> io::Result<()> {
+	fn handle_connection(self: &Arc<Self>, stream: TcpStream) -> io::Result<()> {
 		stream.set_nodelay(true)?;
 		stream.set_read_timeout(Some(self.cfg.client_timeout))?;
 		stream.set_write_timeout(Some(self.cfg.client_timeout))?;
-		let first = read_frame(&mut stream)?;
+		// Party A serves clients (client PSK); Party B serves Party A (peer PSK).
+		let psk = match self.cfg.party {
+			Party::P1 => self.cfg.client_psk,
+			Party::P2 => self.cfg.peer_psk,
+		};
+		let mut conn = Conn::new(stream, psk.as_ref(), false)?;
+		let first = conn.read_frame()?;
 		match frame_kind(&first) {
 			FrameKind::Request => {
 				let resp = match Request::decode(&first) {
@@ -295,14 +353,14 @@ impl PartyService {
 						Response::Error { code: ErrorCode::BadRequest, message: e.to_string() }
 					},
 				};
-				write_frame(&mut stream, &resp.encode())
+				conn.write_frame(&resp.encode())
 			},
 			FrameKind::SessionStart => match SessionStart::decode(&first) {
-				Ok(start) => self.handle_session(stream, start),
+				Ok(start) => self.handle_session(conn, start),
 				Err(e) => {
 					let ack =
 						SessionAck::Error { code: ErrorCode::BadRequest, message: e.to_string() };
-					write_frame(&mut stream, &ack.encode())
+					conn.write_frame(&ack.encode())
 				},
 			},
 			FrameKind::Other => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown frame")),
@@ -394,28 +452,32 @@ impl PartyService {
 		}
 	}
 
-	fn connect_peer(&self) -> Result<TcpStream, ServiceError> {
+	fn connect_peer(&self) -> Result<Conn, ServiceError> {
 		let addr = self
 			.cfg
 			.peer_addr
 			.ok_or_else(|| ServiceError::new(ErrorCode::Internal, "no peer configured"))?;
-		TcpStream::connect_timeout(&addr, self.cfg.protocol_timeout).map_err(|e| {
+		let stream = TcpStream::connect_timeout(&addr, self.cfg.protocol_timeout).map_err(|e| {
 			ServiceError::new(ErrorCode::PeerUnavailable, format!("connect to {addr}: {e}"))
+		})?;
+		stream.set_nodelay(true)?;
+		stream.set_read_timeout(Some(self.cfg.protocol_timeout))?;
+		stream.set_write_timeout(Some(self.cfg.protocol_timeout))?;
+		Conn::new(stream, self.cfg.peer_psk.as_ref(), true).map_err(|e| {
+			ServiceError::new(ErrorCode::Unauthorized, format!("peer handshake with {addr}: {e}"))
 		})
 	}
 
 	/// Opens a session with P2: sends the start header and returns the stream plus ack payload.
-	fn open_session(&self, start: &SessionStart) -> Result<(TcpStream, Vec<u8>), ServiceError> {
-		let mut stream = self.connect_peer()?;
-		stream
-			.set_read_timeout(Some(self.cfg.protocol_timeout))
-			.and_then(|_| stream.set_write_timeout(Some(self.cfg.protocol_timeout)))?;
-		write_frame(&mut stream, &start.encode())
+	fn open_session(&self, start: &SessionStart) -> Result<(Conn, Vec<u8>), ServiceError> {
+		let mut conn = self.connect_peer()?;
+		conn.write_frame(&start.encode())
 			.map_err(|e| ServiceError::new(ErrorCode::PeerUnavailable, e.to_string()))?;
-		let ack = read_frame(&mut stream)
+		let ack = conn
+			.read_frame()
 			.map_err(|e| ServiceError::new(ErrorCode::PeerUnavailable, e.to_string()))?;
 		match SessionAck::decode(&ack) {
-			Ok(SessionAck::Ok { payload }) => Ok((stream, payload)),
+			Ok(SessionAck::Ok { payload }) => Ok((conn, payload)),
 			Ok(SessionAck::Error { code, message }) => {
 				Err(ServiceError::new(code, format!("peer refused session: {message}")))
 			},
@@ -430,8 +492,9 @@ impl PartyService {
 	}
 
 	fn read_done(&self, transport: TcpTransport) -> Result<PublicKey, ServiceError> {
-		let mut stream = transport.into_inner();
-		let frame = read_frame(&mut stream)
+		let mut conn = transport.into_inner();
+		let frame = conn
+			.read_frame()
 			.map_err(|e| ServiceError::new(ErrorCode::PeerUnavailable, e.to_string()))?;
 		let done = SessionDone::decode(&frame)
 			.map_err(|e| ServiceError::new(ErrorCode::ProtocolFailed, e.to_string()))?;
@@ -453,8 +516,8 @@ impl PartyService {
 		}
 		log::info!("running DKG for key {} ({:?})", key_id.as_hex(), channel.map(|c| c.1));
 		let start = SessionStart { op: SessionOp::Dkg { key_id: *key_id, channel } };
-		let (stream, _) = self.open_session(&start)?;
-		let transport = TcpTransport::new(stream, self.cfg.protocol_timeout)?;
+		let (conn, _) = self.open_session(&start)?;
+		let transport = TcpTransport::new(conn, self.cfg.protocol_timeout)?;
 		let blob = self.job(&transport).dkg()?;
 		let peer_pk = self.read_done(transport)?;
 		let pk = self.pubkey_of(&blob)?;
@@ -548,8 +611,8 @@ impl PartyService {
 		let lock = self.key_lock(&item.key_id);
 		let _guard = lock.lock().unwrap();
 		let start = SessionStart { op: SessionOp::Sign { channel, item } };
-		let (stream, _) = self.open_session(&start)?;
-		let transport = TcpTransport::new(stream, self.cfg.protocol_timeout)?;
+		let (conn, _) = self.open_session(&start)?;
+		let transport = TcpTransport::new(conn, self.cfg.protocol_timeout)?;
 		let der = self.job(&transport).sign(&share, &digest)?.ok_or_else(|| {
 			ServiceError::new(ErrorCode::ProtocolFailed, "P1 did not receive a signature")
 		})?;
@@ -573,49 +636,48 @@ impl PartyService {
 	// Peer sessions (Party B)
 	// -----------------------------------------------------------------------
 
-	fn handle_session(&self, mut stream: TcpStream, start: SessionStart) -> io::Result<()> {
+	fn handle_session(&self, mut conn: Conn, start: SessionStart) -> io::Result<()> {
 		if self.cfg.party != Party::P2 {
 			let ack = SessionAck::Error {
 				code: ErrorCode::BadRequest,
 				message: "only P2 accepts sessions".into(),
 			};
-			return write_frame(&mut stream, &ack.encode());
+			return conn.write_frame(&ack.encode());
 		}
-		stream.set_read_timeout(Some(self.cfg.protocol_timeout))?;
-		stream.set_write_timeout(Some(self.cfg.protocol_timeout))?;
+		conn.set_timeouts(self.cfg.protocol_timeout)?;
 
 		match start.op {
-			SessionOp::Dkg { key_id, channel } => self.session_dkg(stream, key_id, channel),
-			SessionOp::Sign { channel, item } => self.session_sign(stream, channel, item),
+			SessionOp::Dkg { key_id, channel } => self.session_dkg(conn, key_id, channel),
+			SessionOp::Sign { channel, item } => self.session_sign(conn, channel, item),
 			SessionOp::PerCommitmentPoint { channel, idx } => {
 				let res = self
 					.policy
 					.per_commitment_point(&channel, idx)
 					.map(|pk| pk.serialize().to_vec());
-				Self::reply(stream, res)
+				Self::reply(conn, res)
 			},
 			SessionOp::ReleaseSecret { channel, idx } => {
 				let res = self.policy.release_commitment_secret(&channel, idx).map(|s| s.to_vec());
-				Self::reply(stream, res)
+				Self::reply(conn, res)
 			},
 			SessionOp::HolderCommitmentValidated { channel, commitment_number } => {
 				let res = self
 					.policy
 					.holder_commitment_validated(&channel, commitment_number)
 					.map(|_| Vec::new());
-				Self::reply(stream, res)
+				Self::reply(conn, res)
 			},
 			SessionOp::CounterpartyRevocationValidated { channel, idx, secret } => {
 				let res = self
 					.policy
 					.counterparty_revocation_validated(&channel, idx, &secret)
 					.map(|_| Vec::new());
-				Self::reply(stream, res)
+				Self::reply(conn, res)
 			},
 		}
 	}
 
-	fn reply(mut stream: TcpStream, res: Result<Vec<u8>, PolicyError>) -> io::Result<()> {
+	fn reply(mut conn: Conn, res: Result<Vec<u8>, PolicyError>) -> io::Result<()> {
 		let ack = match res {
 			Ok(payload) => SessionAck::Ok { payload },
 			Err(e) => {
@@ -623,11 +685,11 @@ impl PartyService {
 				SessionAck::Error { code: ErrorCode::PolicyDenied, message: e.to_string() }
 			},
 		};
-		write_frame(&mut stream, &ack.encode())
+		conn.write_frame(&ack.encode())
 	}
 
 	fn session_dkg(
-		&self, mut stream: TcpStream, key_id: KeyId, channel: Option<(ChannelId, KeyKind)>,
+		&self, mut conn: Conn, key_id: KeyId, channel: Option<(ChannelId, KeyKind)>,
 	) -> io::Result<()> {
 		if self.store.get(&key_id)?.is_some() {
 			// P1 lost its share but we still have ours: refuse rather than silently generating
@@ -636,12 +698,12 @@ impl PartyService {
 				code: ErrorCode::KeyMismatch,
 				message: "P2 already holds a share for this key id".into(),
 			};
-			return write_frame(&mut stream, &ack.encode());
+			return conn.write_frame(&ack.encode());
 		}
 		let lock = self.key_lock(&key_id);
 		let _guard = lock.lock().unwrap();
-		write_frame(&mut stream, &SessionAck::ok().encode())?;
-		let transport = TcpTransport::new(stream, self.cfg.protocol_timeout)?;
+		conn.write_frame(&SessionAck::ok().encode())?;
+		let transport = TcpTransport::new(conn, self.cfg.protocol_timeout)?;
 		log::info!("running DKG (P2) for key {} ({:?})", key_id.as_hex(), channel.map(|c| c.1));
 		let result: Result<PublicKey, ServiceError> =
 			self.job(&transport).dkg().map_err(ServiceError::from).and_then(|blob| {
@@ -657,7 +719,7 @@ impl PartyService {
 	}
 
 	fn session_sign(
-		&self, mut stream: TcpStream, channel: Option<ChannelId>, item: SignItem,
+		&self, mut conn: Conn, channel: Option<ChannelId>, item: SignItem,
 	) -> io::Result<()> {
 		let prepared: Result<(Arc<KeyBlob>, crate::policy::Authorized), ServiceError> = (|| {
 			let blob = self
@@ -672,13 +734,13 @@ impl PartyService {
 			Err(e) => {
 				log::warn!("refusing sign for key {}: {}", item.key_id.as_hex(), e.message);
 				let ack = SessionAck::Error { code: e.code, message: e.message };
-				return write_frame(&mut stream, &ack.encode());
+				return conn.write_frame(&ack.encode());
 			},
 		};
 		let lock = self.key_lock(&item.key_id);
 		let _guard = lock.lock().unwrap();
-		write_frame(&mut stream, &SessionAck::ok().encode())?;
-		let transport = TcpTransport::new(stream, self.cfg.protocol_timeout)?;
+		conn.write_frame(&SessionAck::ok().encode())?;
+		let transport = TcpTransport::new(conn, self.cfg.protocol_timeout)?;
 		let result: Result<PublicKey, ServiceError> = (|| {
 			let (share, expected_pk) = self.derive(&blob, &item.derivation)?;
 			self.job(&transport).sign(&share, &item.digest)?;
@@ -689,11 +751,9 @@ impl PartyService {
 	}
 
 	fn finish(transport: TcpTransport, result: Result<PublicKey, ServiceError>) -> io::Result<()> {
-		let mut stream = transport.into_inner();
+		let mut conn = transport.into_inner();
 		match result {
-			Ok(pk) => {
-				write_frame(&mut stream, &SessionDone { pubkey: pk.serialize().to_vec() }.encode())
-			},
+			Ok(pk) => conn.write_frame(&SessionDone { pubkey: pk.serialize().to_vec() }.encode()),
 			Err(e) => {
 				log::warn!("session failed: {}", e.message);
 				Err(io::Error::other(e.message))

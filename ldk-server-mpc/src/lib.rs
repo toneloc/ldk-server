@@ -19,6 +19,7 @@ pub mod ffi;
 pub mod party;
 pub mod policy;
 pub mod protocol;
+pub mod secure;
 pub mod transport;
 
 pub use bitcoin;
