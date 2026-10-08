@@ -27,7 +27,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpub};
 use bitcoin::consensus::encode::deserialize;
@@ -157,8 +158,9 @@ pub struct ChannelState {
 	pub last_counterparty_commitment: Option<u64>,
 	/// Lowest (newest) holder commitment number LDK reported as validated.
 	pub validated_holder_commitment: Option<u64>,
-	/// Our balance in the last commitment we signed, in sats.
+	/// Our balance in the last commitment we signed, in sats, and that commitment's number.
 	pub last_holder_balance_sat: Option<u64>,
+	pub last_holder_balance_commitment: Option<u64>,
 	/// Highest (oldest) per-commitment secret index not yet releasable; secrets with index
 	/// greater than `validated_holder_commitment` may be released.
 	pub released_secrets: u64,
@@ -182,6 +184,7 @@ impl ChannelState {
 		w.opt_u64(self.last_counterparty_commitment);
 		w.opt_u64(self.validated_holder_commitment);
 		w.opt_u64(self.last_holder_balance_sat);
+		w.opt_u64(self.last_holder_balance_commitment);
 		w.u64(self.released_secrets);
 		w.0
 	}
@@ -205,11 +208,42 @@ impl ChannelState {
 			st.last_counterparty_commitment = r.opt_u64()?;
 			st.validated_holder_commitment = r.opt_u64()?;
 			st.last_holder_balance_sat = r.opt_u64()?;
+			st.last_holder_balance_commitment = r.opt_u64()?;
 			st.released_secrets = r.u64()?;
 			Ok(())
 		})()
 		.map_err(|e| e.to_string())?;
 		Ok(st)
+	}
+
+	/// Merges `newer` into `self`, keeping the most advanced value of every monotonic field.
+	/// Used so that concurrent authorizations (e.g. the HTLC signatures of one commitment)
+	/// cannot lose each other's updates.
+	fn merge(&mut self, newer: &ChannelState) {
+		for (k, id) in &newer.keys {
+			self.keys.entry(*k).or_insert(*id);
+		}
+		for id in &newer.spliced_funding_keys {
+			if !self.spliced_funding_keys.contains(id) {
+				self.spliced_funding_keys.push(*id);
+			}
+		}
+		self.last_counterparty_commitment =
+			min_opt(self.last_counterparty_commitment, newer.last_counterparty_commitment);
+		self.validated_holder_commitment =
+			min_opt(self.validated_holder_commitment, newer.validated_holder_commitment);
+		match (self.last_holder_balance_commitment, newer.last_holder_balance_commitment) {
+			(Some(mine), Some(theirs)) if theirs > mine => {},
+			(_, Some(_)) => {
+				self.last_holder_balance_sat = newer.last_holder_balance_sat;
+				self.last_holder_balance_commitment = newer.last_holder_balance_commitment;
+			},
+			(None, None) if newer.last_holder_balance_sat.is_some() => {
+				self.last_holder_balance_sat = newer.last_holder_balance_sat;
+			},
+			_ => {},
+		}
+		self.released_secrets = self.released_secrets.max(newer.released_secrets);
 	}
 
 	pub fn kind_of(&self, key_id: &KeyId) -> Option<KeyKind> {
@@ -229,6 +263,14 @@ impl ChannelState {
 	}
 }
 
+fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+	match (a, b) {
+		(Some(a), Some(b)) => Some(a.min(b)),
+		(a, None) => a,
+		(None, b) => b,
+	}
+}
+
 /// The commitment-secret seed and policy state for all channels of one party.
 pub struct ChannelPolicy {
 	dir: PathBuf,
@@ -237,6 +279,8 @@ pub struct ChannelPolicy {
 	/// B has one; Party A runs the policy without it (no secret / point service).
 	master_secret: Option<[u8; 32]>,
 	states: Mutex<HashMap<ChannelId, ChannelState>>,
+	locks: Mutex<HashMap<ChannelId, Arc<Mutex<()>>>>,
+	tmp_counter: AtomicU64,
 	secp: Secp256k1<All>,
 }
 
@@ -247,6 +291,7 @@ pub trait KeyLookup {
 }
 
 /// Result of a successful authorization: state to persist once the operation succeeds.
+#[derive(Debug)]
 pub struct Authorized {
 	channel: Option<ChannelId>,
 	state: Option<ChannelState>,
@@ -262,8 +307,15 @@ impl ChannelPolicy {
 			config,
 			master_secret,
 			states: Mutex::new(HashMap::new()),
+			locks: Mutex::new(HashMap::new()),
+			tmp_counter: AtomicU64::new(0),
 			secp: Secp256k1::new(),
 		})
+	}
+
+	fn lock(&self, channel: &ChannelId) -> Arc<Mutex<()>> {
+		let mut locks = self.locks.lock().unwrap();
+		Arc::clone(locks.entry(*channel).or_insert_with(|| Arc::new(Mutex::new(()))))
 	}
 
 	pub fn config(&self) -> &PolicyConfig {
@@ -294,7 +346,9 @@ impl ChannelPolicy {
 
 	fn store(&self, channel: &ChannelId, st: ChannelState) -> io::Result<()> {
 		let path = self.state_path(channel);
-		let tmp = self.dir.join(format!("{}.policy.tmp", channel.as_hex()));
+		let n = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
+		let tmp =
+			self.dir.join(format!("{}.policy.{}.{}.tmp", channel.as_hex(), std::process::id(), n));
 		fs::write(&tmp, st.encode())?;
 		fs::rename(&tmp, &path)?;
 		self.states.lock().unwrap().insert(*channel, st);
@@ -310,6 +364,8 @@ impl ChannelPolicy {
 	pub fn register_key(
 		&self, channel: &ChannelId, kind: KeyKind, key_id: &KeyId,
 	) -> Result<(), PolicyError> {
+		let lock = self.lock(channel);
+		let _guard = lock.lock().unwrap();
 		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
 		match kind {
 			KeyKind::SplicedFunding => {
@@ -364,6 +420,8 @@ impl ChannelPolicy {
 	pub fn release_commitment_secret(
 		&self, channel: &ChannelId, idx: u64,
 	) -> Result<[u8; 32], PolicyError> {
+		let lock = self.lock(channel);
+		let _guard = lock.lock().unwrap();
 		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
 		match st.validated_holder_commitment {
 			Some(validated) if idx > validated => {},
@@ -387,6 +445,8 @@ impl ChannelPolicy {
 	pub fn holder_commitment_validated(
 		&self, channel: &ChannelId, number: u64,
 	) -> Result<(), PolicyError> {
+		let lock = self.lock(channel);
+		let _guard = lock.lock().unwrap();
 		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
 		if let Some(v) = st.validated_holder_commitment {
 			if number > v {
@@ -482,6 +542,7 @@ impl ChannelPolicy {
 					{
 						self.check_balance_decrease(&st, balance)?;
 						st.last_holder_balance_sat = Some(balance);
+						st.last_holder_balance_commitment = Some(number);
 					}
 					st.last_counterparty_commitment = Some(number);
 				}
@@ -503,6 +564,7 @@ impl ChannelPolicy {
 				{
 					self.check_balance_decrease(&st, balance)?;
 					st.last_holder_balance_sat = Some(balance);
+					st.last_holder_balance_commitment = Some(number);
 				}
 			},
 			SigningOp::ClosingTransaction => {
@@ -529,7 +591,11 @@ impl ChannelPolicy {
 	/// Persists the state changes of a successful authorization.
 	pub fn commit(&self, auth: Authorized) -> Result<(), PolicyError> {
 		if let (Some(channel), Some(st)) = (auth.channel, auth.state) {
-			self.store(&channel, st).map_err(|e| PolicyError(e.to_string()))?;
+			let lock = self.lock(&channel);
+			let _guard = lock.lock().unwrap();
+			let mut current = self.load(&channel).map_err(|e| PolicyError(e.to_string()))?;
+			current.merge(&st);
+			self.store(&channel, current).map_err(|e| PolicyError(e.to_string()))?;
 		}
 		Ok(())
 	}
@@ -742,4 +808,453 @@ pub fn revocation_tweaks(
 		.expect("non-zero")
 		.secret_bytes();
 	(mul, add)
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use bitcoin::absolute::LockTime;
+	use bitcoin::consensus::encode::serialize;
+	use bitcoin::hashes::Hash as _;
+	use bitcoin::secp256k1::rand::{thread_rng, RngCore};
+	use bitcoin::transaction::Version;
+	use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Txid, Witness};
+	use lightning::util::ser::Writeable;
+
+	use super::*;
+	use crate::protocol::{CounterpartyKeys, SigningContext};
+
+	struct Keys {
+		secrets: HashMap<KeyId, SecretKey>,
+		pubkeys: HashMap<KeyId, PublicKey>,
+	}
+
+	impl Keys {
+		fn new() -> Self {
+			Keys { secrets: HashMap::new(), pubkeys: HashMap::new() }
+		}
+		fn add(&mut self, id: u8) -> KeyId {
+			let secp = Secp256k1::new();
+			let mut sk = [0u8; 32];
+			thread_rng().fill_bytes(&mut sk);
+			let sk = SecretKey::from_slice(&sk).unwrap();
+			let key_id = [id; 32];
+			self.pubkeys.insert(key_id, PublicKey::from_secret_key(&secp, &sk));
+			self.secrets.insert(key_id, sk);
+			key_id
+		}
+	}
+
+	impl KeyLookup for Keys {
+		fn public_key(&self, key_id: &KeyId) -> Option<PublicKey> {
+			self.pubkeys.get(key_id).copied()
+		}
+	}
+
+	struct Fixture {
+		policy: ChannelPolicy,
+		keys: Keys,
+		channel: ChannelId,
+		funding: KeyId,
+		payment: KeyId,
+		delayed: KeyId,
+		htlc: KeyId,
+		revocation: KeyId,
+		cp_rev: SecretKey,
+		_dir: PathBuf,
+	}
+
+	fn fixture(config: PolicyConfig) -> Fixture {
+		let mut dir = std::env::temp_dir();
+		let nanos =
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		dir.push(format!("ldk-mpc-policy-test-{nanos}"));
+		let policy = ChannelPolicy::open(&dir, config, Some([0x42u8; 32])).unwrap();
+		let mut keys = Keys::new();
+		let channel = [0xccu8; 32];
+		let funding = keys.add(1);
+		let payment = keys.add(2);
+		let delayed = keys.add(3);
+		let htlc = keys.add(4);
+		let revocation = keys.add(5);
+		policy.register_key(&channel, KeyKind::Funding, &funding).unwrap();
+		policy.register_key(&channel, KeyKind::Payment, &payment).unwrap();
+		policy.register_key(&channel, KeyKind::DelayedPayment, &delayed).unwrap();
+		policy.register_key(&channel, KeyKind::Htlc, &htlc).unwrap();
+		policy.register_key(&channel, KeyKind::Revocation, &revocation).unwrap();
+		let cp_rev = SecretKey::from_slice(&[0x77u8; 32]).unwrap();
+		Fixture {
+			policy,
+			keys,
+			channel,
+			funding,
+			payment,
+			delayed,
+			htlc,
+			revocation,
+			cp_rev,
+			_dir: dir,
+		}
+	}
+
+	fn features() -> ChannelTypeFeatures {
+		ChannelTypeFeatures::only_static_remote_key()
+	}
+
+	fn tx_with_outputs(outputs: Vec<TxOut>) -> Transaction {
+		Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+				witness: Witness::new(),
+			}],
+			output: outputs,
+		}
+	}
+
+	fn digest(tx: &Transaction, script: &ScriptBuf, value: u64, ty: EcdsaSighashType) -> [u8; 32] {
+		sighash::SighashCache::new(tx)
+			.p2wsh_signature_hash(0, script, Amount::from_sat(value), ty)
+			.unwrap()
+			.to_byte_array()
+	}
+
+	fn counterparty_keys(f: &Fixture) -> CounterpartyKeys {
+		let secp = Secp256k1::new();
+		let cp_rev_pk = PublicKey::from_secret_key(&secp, &f.cp_rev);
+		CounterpartyKeys {
+			funding_pubkey: [2u8; 33],
+			revocation_basepoint: cp_rev_pk.serialize(),
+			payment_point: [2u8; 33],
+			delayed_payment_basepoint: [3u8; 33],
+			htlc_basepoint: [2u8; 33],
+		}
+	}
+
+	fn base_context(
+		f: &Fixture, op: SigningOp, tx: &Transaction, script: &ScriptBuf, value: u64,
+	) -> SigningContext {
+		SigningContext {
+			op: Some(op),
+			channel_keys_id: Some([1u8; 32]),
+			channel_value_satoshis: Some(100_000),
+			commitment_number: None,
+			funding_txid: None,
+			funding_vout: None,
+			splice_parent_funding_txid: None,
+			channel_type_features: Some(features().encode()),
+			counterparty_keys: Some(counterparty_keys(f)),
+			holder_selected_contest_delay: Some(144),
+			counterparty_selected_contest_delay: Some(144),
+			transaction: Some(serialize(tx)),
+			input_index: 0,
+			input_value_sat: value,
+			witness_script: Some(script.to_bytes()),
+			sighash_type: 0x01,
+			per_commitment_point: None,
+			counterparty_per_commitment_secret: None,
+			holder_balance_sat: None,
+		}
+	}
+
+	/// A counterparty commitment paying `ours` sats to our payment point.
+	fn counterparty_commitment(f: &Fixture, number: u64, ours: u64) -> SignItem {
+		let payment_point = f.keys.public_key(&f.payment).unwrap();
+		let script = chan_utils::get_countersigner_payment_script(&features(), &payment_point);
+		let tx = tx_with_outputs(vec![
+			TxOut { value: Amount::from_sat(ours), script_pubkey: script },
+			TxOut {
+				value: Amount::from_sat(100_000 - ours - 1_000),
+				script_pubkey: ScriptBuf::new_op_return(&[1u8]),
+			},
+		]);
+		let redeem = ScriptBuf::from_bytes(vec![0x52; 71]);
+		let mut ctx = base_context(f, SigningOp::CounterpartyCommitment, &tx, &redeem, 100_000);
+		ctx.commitment_number = Some(number);
+		ctx.per_commitment_point = Some([2u8; 33]);
+		SignItem {
+			key_id: f.funding,
+			derivation: Derivation::None,
+			digest: digest(&tx, &redeem, 100_000, EcdsaSighashType::All),
+			context: ctx,
+		}
+	}
+
+	#[test]
+	fn standalone_keys_only_sign_test_ops() {
+		let f = fixture(PolicyConfig::default());
+		let item = SignItem {
+			key_id: f.funding,
+			derivation: Derivation::None,
+			digest: [1u8; 32],
+			context: SigningContext { op: Some(SigningOp::Test), ..Default::default() },
+		};
+		assert!(f.policy.authorize(None, &item, &f.keys).is_ok());
+		let bad = SignItem {
+			context: SigningContext {
+				op: Some(SigningOp::ClosingTransaction),
+				..Default::default()
+			},
+			..item
+		};
+		assert!(f.policy.authorize(None, &bad, &f.keys).is_err());
+	}
+
+	#[test]
+	fn digest_must_match_sighash() {
+		let f = fixture(PolicyConfig::default());
+		let mut item = counterparty_commitment(&f, 100, 60_000);
+		assert!(f.policy.authorize(Some(&f.channel), &item, &f.keys).is_ok());
+		item.digest[0] ^= 1;
+		let err = f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap_err();
+		assert!(err.0.contains("sighash"), "{err}");
+		// A different input value changes the sighash too.
+		let mut item = counterparty_commitment(&f, 100, 60_000);
+		item.context.input_value_sat = 99_999;
+		assert!(f.policy.authorize(Some(&f.channel), &item, &f.keys).is_err());
+	}
+
+	#[test]
+	fn key_kind_must_match_operation() {
+		let f = fixture(PolicyConfig::default());
+		let mut item = counterparty_commitment(&f, 100, 60_000);
+		item.key_id = f.payment;
+		let err = f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap_err();
+		assert!(err.0.contains("requires a Funding key"), "{err}");
+		// Keys of another channel are rejected.
+		let other = [0xddu8; 32];
+		let err = f
+			.policy
+			.authorize(Some(&other), &counterparty_commitment(&f, 100, 60_000), &f.keys)
+			.unwrap_err();
+		assert!(err.0.contains("not bound"), "{err}");
+		// A kind cannot be rebound to a different key.
+		assert!(f.policy.register_key(&f.channel, KeyKind::Funding, &f.htlc).is_err());
+	}
+
+	#[test]
+	fn commitment_numbers_are_monotonic_and_balance_tracked() {
+		let f = fixture(PolicyConfig {
+			max_holder_balance_decrease_sat: Some(10_000),
+			..Default::default()
+		});
+		let sign = |number: u64, ours: u64| {
+			let item = counterparty_commitment(&f, number, ours);
+			f.policy
+				.authorize(Some(&f.channel), &item, &f.keys)
+				.map(|a| f.policy.commit(a).unwrap())
+		};
+		sign(100, 60_000).unwrap();
+		assert_eq!(
+			f.policy.channel_state(&f.channel).unwrap().last_holder_balance_sat,
+			Some(60_000)
+		);
+		sign(100, 60_000).unwrap(); // re-signing the same state is allowed
+		assert!(sign(101, 60_000).unwrap_err().0.contains("older"));
+		sign(99, 55_000).unwrap(); // within the 10k cap
+		let err = sign(98, 40_000).unwrap_err(); // 15k drop exceeds the cap
+		assert!(err.0.contains("drop"), "{err}");
+		assert_eq!(
+			f.policy.channel_state(&f.channel).unwrap().last_holder_balance_sat,
+			Some(55_000)
+		);
+		sign(98, 70_000).unwrap(); // increases are fine
+	}
+
+	#[test]
+	fn htlc_derivation_must_match_bolt3() {
+		let f = fixture(PolicyConfig::default());
+		let base = f.keys.public_key(&f.htlc).unwrap();
+		let pcp = PublicKey::from_secret_key(
+			&Secp256k1::new(),
+			&SecretKey::from_slice(&[9u8; 32]).unwrap(),
+		);
+		let tx = tx_with_outputs(vec![TxOut {
+			value: Amount::from_sat(900),
+			script_pubkey: ScriptBuf::new_op_return(&[1u8]),
+		}]);
+		let script = ScriptBuf::from_bytes(vec![0x63; 10]);
+		let mut ctx = base_context(&f, SigningOp::HolderHtlcTransaction, &tx, &script, 1_000);
+		ctx.per_commitment_point = Some(pcp.serialize());
+		let tweak = bolt3_tweak(&pcp.serialize(), &base.serialize());
+		let item = SignItem {
+			key_id: f.htlc,
+			derivation: Derivation::Additive { tweak },
+			digest: digest(&tx, &script, 1_000, EcdsaSighashType::All),
+			context: ctx,
+		};
+		assert!(f.policy.authorize(Some(&f.channel), &item, &f.keys).is_ok());
+		let mut wrong = tweak;
+		wrong[5] ^= 0xff;
+		let bad = SignItem { derivation: Derivation::Additive { tweak: wrong }, ..item.clone() };
+		assert!(f
+			.policy
+			.authorize(Some(&f.channel), &bad, &f.keys)
+			.unwrap_err()
+			.0
+			.contains("tweak"));
+		// An HTLC key cannot be used untweaked, and a funding key cannot be tweaked.
+		let bad = SignItem { derivation: Derivation::None, ..item.clone() };
+		assert!(f.policy.authorize(Some(&f.channel), &bad, &f.keys).is_err());
+		let _ = f.delayed;
+	}
+
+	#[test]
+	fn revocation_derivation_must_match_revealed_secret() {
+		let f = fixture(PolicyConfig::default());
+		let secp = Secp256k1::new();
+		let base = f.keys.public_key(&f.revocation).unwrap();
+		let cp_secret = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
+		let (mul, add) = revocation_tweaks(&secp, &base, &cp_secret);
+		let tx = tx_with_outputs(vec![TxOut {
+			value: Amount::from_sat(900),
+			script_pubkey: ScriptBuf::new_op_return(&[1u8]),
+		}]);
+		let script = ScriptBuf::from_bytes(vec![0x63; 10]);
+		let mut ctx = base_context(&f, SigningOp::JusticeRevokedOutput, &tx, &script, 1_000);
+		ctx.counterparty_per_commitment_secret = Some(cp_secret.secret_bytes());
+		ctx.per_commitment_point = Some(PublicKey::from_secret_key(&secp, &cp_secret).serialize());
+		let item = SignItem {
+			key_id: f.revocation,
+			derivation: Derivation::MulAdd { mul, add },
+			digest: digest(&tx, &script, 1_000, EcdsaSighashType::All),
+			context: ctx,
+		};
+		assert!(f.policy.authorize(Some(&f.channel), &item, &f.keys).is_ok());
+		let mut bad_add = add;
+		bad_add[0] ^= 1;
+		let bad = SignItem { derivation: Derivation::MulAdd { mul, add: bad_add }, ..item.clone() };
+		assert!(f.policy.authorize(Some(&f.channel), &bad, &f.keys).is_err());
+		let mut ctx = item.context.clone();
+		ctx.counterparty_per_commitment_secret = Some([0x34u8; 32]);
+		let bad = SignItem { context: ctx, ..item };
+		assert!(f.policy.authorize(Some(&f.channel), &bad, &f.keys).is_err());
+	}
+
+	#[test]
+	fn secrets_release_only_after_newer_holder_commitment_validated() {
+		let f = fixture(PolicyConfig::default());
+		let start = 281474976710655u64;
+		assert!(f.policy.release_commitment_secret(&f.channel, start).is_err());
+		f.policy.holder_commitment_validated(&f.channel, start - 1).unwrap();
+		let s1 = f.policy.release_commitment_secret(&f.channel, start).unwrap();
+		assert_eq!(
+			s1,
+			f.policy.release_commitment_secret(&f.channel, start).unwrap(),
+			"re-release is stable"
+		);
+		assert!(
+			f.policy.release_commitment_secret(&f.channel, start - 1).is_err(),
+			"current state not releasable"
+		);
+		assert!(f.policy.release_commitment_secret(&f.channel, start - 2).is_err());
+		// The point for a commitment matches the secret.
+		let secp = Secp256k1::new();
+		let pk = f.policy.per_commitment_point(&f.channel, start).unwrap();
+		assert_eq!(pk, PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&s1).unwrap()));
+		// Holder commitments only sign for the latest validated state or newer.
+		let mut st = f.policy.channel_state(&f.channel).unwrap();
+		assert_eq!(st.validated_holder_commitment, Some(start - 1));
+		st.released_secrets = 0;
+		assert!(
+			f.policy.holder_commitment_validated(&f.channel, start).is_err(),
+			"cannot go backwards"
+		);
+	}
+
+	#[test]
+	fn closing_must_pay_allowlisted_script_with_balance() {
+		let mut allow = PayoutAllowlist::default();
+		allow.add_address("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080").unwrap();
+		let ok_script = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+			.unwrap()
+			.assume_checked()
+			.script_pubkey();
+		let f = fixture(PolicyConfig {
+			payout: Some(allow),
+			max_closing_fee_sat: 2_000,
+			..Default::default()
+		});
+		// Establish a balance of 60k via a signed counterparty commitment.
+		let item = counterparty_commitment(&f, 100, 60_000);
+		f.policy.commit(f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap()).unwrap();
+
+		let closing = |script: ScriptBuf, value: u64| {
+			let tx = tx_with_outputs(vec![
+				TxOut { value: Amount::from_sat(value), script_pubkey: script },
+				TxOut {
+					value: Amount::from_sat(39_000),
+					script_pubkey: ScriptBuf::new_op_return(&[2u8]),
+				},
+			]);
+			let redeem = ScriptBuf::from_bytes(vec![0x52; 71]);
+			let ctx = base_context(&f, SigningOp::ClosingTransaction, &tx, &redeem, 100_000);
+			SignItem {
+				key_id: f.funding,
+				derivation: Derivation::None,
+				digest: digest(&tx, &redeem, 100_000, EcdsaSighashType::All),
+				context: ctx,
+			}
+		};
+		assert!(f
+			.policy
+			.authorize(Some(&f.channel), &closing(ok_script.clone(), 59_000), &f.keys)
+			.is_ok());
+		let err = f
+			.policy
+			.authorize(Some(&f.channel), &closing(ok_script.clone(), 50_000), &f.keys)
+			.unwrap_err();
+		assert!(err.0.contains("allow-listed"), "{err}");
+		let elsewhere = ScriptBuf::new_op_return(&[9u8]);
+		assert!(f
+			.policy
+			.authorize(Some(&f.channel), &closing(elsewhere, 60_000), &f.keys)
+			.is_err());
+	}
+
+	#[test]
+	fn sweeps_must_pay_allowlisted_scripts() {
+		let mut allow = PayoutAllowlist::default();
+		let xpub: Xpub = "tpubDC5FSnBiZDMmhiuCmWAYsLwgLYrrT9rAqvTySfuCCrgsWz8wxMXUS9Tb9iVMvcRbvFcAHGkMD5Kx8koh4GquNGNTfohfk7pgjhaPCdXpoba".parse().unwrap();
+		allow.add_bip84_xpub(&xpub, 5).unwrap();
+		assert_eq!(allow.len(), 10);
+		let secp = Secp256k1::new();
+		let child = xpub
+			.derive_pub(
+				&secp,
+				&DerivationPath::from(vec![
+					ChildNumber::from_normal_idx(0).unwrap(),
+					ChildNumber::from_normal_idx(3).unwrap(),
+				]),
+			)
+			.unwrap();
+		let ok_script = Address::p2wpkh(&CompressedPublicKey(child.public_key), Network::Bitcoin)
+			.script_pubkey();
+		let f = fixture(PolicyConfig { payout: Some(allow), ..Default::default() });
+		let payment_point = f.keys.public_key(&f.payment).unwrap();
+		let witness_script =
+			chan_utils::get_countersigner_payment_script(&features(), &payment_point);
+		let sweep = |script: ScriptBuf| {
+			let tx = tx_with_outputs(vec![TxOut {
+				value: Amount::from_sat(9_000),
+				script_pubkey: script,
+			}]);
+			let ctx = base_context(&f, SigningOp::SweepStaticPayment, &tx, &witness_script, 10_000);
+			SignItem {
+				key_id: f.payment,
+				derivation: Derivation::None,
+				digest: digest(&tx, &witness_script, 10_000, EcdsaSighashType::All),
+				context: ctx,
+			}
+		};
+		assert!(f.policy.authorize(Some(&f.channel), &sweep(ok_script), &f.keys).is_ok());
+		assert!(f
+			.policy
+			.authorize(Some(&f.channel), &sweep(ScriptBuf::new_op_return(&[1u8])), &f.keys)
+			.is_err());
+	}
 }
