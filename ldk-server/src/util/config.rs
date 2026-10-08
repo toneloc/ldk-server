@@ -85,6 +85,18 @@ pub struct Config {
 	pub metrics_password: Option<String>,
 	pub tor_config: Option<TorConfig>,
 	pub hrn_config: HumanReadableNamesConfig,
+	pub mpc_config: Option<MpcConfig>,
+}
+
+/// Configuration of the external 2-of-2 MPC funding-key signer (`[mpc]` section).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MpcConfig {
+	/// Address of MPC Party A (the cb-mpc P1 service).
+	pub party_address: SocketAddr,
+	/// Timeout for signing requests.
+	pub request_timeout_secs: u64,
+	/// Timeout for key-generation requests.
+	pub dkg_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +192,7 @@ struct ConfigBuilder {
 	metrics_password: Option<String>,
 	tor_proxy_address: Option<String>,
 	hrn: Option<HrnTomlConfig>,
+	mpc: Option<MpcTomlConfig>,
 }
 
 impl ConfigBuilder {
@@ -271,6 +284,10 @@ impl ConfigBuilder {
 
 		if let Some(hrn) = toml.hrn {
 			self.hrn = Some(hrn);
+		}
+
+		if let Some(mpc) = toml.mpc {
+			self.mpc = Some(mpc);
 		}
 	}
 
@@ -407,6 +424,15 @@ impl ConfigBuilder {
 
 		if let Some(tor_proxy_address) = &args.tor_proxy_address {
 			self.tor_proxy_address = Some(tor_proxy_address.clone());
+		}
+
+		if let Some(mpc_party_address) = &args.mpc_party_address {
+			let mpc = self.mpc.get_or_insert_with(|| MpcTomlConfig {
+				party_address: String::new(),
+				request_timeout_secs: None,
+				dkg_timeout_secs: None,
+			});
+			mpc.party_address = mpc_party_address.clone();
 		}
 
 		if let Some(log_max_size_mb) = args.log_max_size_mb {
@@ -715,6 +741,23 @@ impl ConfigBuilder {
 			None => HumanReadableNamesConfig::default(),
 		};
 
+		let mpc_config = match self.mpc {
+			Some(mpc) => {
+				let party_address = SocketAddr::from_str(&mpc.party_address).map_err(|e| {
+					io::Error::new(
+						io::ErrorKind::InvalidInput,
+						format!("Invalid mpc.party_address configured: {}", e),
+					)
+				})?;
+				Some(MpcConfig {
+					party_address,
+					request_timeout_secs: mpc.request_timeout_secs.unwrap_or(30),
+					dkg_timeout_secs: mpc.dkg_timeout_secs.unwrap_or(120),
+				})
+			},
+			None => None,
+		};
+
 		Ok(Config {
 			network,
 			listening_addrs,
@@ -745,6 +788,7 @@ impl ConfigBuilder {
 			metrics_password,
 			tor_config: tor_proxy_address.map(|proxy_address| TorConfig { proxy_address }),
 			hrn_config,
+			mpc_config,
 		})
 	}
 }
@@ -765,6 +809,7 @@ pub struct TomlConfig {
 	probing: Option<ProbingTomlConfig>,
 	tor: Option<TomlTorConfig>,
 	hrn: Option<HrnTomlConfig>,
+	mpc: Option<MpcTomlConfig>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -872,6 +917,14 @@ struct ProbingTomlConfig {
 #[serde(deny_unknown_fields)]
 struct TomlTorConfig {
 	proxy_address: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MpcTomlConfig {
+	party_address: String,
+	request_timeout_secs: Option<u64>,
+	dkg_timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1411,6 +1464,13 @@ pub struct ArgsConfig {
 		help = "Tor daemon SOCKS proxy address. Only connections to OnionV3 peers will be made via this proxy; other connections (IPv4 peers, Electrum server) will not be routed over Tor."
 	)]
 	tor_proxy_address: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_MPC_PARTY_ADDRESS",
+		help = "Address of MPC Party A (cb-mpc P1). When set, channel funding keys are generated and used via 2-of-2 MPC. Only enable on a fresh node."
+	)]
+	mpc_party_address: Option<String>,
 }
 
 impl ArgsConfig {
@@ -1587,6 +1647,7 @@ mod tests {
 			metrics_username: None,
 			metrics_password: None,
 			tor_proxy_address: None,
+			mpc_party_address: None,
 			log_to_file: Some(true),
 			log_max_size_mb: Some(50),
 			log_rotation_interval_hours: Some(24),
@@ -1629,6 +1690,7 @@ mod tests {
 			metrics_username: None,
 			metrics_password: None,
 			tor_proxy_address: None,
+			mpc_party_address: None,
 			log_to_file: Some(true),
 			log_max_size_mb: None,
 			log_rotation_interval_hours: None,
@@ -1745,6 +1807,7 @@ mod tests {
 				proxy_address: SocketAddress::from_str("127.0.0.1:9050").unwrap(),
 			}),
 			hrn_config: HumanReadableNamesConfig::default(),
+			mpc_config: None,
 		};
 
 		assert_eq!(config.listening_addrs, expected.listening_addrs);
@@ -2720,6 +2783,7 @@ mod tests {
 			metrics_password: None,
 			tor_config: None,
 			hrn_config: HumanReadableNamesConfig::default(),
+			mpc_config: None,
 			log_max_size_bytes: 50 * 1024 * 1024,
 			log_rotation_interval_secs: 24 * 60 * 60,
 			log_max_files: 5,
@@ -2854,6 +2918,7 @@ mod tests {
 				proxy_address: SocketAddress::from_str("127.0.0.1:9050").unwrap(),
 			}),
 			hrn_config: HumanReadableNamesConfig::default(),
+			mpc_config: None,
 			log_max_size_bytes: 50 * 1024 * 1024,
 			log_rotation_interval_secs: 24 * 60 * 60,
 			log_max_files: 5,

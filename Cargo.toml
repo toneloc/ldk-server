@@ -10,3 +10,8 @@ lto = true
 
 [profile.dev]
 panic = "abort"
+
+# ldk-node with the `ExternalFundingSigner` hook (contrib/patches/ldk-node-external-funding-signer.patch)
+# applied on top of the pinned upstream revision. See ldk-server-mpc/README.md.
+[patch."https://github.com/lightningdevkit/ldk-node"]
+ldk-node = { path = "../ldk-node" }

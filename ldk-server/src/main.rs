@@ -9,6 +9,7 @@
 
 mod api;
 mod macaroons;
+mod mpc_signer;
 mod service;
 mod util;
 
@@ -269,6 +270,19 @@ fn main() {
 	if let Err(e) = builder.set_runtime(runtime.handle().clone()) {
 		error!("Failed to set LDK Node runtime: {e}");
 		std::process::exit(-1);
+	}
+
+	if let Some(mpc_config) = &config_file.mpc_config {
+		let mpc_signer = crate::mpc_signer::MpcFundingSigner::new(mpc_config);
+		if let Err(e) = mpc_signer.ping() {
+			error!("MPC party A at {} is unreachable: {e}", mpc_config.party_address);
+			std::process::exit(-1);
+		}
+		info!(
+			"Channel funding keys are 2-of-2 MPC-backed via party A at {}",
+			mpc_config.party_address
+		);
+		builder.set_external_funding_signer(Arc::new(mpc_signer));
 	}
 
 	if let Err(e) =
