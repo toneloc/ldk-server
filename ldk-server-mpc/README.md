@@ -22,30 +22,30 @@ flowchart TB
             NODE["LDK Node (patched)<br/>channel state machine, HTLCs,<br/>payments, monitors, persistence"]
             SP["WalletKeysManager<br/>(SignerProvider)"]
             NCS["NodeChannelSigner<br/>= InMemorySigner + external funding key"]
-            MFS["MpcFundingSigner<br/>(ExternalFundingSigner impl)"]
+            MFS["MpcChannelSigner<br/>(ExternalChannelSigner impl)"]
             MC["MpcClient"]
             API --> NODE --> SP --> NCS
-            NCS -- "funding-key ops only:<br/>pubkeys / sign commitment,<br/>closing, anchor, announcement, splice" --> MFS --> MC
-            NCS -. "all other keys stay local:<br/>revocation, payment, delayed, HTLC,<br/>per-commitment secrets" .-> NCS
+            NCS -- "all channel keys:<br/>pubkeys, per-commitment points/secrets,<br/>commitment, HTLC, closing, justice,<br/>sweep signatures (full tx context)" --> MFS --> MC
+            NCS -. "stays local:<br/>node identity key,<br/>on-chain wallet (own mnemonic)" .-> NCS
         end
         KV[("LDK KV store<br/>channels, monitors, wallet")]
         NODE --> KV
     end
 
     subgraph pa["MPC Party A process (cb-mpc P1)"]
-        P1["ldk-server-mpc-party --role p1"]
-        KA[("share A<br/>&lt;key_id&gt;.share")]
+        P1["ldk-server-mpc-party --role p1<br/>policy (first line)"]
+        KA[("shares A (encrypted)<br/>5 per channel")]
         P1 --> KA
     end
 
     subgraph pb["MPC Party B process (cb-mpc P2)"]
-        P2["ldk-server-mpc-party --role p2"]
-        KB[("share B<br/>&lt;key_id&gt;.share")]
+        P2["ldk-server-mpc-party --role p2<br/>policy (authoritative)<br/>commitment seed"]
+        KB[("shares B (encrypted)<br/>+ master secret<br/>+ per-channel policy state")]
         P2 --> KB
     end
 
-    MC -- "TCP, one request per call:<br/>EnsureKey{key_id} -> pubkey<br/>Sign{key_id, digest, context} -> sig" --> P1
-    P1 <-- "framed TCP session per operation:<br/>SessionStart -> SessionAck -><br/>cb-mpc ECDSA-2P rounds (DKG / sign)<br/>-> SessionDone{pubkey}" --> P2
+    MC -- "PSK-encrypted TCP, one request per call:<br/>EnsureKey{key, channel, kind} -> pubkey<br/>PerCommitmentPoint / ReleaseSecret<br/>Sign{items: key, derivation, digest, full tx} -> sigs" --> P1
+    P1 <-- "PSK-encrypted session per item (parallel):<br/>SessionStart -> policy -> SessionAck -><br/>cb-mpc ECDSA-2P rounds (DKG / sign)<br/>-> SessionDone{pubkey}" --> P2
 
     classDef mpc fill:#eef6ff,stroke:#3b6fb6;
     classDef ldk fill:#f6f6f6,stroke:#666;
@@ -53,55 +53,44 @@ flowchart TB
     class API,NODE,SP,NCS,KV ldk;
 ```
 
-Trust and data boundaries:
-
-- **LDK Server** owns all Lightning state (channels, commitments, HTLCs, revocation
-  secrets, monitors) and the on-chain wallet. It never sees a funding private key.
+- **LDK Server** owns all Lightning state and the on-chain wallet; it never sees a funding
+  private key.
 - **Party A (P1)** is the only endpoint LDK Server talks to and the only party that
-  obtains the final signature (a property of cb-mpc's ECDSA-2P protocol). It holds share A.
-- **Party B (P2)** only accepts protocol sessions from Party A and holds share B. Neither
-  party stores any channel state; the only state is the opaque per-key share blob.
-- The full private key never exists: DKG produces the shares directly, and signing is an
-  interactive protocol over the shares.
+  obtains the final signature (a property of cb-mpc ECDSA-2P). It holds the A shares and
+  runs the policy as a first line.
+- **Party B (P2)** only accepts protocol sessions from Party A, holds the B shares, the
+  commitment-seed master secret and the per-channel policy counters, and is the authoritative
+  policy. It never sees LDK's database; everything it checks it recomputes from the
+  transaction bytes in the request.
 
-Signing flow for one commitment update:
+### Signing flow for one commitment update (funding signature + one HTLC signature)
 
 ```text
- LDK channel state machine          MpcFundingSigner        Party A (P1)             Party B (P2)
- ────────────────────────           ────────────────        ────────────             ────────────
+ LDK channel state machine        MpcChannelSigner           Party A (P1)                    Party B (P2)
+ ────────────────────────         ────────────────           ────────────                    ────────────
  sign_counterparty_commitment ─┐
-   HTLC sigs: local htlc key   │
-   funding sig: sighash ───────┼──▶ key_id = H(tag ‖ channel_keys_id)
-                               │    Sign{key_id, digest, ctx} ──▶ load share A
-                               │                                 policy.authorize (AllowAll)
-                               │                                 SessionStart ────────────▶ load share B
-                               │                                 ◀──────────── SessionAck   policy.authorize
-                               │                                 ◀═ cb-mpc ECDSA-2P sign ═▶
-                               │                                 DER sig (P1 only)
-                               │                                 ◀──────────── SessionDone{pubkey}
-                               │                                 verify, low-S normalize
-                               │    ◀── Signature (compact)
-                               │    verify against cached pubkey
+   build commitment + HTLC txs │
+   funding sighash, HTLC sighash
+                               ├─▶ items: [funding key, none, digest, full tx ctx],
+                               │          [htlc basepoint, +SHA256(pcp‖base), digest, htlc tx ctx]
+                               │   Sign{channel, items} ──▶ policy.authorize(each item)
+                               │                            derive share (+tweak) locally
+                               │                            ┌─ session 1 ──SessionStart──▶ policy: sighash ✓, key kind ✓,
+                               │                            │                               derivation ✓, commitment nr ✓,
+                               │                            │                               balance by script ✓ (cap)
+                               │                            │  ◀──── SessionAck ────────── derive share B (+tweak)
+                               │                            │  ◀═ cb-mpc ECDSA-2P sign ═▶
+                               │                            │  ◀──── SessionDone{pubkey}── commit state
+                               │                            └─ session 2 (in parallel) ... same for the HTLC item
+                               │                            verify each sig vs derived pubkey, low-S
+                               │   ◀── [sig, sig]
+                               │   verify vs locally derived pubkeys
  ◀─ (funding sig, HTLC sigs) ──┘
+ ...
+ validate_holder_commitment(n) ──▶ HolderCommitmentValidated{n} ──▶ (mirror) ──▶ record n
+ release_commitment_secret(n+1) ─▶ ReleaseSecret{n+1} ──▶ forward ──▶ seed: allowed iff n+1 > validated(n)
 ```
 
-Legacy overview (same thing, flattened):
-
-```text
-                 LDK Server (ldk-server)
-                     |  Builder::set_external_funding_signer(MpcFundingSigner)
-                 LDK Node (patched, ../ldk-node)
-                     |  SignerProvider -> NodeChannelSigner { InMemorySigner, external funding }
-              MpcFundingSigner (ldk-server/src/mpc_signer.rs)
-                     |  EnsureKey / Sign  (one TCP request per call, bounded timeouts)
-              MpcClient (ldk-server-mpc/src/client.rs)
-                     |
-          +----------+-----------+
-          |                      |
-   MPC Party A (P1)  <------->  MPC Party B (P2)
-   ldk-server-mpc-party         ldk-server-mpc-party
-   cb-mpc ECDSA-2P, share A     cb-mpc ECDSA-2P, share B
-```
 
 ## What is MPC-backed and what is not
 

@@ -43,7 +43,7 @@ different keys run in parallel; signatures on the same key are serialized (per-k
 ## Impact on Lightning operations (regtest e2e, `e2e-tests/tests/mpc.rs`)
 
 From the ldk-server debug log (`MPC signed <op> ... in <t>`), measured inside the
-`ExternalFundingSigner` call, i.e. including client connect, request, protocol and
+`ExternalChannelSigner` call (funding-only build), i.e. including client connect, request, protocol and
 verification:
 
 | operation                              | observed latency        |
