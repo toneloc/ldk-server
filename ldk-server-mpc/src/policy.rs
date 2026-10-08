@@ -969,7 +969,7 @@ mod tests {
 			TxOut { value: Amount::from_sat(ours), script_pubkey: script },
 			TxOut {
 				value: Amount::from_sat(100_000 - ours - 1_000),
-				script_pubkey: ScriptBuf::new_op_return(&[1u8]),
+				script_pubkey: ScriptBuf::new_op_return([1u8]),
 			},
 		]);
 		let redeem = ScriptBuf::from_bytes(vec![0x52; 71]);
@@ -1075,7 +1075,7 @@ mod tests {
 		);
 		let tx = tx_with_outputs(vec![TxOut {
 			value: Amount::from_sat(900),
-			script_pubkey: ScriptBuf::new_op_return(&[1u8]),
+			script_pubkey: ScriptBuf::new_op_return([1u8]),
 		}]);
 		let script = ScriptBuf::from_bytes(vec![0x63; 10]);
 		let mut ctx = base_context(&f, SigningOp::HolderHtlcTransaction, &tx, &script, 1_000);
@@ -1112,7 +1112,7 @@ mod tests {
 		let (mul, add) = revocation_tweaks(&secp, &base, &cp_secret);
 		let tx = tx_with_outputs(vec![TxOut {
 			value: Amount::from_sat(900),
-			script_pubkey: ScriptBuf::new_op_return(&[1u8]),
+			script_pubkey: ScriptBuf::new_op_return([1u8]),
 		}]);
 		let script = ScriptBuf::from_bytes(vec![0x63; 10]);
 		let mut ctx = base_context(&f, SigningOp::JusticeRevokedOutput, &tx, &script, 1_000);
@@ -1188,7 +1188,7 @@ mod tests {
 				TxOut { value: Amount::from_sat(value), script_pubkey: script },
 				TxOut {
 					value: Amount::from_sat(39_000),
-					script_pubkey: ScriptBuf::new_op_return(&[2u8]),
+					script_pubkey: ScriptBuf::new_op_return([2u8]),
 				},
 			]);
 			let redeem = ScriptBuf::from_bytes(vec![0x52; 71]);
@@ -1209,7 +1209,7 @@ mod tests {
 			.authorize(Some(&f.channel), &closing(ok_script.clone(), 50_000), &f.keys)
 			.unwrap_err();
 		assert!(err.0.contains("allow-listed"), "{err}");
-		let elsewhere = ScriptBuf::new_op_return(&[9u8]);
+		let elsewhere = ScriptBuf::new_op_return([9u8]);
 		assert!(f
 			.policy
 			.authorize(Some(&f.channel), &closing(elsewhere, 60_000), &f.keys)
@@ -1254,7 +1254,7 @@ mod tests {
 		assert!(f.policy.authorize(Some(&f.channel), &sweep(ok_script), &f.keys).is_ok());
 		assert!(f
 			.policy
-			.authorize(Some(&f.channel), &sweep(ScriptBuf::new_op_return(&[1u8])), &f.keys)
+			.authorize(Some(&f.channel), &sweep(ScriptBuf::new_op_return([1u8])), &f.keys)
 			.is_err());
 	}
 }

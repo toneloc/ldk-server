@@ -744,6 +744,7 @@ impl Response {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionOp {
 	/// Interactive DKG for `key_id`.
 	Dkg {
