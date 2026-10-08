@@ -477,7 +477,7 @@ impl PartyService {
 					start.key_id.as_hex(),
 					e.message
 				);
-				Err(io::Error::new(io::ErrorKind::Other, e.message))
+				Err(io::Error::other(e.message))
 			},
 		}
 	}
