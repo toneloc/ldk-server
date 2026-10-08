@@ -1,106 +1,90 @@
-# LDK Server
+# ldk-server fork: Coinbase cb-mpc channel signing for Lightning
 
-**LDK Server** is a fully-functional Lightning node in daemon form, built on top of
-[LDK Node](https://github.com/lightningdevkit/ldk-node), which itself provides a powerful abstraction over the
-[Lightning Development Kit (LDK)](https://github.com/lightningdevkit/rust-lightning) and uses a built-in
-[Bitcoin Development Kit (BDK)](https://bitcoindevkit.org/) wallet.
+**This is a fork of [lightningdevkit/ldk-server](https://github.com/lightningdevkit/ldk-server)
+whose only purpose is to test putting Lightning channel keys under Coinbase's
+[cb-mpc](https://github.com/coinbase/cb-mpc) 2-of-2 ECDSA MPC.** It is not a release of LDK
+Server; for the daemon itself use upstream. Upstream's README, API docs and contribution
+guide are unchanged under `docs/`, `ldk-server-grpc/` and `CONTRIBUTING.md`.
 
-The primary goal of LDK Server is to provide an efficient, stable, and API-first solution for deploying and managing
-a Lightning Network node. With its streamlined setup, LDK Server enables users to easily set up, configure, and run
-a Lightning node while exposing a robust, language-agnostic API via [Protocol Buffers (Protobuf)](https://protobuf.dev/).
+## What it does
 
-> **Warning**
-> LDK Server is still under active development and is not ready for production use. Until the v0.1 release, the
-> persisted data model may change in non-backwards-compatible ways. Do not run it with funds you cannot afford to lose.
+Every channel key of an LDK Server node (funding, payment, delayed-payment, HTLC and
+revocation basepoints) is a cb-mpc 2-of-2 distributed key, and the per-commitment secrets live
+on the second MPC party. Two independent MPC processes each hold one share of every key; the
+complete private keys are never assembled. Per-commitment keys are derived on the shares with
+the BOLT 3 tweaks (two small additions to cb-mpc's ECDSA-2P API, included as a patch).
 
-## Workspace Crates
+Party B is a validating signer: it recomputes every sighash from the transaction it is given,
+checks that the key kind matches the operation and that derivations match BOLT 3, keeps
+commitment numbers monotonic, releases a per-commitment secret only after a newer holder
+commitment was validated, tracks the node's balance in every commitment and caps how much it
+may drop per update, and only signs cooperative closes and sweeps that pay an allow-listed
+script (the node's wallet xpub). Links are PSK-authenticated and encrypted; key shares are
+encrypted at rest. All Lightning channel state stays in LDK Server / LDK Node.
 
-- `ldk-server`: daemon that runs the Lightning node and exposes the API
-- `ldk-server-cli`: CLI client for the server API
-- `ldk-server-client`: Rust client library for authenticated TLS gRPC calls
-- `ldk-server-grpc`: generated protobuf and shared gRPC types
-- `ldk-server-macaroons`: shared token parsing, signing, derivation, and request binding
-- `ldk-server-mcp`: stdio MCP bridge exposing unary `ldk-server` RPCs as MCP tools
-- `ldk-server-mpc`: Coinbase cb-mpc 2-of-2 MPC party service and client for channel funding keys (see [MPC Channel Signing](#mpc-channel-signing-coinbase-cb-mpc))
+## Status (2026-10-08)
 
-### Features
+- **Regtest, full coverage:** two LDK Servers, one MPC-backed. Channel open (five DKGs),
+  payments both ways, restart of the MPC parties, restart of LDK Server, cooperative close
+  with a DKG'd key verified in the on-chain 2-of-2 script, and a holder force-close, with
+  PSK links, encrypted shares and Party B allow-listing the wallet xpub. `e2e-tests/tests/mpc.rs`.
+- **Signet, funding-key coverage:** channels with Blink's staging LND node and a second LDK
+  Server; keysend sent, 20,000 sat received, 7,000 sat sent, restart with shares restored,
+  cooperative close and force close confirmed on-chain with the DKG'd keys in their witness
+  scripts. Log in [`docs/mpc-signet-demo.md`](docs/mpc-signet-demo.md).
+- **Latency, both parties on one machine:** commitment update 53 ms, with one HTLC 64 ms,
+  closing 47 ms; a payment adds roughly 110 to 130 ms. [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
+- **Tests:** `cargo test -p ldk-server-mpc` (DKG/sign/derivation, policy, secure transport,
+  service) and `cd e2e-tests && cargo test --test mpc -- --test-threads=1` (regtest,
+  downloads bitcoind).
 
-- **Out-of-the-Box Lightning Node**:
-    - Deploy a Lightning Network node with minimal configuration, no coding required.
+## Not yet covered
 
-- **API-First Design**:
-    - Exposes a well-defined gRPC API using Protobuf, allowing seamless integration with any language.
+- The on-chain wallet mnemonic is still on the LDK Server host. It is separate from the node
+  seed (`onchain_wallet_mnemonic_path`) and Party B only pays out to its addresses, so a host
+  compromise can force funds *into* the wallet but not elsewhere; moving on-chain signing
+  off-host is the remaining step.
+- Party B must run on separate infrastructure with its own operator to be a trust boundary.
+- HTLC-level accounting is not enforced; counterparty revocation notices are recorded, not
+  verified. The balance cap is a per-update delta, not a price-based rule.
+- The two cb-mpc derivation functions use cb-mpc's internal key representation and are outside
+  its public, bug-bounty-covered API.
+- Splicing and the full-coverage mode were not exercised on signet.
 
-- **Powered by LDK**:
-    - Built on top of LDK-Node, leveraging the modular, reliable, and high-performance architecture of LDK.
+## Where things are
 
-- **Effortless Integration**:
-    - Ideal for embedding Lightning functionality into payment processors, self-hosted nodes, custodial wallets, or other Lightning-enabled
-      applications.
+- [`ldk-server-mpc/`](ldk-server-mpc/): cb-mpc FFI, party service, client, policy, secure
+  transport. [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md) has the detailed design,
+  build steps (cb-mpc, custom OpenSSL, patched ldk-node) and security notes.
+- [`ldk-server/src/mpc_signer.rs`](ldk-server/src/mpc_signer.rs): the `ExternalChannelSigner`
+  implementation; `[mpc]` config in [`docs/configuration.md`](docs/configuration.md).
+- [`contrib/patches/`](contrib/patches/): the ldk-node patch (`ExternalChannelSigner`,
+  separate wallet entropy, `signer_unblocked` poke) and the cb-mpc derivation patch. The
+  workspace `Cargo.toml` expects the patched ldk-node at `../ldk-node` and cb-mpc at
+  `../cb-mpc`.
+- [`contrib/mpc-signet/`](contrib/mpc-signet/): signet config and party launch scripts.
 
-### Project Status
-
-**Work in Progress**:
-- APIs are under development. Expect breaking changes as the project evolves.
-- Not tested for production use.
-- We welcome your feedback and contributions to help shape the future of LDK Server!
-
-### Quick Start
+## Build and run
 
 ```bash
-git clone https://github.com/lightningdevkit/ldk-server.git
-cd ldk-server
-cargo build --release
-cp contrib/ldk-server-config.toml my-config.toml  # edit with your settings
-./target/release/ldk-server my-config.toml
+# one-time: cb-mpc (+ derivation patch) with its custom OpenSSL, and the patched ldk-node
+#           (see ldk-server-mpc/README.md)
+cargo build --release -p ldk-server -p ldk-server-cli -p ldk-server-mpc
+
+# Party A (creates the PSK / share key files if missing)
+target/release/ldk-server-mpc-party --role p1 --listen 127.0.0.1:7701 --peer 127.0.0.1:7702 \
+  --keystore mpc/a --auth-key-file mpc/client.psk --peer-auth-key-file mpc/peer.psk \
+  --share-key-file mpc/share-a.key
+# LDK Server on a FRESH storage dir with [mpc] party_address / coverage / auth_key_path and
+# [node] onchain_wallet_mnemonic_path; it writes <storage>/onchain_wallet_xpub
+target/release/ldk-server my-config.toml
+# Party B (on separate infrastructure) with the wallet xpub allow-listed
+target/release/ldk-server-mpc-party --role p2 --listen 127.0.0.1:7702 --keystore mpc/b \
+  --peer-auth-key-file mpc/peer.psk --share-key-file mpc/share-b.key \
+  --payout-xpub "$(cat <storage>/onchain_wallet_xpub)" --max-balance-decrease-sat 100000
 ```
 
-See [Getting Started](docs/getting-started.md) for a full walkthrough.
-
-### Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Getting Started](docs/getting-started.md) | Install, configure, and run your first node |
-| [Configuration](docs/configuration.md) | All config options, environment variables, and Bitcoin backend tradeoffs |
-| [API Guide](docs/api-guide.md) | gRPC transport, authentication, and endpoint reference |
-| [Tor](docs/tor.md) | Connecting to and receiving connections over Tor |
-| [Operations](docs/operations.md) | Production deployment, backups, and monitoring |
-
-### API
-
-The canonical API definitions are in [`ldk-server-grpc/src/proto/`](ldk-server-grpc/src/proto/). A ready-made
-Rust client library is provided in [`ldk-server-client/`](ldk-server-client/).
-
-### MCP Bridge
-
-The workspace also includes `ldk-server-mcp`, a stdio [Model Context Protocol](https://spec.modelcontextprotocol.io/) server
-that lets MCP-compatible clients call the unary `ldk-server` RPC surface as tools.
-
-Run it directly from the workspace:
-```bash
-cargo run -p ldk-server-mcp -- --config /path/to/config.toml
-```
-
-It is covered by both crate-local tests and an `e2e-tests` sanity suite against a live `ldk-server` instance.
-
-
-### MPC Channel Signing (Coinbase cb-mpc)
-
-This fork puts **every channel key** (funding, payment, delayed-payment, HTLC and revocation
-basepoints) and the per-commitment secrets under [Coinbase cb-mpc](https://github.com/coinbase/cb-mpc)
-two-party ECDSA. Two independent MPC processes each hold one share of every key; the complete
-private keys are never assembled. Party B holds the commitment seed and enforces a signing
-policy: it recomputes every sighash from the transaction it is given, checks key kinds and
-BOLT 3 derivations, keeps commitment numbers monotonic, releases per-commitment secrets only
-once a newer holder commitment was validated, tracks our balance in every commitment and
-caps how much it may drop per update, and only signs closes and sweeps that pay an
-allow-listed script (the wallet's xpub). Links are PSK-authenticated and encrypted; shares
-are encrypted at rest. All Lightning channel state stays in LDK Server / LDK Node. Details,
-build steps and remaining work are in [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md);
-measurements are in [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
-
-#### Architecture
+## Architecture
 
 ```mermaid
 flowchart TB
@@ -152,7 +136,7 @@ flowchart TB
   policy. It never sees LDK's database; everything it checks it recomputes from the
   transaction bytes in the request.
 
-#### Signing flow for one commitment update (funding signature + one HTLC signature)
+## Signing flow for one commitment update (funding signature + one HTLC signature)
 
 ```text
  LDK channel state machine        MpcChannelSigner           Party A (P1)                    Party B (P2)
@@ -180,7 +164,7 @@ flowchart TB
  release_commitment_secret(n+1) ─▶ ReleaseSecret{n+1} ──▶ forward ──▶ seed: allowed iff n+1 > validated(n)
 ```
 
-#### What is MPC-backed (`coverage = "all"`)
+## What is MPC-backed (`coverage = "all"`)
 
 | Key / operation                                        | Backing                                    |
 |--------------------------------------------------------|--------------------------------------------|
@@ -204,7 +188,7 @@ stall the node, and spend the on-chain wallet, whose mnemonic remains on the hos
 (`onchain_wallet_mnemonic_path` keeps it separate from the node seed; moving it off-host is
 the remaining step).
 
-#### Measured performance (Apple M4, both parties on one machine, cb-mpc `0b71670`)
+## Measured performance (Apple M4, both parties on one machine, cb-mpc `0b71670`)
 
 | Operation                                               | p50     | p95     | p99     | Throughput |
 |---------------------------------------------------------|---------|---------|---------|------------|
@@ -221,7 +205,7 @@ direct-channel BOLT11 payment adds roughly 110–130 ms of MPC time (two commitm
 each with the HTLC signature in parallel); on signet a 20,000 sat receive completed 164 ms
 after the send command. See [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
 
-#### Running it
+## Running it
 
 ```bash
 # one-time: build cb-mpc (+ derivation patch) and the patched ldk-node (see ldk-server-mpc/README.md)
@@ -240,6 +224,7 @@ transport and service tests) and `cd e2e-tests && cargo test --test mpc -- --tes
 cooperative close with a DKG'd key verified on-chain, force close; PSK links, encrypted
 shares and Party B allow-listing the wallet xpub).
 
-### Contributing
+## Upstream
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on building, testing, code style, and development workflow.
+Everything outside the files listed above is upstream LDK Server at commit 08316de (synced
+2026-10-07). See [lightningdevkit/ldk-server](https://github.com/lightningdevkit/ldk-server).
