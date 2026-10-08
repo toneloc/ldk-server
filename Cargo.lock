@@ -1517,7 +1517,9 @@ dependencies = [
  "bitcoin",
  "clap",
  "hex-conservative 0.2.2",
+ "lightning",
  "log",
+ "ring",
 ]
 
 [[package]]

@@ -205,25 +205,6 @@ direct-channel BOLT11 payment adds roughly 110–130 ms of MPC time (two commitm
 each with the HTLC signature in parallel); on signet a 20,000 sat receive completed 164 ms
 after the send command. See [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
 
-## Running it
-
-```bash
-# one-time: build cb-mpc (+ derivation patch) and the patched ldk-node (see ldk-server-mpc/README.md)
-cargo build --release -p ldk-server -p ldk-server-cli -p ldk-server-mpc
-contrib/mpc-signet/run-mpc-parties.sh                 # Party B then Party A, separate keystores
-target/release/ldk-server contrib/mpc-signet/ldk-server-signet-mpc.toml   # [mpc] party_address, coverage, auth_key_path
-```
-
-Production layout: Party A with `--auth-key-file`/`--peer-auth-key-file`/`--share-key-file`,
-LDK Server with `[mpc] auth_key_path` and `[node] onchain_wallet_mnemonic_path`, then Party B
-on separate infrastructure with the same peer PSK and `--payout-xpub $(cat <storage>/onchain_wallet_xpub)`.
-
-Tests: `cargo test -p ldk-server-mpc` (two-party DKG/sign/derivation, policy, secure
-transport and service tests) and `cd e2e-tests && cargo test --test mpc -- --test-threads=1`
-(regtest, full coverage: open with five DKGs, pay both ways, restart parties and server,
-cooperative close with a DKG'd key verified on-chain, force close; PSK links, encrypted
-shares and Party B allow-listing the wallet xpub).
-
 ## Upstream
 
 Everything outside the files listed above is upstream LDK Server at commit 08316de (synced
