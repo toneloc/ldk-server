@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ldk-server-cli", "ldk-server-client", "ldk-server-grpc", "ldk-server", "ldk-server-mcp", "ldk-server-macaroons"]
+members = ["ldk-server-cli", "ldk-server-client", "ldk-server-grpc", "ldk-server", "ldk-server-mcp", "ldk-server-macaroons", "ldk-server-mpc"]
 exclude = ["e2e-tests", "ldk-server-gui"]
 
 [profile.release]

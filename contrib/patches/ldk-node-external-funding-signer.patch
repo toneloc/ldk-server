@@ -1,0 +1,726 @@
+From 29e0793316030aaa3c585dc8a6259f627b4b558d Mon Sep 17 00:00:00 2001
+From: toneloc <3665696+toneloc@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 22:52:46 -0400
+Subject: [PATCH] Add ExternalFundingSigner hook for externally held channel
+ funding keys
+
+Introduces `signer::NodeChannelSigner`, a wrapper around LDK's
+`InMemorySigner` that routes the channel funding key (pubkey and all
+signatures made with it: commitment, closing, keyed anchor, channel
+announcement, splice shared input) to a pluggable
+`signer::ExternalFundingSigner`. All other channel keys stay locally
+derived. `Builder::set_external_funding_signer` enables it.
+
+Signers are restored via `SignerProvider::derive_channel_signer`, so no
+serialization changes are needed. Adds a `_test_utils` feature mirroring
+lightning's for the test-only signer method.
+
+AI tooling disclosure: written with Claude Code assistance.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Cargo.toml        |   2 +
+ src/builder.rs    |  36 +++-
+ src/lib.rs        |   1 +
+ src/signer.rs     | 442 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/types.rs      |   4 +-
+ src/wallet/mod.rs |  38 +++-
+ 6 files changed, 512 insertions(+), 11 deletions(-)
+ create mode 100644 src/signer.rs
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 453212a..ee78e39 100755
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -63,6 +63,8 @@ unified-payments = [
+ 	"dep:lightning-dns-resolver",
+ ]
+ uniffi = ["dep:uniffi"]
++# Enables the test-only signer methods required when `lightning/_test_utils` is on.
++_test_utils = ["lightning/_test_utils"]
+ uniffi-default = [
+ 	"uniffi",
+ 	"chain-esplora",
+diff --git a/src/builder.rs b/src/builder.rs
+index 0372e74..2f4776c 100644
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -90,7 +90,7 @@ use crate::io::{
+ };
+ use crate::liquidity::{LSPS2ServiceConfig, LiquiditySourceBuilder, LspConfig};
+ use crate::lnurl_auth::LnurlAuth;
+-use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
++use crate::logger::{log_debug, log_error, LdkLogger, LogLevel, LogWriter, Logger};
+ use crate::message_handler::NodeCustomMessageHandler;
+ use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
+ use crate::payment::forwarding_store::ForwardingStore;
+@@ -102,6 +102,7 @@ use crate::probing::{
+ 	RandomWalkStrategy,
+ };
+ use crate::runtime::{Runtime, RuntimeSpawner};
++use crate::signer::{ExternalFundingSigner, ExternalFundingSignerHandle};
+ use crate::tx_broadcaster::TransactionBroadcaster;
+ use crate::types::{
+ 	AsyncPersister, ChainMonitor, ChannelManager, DynStore, DynStoreRef, DynStoreWrapper,
+@@ -326,6 +327,7 @@ impl std::error::Error for BuildError {}
+ #[derive(Debug)]
+ pub struct NodeBuilder {
+ 	config: Config,
++	external_funding_signer: Option<ExternalFundingSignerHandle>,
+ 	chain_data_source_config: Option<ChainDataSourceConfig>,
+ 	gossip_source_config: Option<GossipSourceConfig>,
+ 	liquidity_source_config: Option<LiquiditySourceConfig>,
+@@ -365,6 +367,7 @@ impl NodeBuilder {
+ 			async_payments_role: None,
+ 			pathfinding_scores_sync_config,
+ 			probing_config,
++			external_funding_signer: None,
+ 		}
+ 	}
+ 
+@@ -699,6 +702,18 @@ impl NodeBuilder {
+ 		self
+ 	}
+ 
++	/// Routes channel funding keys and the signatures made with them to an external signer
++	/// (e.g. an MPC service). All other channel keys remain locally derived.
++	///
++	/// Only enable this on a fresh node: existing channels were set up with locally derived
++	/// funding keys and cannot be migrated.
++	pub fn set_external_funding_signer(
++		&mut self, signer: Arc<dyn ExternalFundingSigner>,
++	) -> &mut Self {
++		self.external_funding_signer = Some(ExternalFundingSignerHandle(signer));
++		self
++	}
++
+ 	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
+ 	/// previously configured.
+ 	#[cfg(feature = "storage-sqlite")]
+@@ -964,6 +979,7 @@ impl NodeBuilder {
+ 			self.pathfinding_scores_sync_config.as_ref(),
+ 			self.probing_config.as_ref(),
+ 			self.async_payments_role,
++			self.external_funding_signer.clone().map(|h| h.0),
+ 			seed_bytes,
+ 			runtime,
+ 			logger,
+@@ -1301,6 +1317,12 @@ impl Builder {
+ 	pub fn set_probing_config(&self, config: Arc<ProbingConfig>) {
+ 		self.inner.write().expect("lock").set_probing_config((*config).clone());
+ 	}
++
++	/// Routes channel funding keys and the signatures made with them to an external signer.
++	/// See [`NodeBuilder::set_external_funding_signer`].
++	pub fn set_external_funding_signer(&self, signer: Arc<dyn ExternalFundingSigner>) {
++		self.inner.write().expect("lock").set_external_funding_signer(signer);
++	}
+ }
+ 
+ #[cfg(all(feature = "uniffi", feature = "storage-sqlite"))]
+@@ -1512,7 +1534,8 @@ fn build_with_store_internal(
+ 	liquidity_source_config: Option<&LiquiditySourceConfig>,
+ 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
+ 	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
+-	seed_bytes: [u8; 64], runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
++	external_funding_signer: Option<Arc<dyn ExternalFundingSigner>>, seed_bytes: [u8; 64],
++	runtime: Arc<Runtime>, logger: Arc<Logger>, kv_store: Arc<DynStore>,
+ ) -> Result<Node, BuildError> {
+ 	optionally_install_rustls_cryptoprovider();
+ 
+@@ -1943,13 +1966,18 @@ fn build_with_store_internal(
+ 	})?;
+ 
+ 	let ldk_seed_bytes: [u8; 32] = xprv.private_key.secret_bytes();
+-	let keys_manager = Arc::new(KeysManager::new(
++	let mut keys_manager = KeysManager::new(
+ 		&ldk_seed_bytes,
+ 		cur_time.as_secs(),
+ 		cur_time.subsec_nanos(),
+ 		Arc::clone(&wallet),
+ 		Arc::clone(&logger),
+-	));
++	);
++	if let Some(signer) = external_funding_signer {
++		log_debug!(logger, "Channel funding keys are provided by an external funding signer");
++		keys_manager.set_external_funding_signer(signer);
++	}
++	let keys_manager = Arc::new(keys_manager);
+ 	let forwarding_store = Arc::new(ForwardingStore::new(
+ 		channel_forwarding_stats,
+ 		config.forwarded_payment_tracking_mode,
+diff --git a/src/lib.rs b/src/lib.rs
+index 6d13141..649d2e1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -112,6 +112,7 @@ mod peer_store;
+ pub mod probing;
+ mod runtime;
+ mod scoring;
++pub mod signer;
+ mod tx_broadcaster;
+ mod types;
+ mod util;
+diff --git a/src/signer.rs b/src/signer.rs
+new file mode 100644
+index 0000000..d4ce75a
+--- /dev/null
++++ b/src/signer.rs
+@@ -0,0 +1,442 @@
++// This file is Copyright its original authors, visible in version control history.
++//
++// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
++// http://opensource.org/licenses/MIT>, at your option. You may not copy, modify, or distribute
++// this file except in accordance with one or both of these licenses.
++
++//! Channel signer with an optionally externalized funding key.
++//!
++//! [`NodeChannelSigner`] wraps LDK's [`InMemorySigner`]. All channel keys (revocation,
++//! payment, delayed payment, HTLC basepoints and the per-commitment secrets) are derived and
++//! held locally exactly as before. If an [`ExternalFundingSigner`] is configured via
++//! [`Builder::set_external_funding_signer`], the channel **funding key** (the holder key in the
++//! 2-of-2 funding multisig) is instead provided and used for signing by that external signer,
++//! e.g. a 2-of-2 MPC service.
++//!
++//! Operations routed to the external funding signer:
++//! - `sign_counterparty_commitment` (funding signature only; HTLC signatures stay local)
++//! - `sign_holder_commitment`
++//! - `sign_closing_transaction`
++//! - `sign_holder_keyed_anchor_input`
++//! - `sign_channel_announcement_with_funding_key`
++//! - `sign_splice_shared_input`
++//! - `pubkeys` (funding pubkey) and `new_funding_pubkey` (spliced funding pubkey)
++//!
++//! Everything else is delegated to the inner [`InMemorySigner`].
++//!
++//! [`Builder::set_external_funding_signer`]: crate::Builder::set_external_funding_signer
++
++use std::sync::Arc;
++
++use bitcoin::hashes::{sha256d, Hash};
++use bitcoin::secp256k1::ecdsa::Signature;
++use bitcoin::secp256k1::{self, Message, PublicKey, Secp256k1, SecretKey};
++use bitcoin::{sighash, Amount, EcdsaSighashType, OutPoint, Transaction, Txid};
++use lightning::ln::chan_utils::{
++	self, ChannelPublicKeys, ChannelTransactionParameters, ClosingTransaction,
++	CommitmentTransaction, HTLCOutputInCommitment, HolderCommitmentTransaction,
++};
++use lightning::ln::msgs::UnsignedChannelAnnouncement;
++use lightning::sign::ecdsa::EcdsaChannelSigner;
++use lightning::sign::{ChannelSigner, HTLCDescriptor, InMemorySigner};
++use lightning::types::payment::PaymentPreimage;
++use lightning::util::ser::Writeable;
++
++/// Value of a keyed anchor output (BOLT 3). Mirrors `lightning::ln::chan_utils`'s private
++/// constant.
++const ANCHOR_OUTPUT_VALUE_SATOSHI: u64 = 330;
++
++/// The Lightning operation a funding-key signature is requested for.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum FundingSignOp {
++	/// Signing the counterparty's commitment transaction.
++	CounterpartyCommitment,
++	/// Signing our own (holder) commitment transaction, e.g. for a force-close.
++	HolderCommitment,
++	/// Signing a cooperative closing transaction.
++	ClosingTransaction,
++	/// Signing the spend of our keyed anchor output.
++	HolderKeyedAnchorInput,
++	/// Signing a `channel_announcement` gossip message.
++	ChannelAnnouncement,
++	/// Signing the shared (previous funding) input of a splice transaction.
++	SpliceSharedInput,
++}
++
++/// Informational context accompanying a funding-key signing request.
++///
++/// This is passed through to the external signer as metadata. It is produced by LDK and is
++/// not independently verified by anyone else; external signers must not treat it as proof
++/// that the signed transaction is safe.
++#[derive(Clone, Debug)]
++pub struct FundingSignContext {
++	/// The operation being signed.
++	pub op: FundingSignOp,
++	/// The channel's funding value.
++	pub channel_value_satoshis: u64,
++	/// The commitment number, for commitment transaction signatures.
++	pub commitment_number: Option<u64>,
++	/// The funding outpoint, if known.
++	pub funding_outpoint: Option<OutPoint>,
++	/// The parent funding txid, for spliced channels.
++	pub splice_parent_funding_txid: Option<Txid>,
++}
++
++/// An external holder of channel funding keys.
++///
++/// Implementations must be thread-safe and should bound how long they block: LDK invokes
++/// these from its own threads, sometimes while holding channel locks.
++pub trait ExternalFundingSigner: Send + Sync {
++	/// Returns the funding public key for the channel identified by `channel_keys_id`.
++	///
++	/// `splice_parent_funding_txid` is `None` for the channel's original funding key and
++	/// `Some` for the funding key of a spliced channel (see
++	/// [`ChannelSigner::new_funding_pubkey`]). The implementation may generate a fresh key
++	/// on first use and must return the same key on subsequent calls with the same arguments,
++	/// including across restarts.
++	fn funding_pubkey(
++		&self, channel_keys_id: [u8; 32], splice_parent_funding_txid: Option<Txid>,
++	) -> Result<PublicKey, ()>;
++
++	/// Produces an ECDSA signature over `msg` with the funding key identified by
++	/// `channel_keys_id` / `splice_parent_funding_txid`. The returned signature must be
++	/// low-S.
++	fn sign_with_funding_key(
++		&self, channel_keys_id: [u8; 32], splice_parent_funding_txid: Option<Txid>, msg: &Message,
++		context: &FundingSignContext,
++	) -> Result<Signature, ()>;
++}
++
++/// A shareable handle to an [`ExternalFundingSigner`].
++#[derive(Clone)]
++pub struct ExternalFundingSignerHandle(pub Arc<dyn ExternalFundingSigner>);
++
++impl std::fmt::Debug for ExternalFundingSignerHandle {
++	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++		f.write_str("ExternalFundingSignerHandle")
++	}
++}
++
++#[derive(Clone)]
++struct ExternalFunding {
++	signer: Arc<dyn ExternalFundingSigner>,
++	/// The (un-spliced) funding public key, fetched once at construction.
++	base_funding_pubkey: PublicKey,
++}
++
++/// LDK Node's channel signer: an [`InMemorySigner`] whose funding key may be externalized.
++#[derive(Clone)]
++pub struct NodeChannelSigner {
++	inner: InMemorySigner,
++	external: Option<ExternalFunding>,
++}
++
++impl NodeChannelSigner {
++	pub(crate) fn local(inner: InMemorySigner) -> Self {
++		NodeChannelSigner { inner, external: None }
++	}
++
++	pub(crate) fn with_external_funding(
++		inner: InMemorySigner, signer: Arc<dyn ExternalFundingSigner>,
++		base_funding_pubkey: PublicKey,
++	) -> Self {
++		NodeChannelSigner { inner, external: Some(ExternalFunding { signer, base_funding_pubkey }) }
++	}
++
++	/// Whether the funding key of this signer is held externally.
++	pub fn has_external_funding_key(&self) -> bool {
++		self.external.is_some()
++	}
++
++	fn sign_external(
++		&self, ext: &ExternalFunding, channel_parameters: &ChannelTransactionParameters,
++		msg: &Message, op: FundingSignOp, commitment_number: Option<u64>,
++	) -> Result<Signature, ()> {
++		let context = FundingSignContext {
++			op,
++			channel_value_satoshis: channel_parameters.channel_value_satoshis,
++			commitment_number,
++			funding_outpoint: channel_parameters
++				.funding_outpoint
++				.as_ref()
++				.map(|o| o.into_bitcoin_outpoint()),
++			splice_parent_funding_txid: channel_parameters.splice_parent_funding_txid,
++		};
++		ext.signer.sign_with_funding_key(
++			self.inner.channel_keys_id(),
++			channel_parameters.splice_parent_funding_txid,
++			msg,
++			&context,
++		)
++	}
++
++	fn funding_redeemscript(
++		channel_parameters: &ChannelTransactionParameters,
++	) -> bitcoin::ScriptBuf {
++		let counterparty = channel_parameters
++			.counterparty_pubkeys()
++			.expect("ChannelTransactionParameters must be populated before signing operations");
++		chan_utils::make_funding_redeemscript(
++			&channel_parameters.holder_pubkeys.funding_pubkey,
++			&counterparty.funding_pubkey,
++		)
++	}
++}
++
++impl ChannelSigner for NodeChannelSigner {
++	fn get_per_commitment_point(
++		&self, idx: u64, secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<PublicKey, ()> {
++		self.inner.get_per_commitment_point(idx, secp_ctx)
++	}
++
++	fn release_commitment_secret(&self, idx: u64) -> Result<[u8; 32], ()> {
++		self.inner.release_commitment_secret(idx)
++	}
++
++	fn validate_holder_commitment(
++		&self, holder_tx: &HolderCommitmentTransaction,
++		outbound_htlc_preimages: Vec<PaymentPreimage>,
++	) -> Result<(), ()> {
++		self.inner.validate_holder_commitment(holder_tx, outbound_htlc_preimages)
++	}
++
++	fn validate_counterparty_revocation(&self, idx: u64, secret: &SecretKey) -> Result<(), ()> {
++		self.inner.validate_counterparty_revocation(idx, secret)
++	}
++
++	fn pubkeys(&self, secp_ctx: &Secp256k1<secp256k1::All>) -> ChannelPublicKeys {
++		let mut pubkeys = self.inner.pubkeys(secp_ctx);
++		if let Some(ext) = &self.external {
++			pubkeys.funding_pubkey = ext.base_funding_pubkey;
++		}
++		pubkeys
++	}
++
++	fn new_funding_pubkey(
++		&self, splice_parent_funding_txid: Txid, secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> PublicKey {
++		match &self.external {
++			Some(ext) => ext
++				.signer
++				.funding_pubkey(self.inner.channel_keys_id(), Some(splice_parent_funding_txid))
++				.unwrap_or_else(|_| {
++					panic!(
++						"External funding signer failed to provide a spliced funding pubkey for channel keys id {:?}",
++						self.inner.channel_keys_id()
++					)
++				}),
++			None => self.inner.new_funding_pubkey(splice_parent_funding_txid, secp_ctx),
++		}
++	}
++
++	fn channel_keys_id(&self) -> [u8; 32] {
++		self.inner.channel_keys_id()
++	}
++}
++
++impl EcdsaChannelSigner for NodeChannelSigner {
++	fn sign_counterparty_commitment(
++		&self, channel_parameters: &ChannelTransactionParameters,
++		commitment_tx: &CommitmentTransaction, inbound_htlc_preimages: Vec<PaymentPreimage>,
++		outbound_htlc_preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<(Signature, Vec<Signature>), ()> {
++		// The inner signer computes the HTLC signatures with the locally held HTLC key. Its
++		// funding signature is made with an unused local key and is discarded below.
++		let (local_funding_sig, htlc_sigs) = self.inner.sign_counterparty_commitment(
++			channel_parameters,
++			commitment_tx,
++			inbound_htlc_preimages,
++			outbound_htlc_preimages,
++			secp_ctx,
++		)?;
++		let Some(ext) = &self.external else {
++			return Ok((local_funding_sig, htlc_sigs));
++		};
++		let redeemscript = Self::funding_redeemscript(channel_parameters);
++		let sighash = commitment_tx
++			.trust()
++			.built_transaction()
++			.get_sighash_all(&redeemscript, channel_parameters.channel_value_satoshis);
++		let sig = self.sign_external(
++			ext,
++			channel_parameters,
++			&sighash,
++			FundingSignOp::CounterpartyCommitment,
++			Some(commitment_tx.commitment_number()),
++		)?;
++		Ok((sig, htlc_sigs))
++	}
++
++	fn sign_holder_commitment(
++		&self, channel_parameters: &ChannelTransactionParameters,
++		commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		let Some(ext) = &self.external else {
++			return self.inner.sign_holder_commitment(channel_parameters, commitment_tx, secp_ctx);
++		};
++		let redeemscript = Self::funding_redeemscript(channel_parameters);
++		let sighash = commitment_tx
++			.trust()
++			.built_transaction()
++			.get_sighash_all(&redeemscript, channel_parameters.channel_value_satoshis);
++		self.sign_external(
++			ext,
++			channel_parameters,
++			&sighash,
++			FundingSignOp::HolderCommitment,
++			Some(commitment_tx.commitment_number()),
++		)
++	}
++
++	#[cfg(any(test, feature = "_test_utils"))]
++	fn unsafe_sign_holder_commitment(
++		&self, channel_parameters: &ChannelTransactionParameters,
++		commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		self.sign_holder_commitment(channel_parameters, commitment_tx, secp_ctx)
++	}
++
++	fn sign_justice_revoked_output(
++		&self, channel_parameters: &ChannelTransactionParameters, justice_tx: &Transaction,
++		input: usize, amount: u64, per_commitment_key: &SecretKey,
++		secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		self.inner.sign_justice_revoked_output(
++			channel_parameters,
++			justice_tx,
++			input,
++			amount,
++			per_commitment_key,
++			secp_ctx,
++		)
++	}
++
++	fn sign_justice_revoked_htlc(
++		&self, channel_parameters: &ChannelTransactionParameters, justice_tx: &Transaction,
++		input: usize, amount: u64, per_commitment_key: &SecretKey, htlc: &HTLCOutputInCommitment,
++		secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		self.inner.sign_justice_revoked_htlc(
++			channel_parameters,
++			justice_tx,
++			input,
++			amount,
++			per_commitment_key,
++			htlc,
++			secp_ctx,
++		)
++	}
++
++	fn sign_holder_htlc_transaction(
++		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
++		secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		self.inner.sign_holder_htlc_transaction(htlc_tx, input, htlc_descriptor, secp_ctx)
++	}
++
++	fn sign_counterparty_htlc_transaction(
++		&self, channel_parameters: &ChannelTransactionParameters, htlc_tx: &Transaction,
++		input: usize, amount: u64, per_commitment_point: &PublicKey, htlc: &HTLCOutputInCommitment,
++		secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		self.inner.sign_counterparty_htlc_transaction(
++			channel_parameters,
++			htlc_tx,
++			input,
++			amount,
++			per_commitment_point,
++			htlc,
++			secp_ctx,
++		)
++	}
++
++	fn sign_closing_transaction(
++		&self, channel_parameters: &ChannelTransactionParameters, closing_tx: &ClosingTransaction,
++		secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		let Some(ext) = &self.external else {
++			return self.inner.sign_closing_transaction(channel_parameters, closing_tx, secp_ctx);
++		};
++		let redeemscript = Self::funding_redeemscript(channel_parameters);
++		let sighash = closing_tx
++			.trust()
++			.get_sighash_all(&redeemscript, channel_parameters.channel_value_satoshis);
++		self.sign_external(
++			ext,
++			channel_parameters,
++			&sighash,
++			FundingSignOp::ClosingTransaction,
++			None,
++		)
++	}
++
++	fn sign_holder_keyed_anchor_input(
++		&self, chan_params: &ChannelTransactionParameters, anchor_tx: &Transaction, input: usize,
++		secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		let Some(ext) = &self.external else {
++			return self.inner.sign_holder_keyed_anchor_input(
++				chan_params,
++				anchor_tx,
++				input,
++				secp_ctx,
++			);
++		};
++		let witness_script =
++			chan_utils::get_keyed_anchor_redeemscript(&chan_params.holder_pubkeys.funding_pubkey);
++		let amt = Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI);
++		let sighash = sighash::SighashCache::new(anchor_tx)
++			.p2wsh_signature_hash(input, &witness_script, amt, EcdsaSighashType::All)
++			.map_err(|_| ())?;
++		let msg = Message::from_digest(sighash.to_byte_array());
++		self.sign_external(ext, chan_params, &msg, FundingSignOp::HolderKeyedAnchorInput, None)
++	}
++
++	fn sign_channel_announcement_with_funding_key(
++		&self, channel_parameters: &ChannelTransactionParameters,
++		msg: &UnsignedChannelAnnouncement, secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		let Some(ext) = &self.external else {
++			return self.inner.sign_channel_announcement_with_funding_key(
++				channel_parameters,
++				msg,
++				secp_ctx,
++			);
++		};
++		let msghash = Message::from_digest(sha256d::Hash::hash(&msg.encode()[..]).to_byte_array());
++		self.sign_external(
++			ext,
++			channel_parameters,
++			&msghash,
++			FundingSignOp::ChannelAnnouncement,
++			None,
++		)
++	}
++
++	fn sign_splice_shared_input(
++		&self, channel_parameters: &ChannelTransactionParameters, tx: &Transaction,
++		input_index: usize, secp_ctx: &Secp256k1<secp256k1::All>,
++	) -> Result<Signature, ()> {
++		let Some(ext) = &self.external else {
++			return self.inner.sign_splice_shared_input(
++				channel_parameters,
++				tx,
++				input_index,
++				secp_ctx,
++			);
++		};
++		let redeemscript = Self::funding_redeemscript(channel_parameters);
++		let sighash = sighash::SighashCache::new(tx)
++			.p2wsh_signature_hash(
++				input_index,
++				&redeemscript,
++				Amount::from_sat(channel_parameters.channel_value_satoshis),
++				EcdsaSighashType::All,
++			)
++			.map_err(|_| ())?;
++		let msg = Message::from_digest(sighash.to_byte_array());
++		self.sign_external(ext, channel_parameters, &msg, FundingSignOp::SpliceSharedInput, None)
++	}
++}
+diff --git a/src/types.rs b/src/types.rs
+index fd86d1b..f53e02c 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -10,6 +10,7 @@ use std::future::Future;
+ use std::pin::Pin;
+ use std::sync::{Arc, Mutex};
+ 
++use crate::signer::NodeChannelSigner;
+ use bitcoin::secp256k1::PublicKey;
+ use bitcoin::{OutPoint, ScriptBuf};
+ use lightning::chain::chainmonitor;
+@@ -24,7 +25,6 @@ use lightning::onion_message::dns_resolution::DNSResolverMessageHandler;
+ use lightning::routing::gossip;
+ use lightning::routing::router::DefaultRouter;
+ use lightning::routing::scoring::{CombinedScorer, ProbabilisticScoringFeeParameters};
+-use lightning::sign::InMemorySigner;
+ use lightning::util::persist::{
+ 	KVStore, MonitorUpdatingPersisterAsync, PageToken, PaginatedKVStore, PaginatedListResponse,
+ };
+@@ -217,7 +217,7 @@ pub(crate) type AsyncPersister = MonitorUpdatingPersisterAsync<
+ >;
+ 
+ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
+-	InMemorySigner,
++	NodeChannelSigner,
+ 	Arc<ChainSource>,
+ 	Arc<Broadcaster>,
+ 	Arc<OnchainFeeEstimator>,
+diff --git a/src/wallet/mod.rs b/src/wallet/mod.rs
+index 3e43398..804e2c9 100644
+--- a/src/wallet/mod.rs
++++ b/src/wallet/mod.rs
+@@ -43,8 +43,8 @@ use lightning::ln::msgs::UnsignedGossipMessage;
+ use lightning::ln::script::ShutdownScript;
+ use lightning::ln::types::ChannelId;
+ use lightning::sign::{
+-	ChangeDestinationSource, EntropySource, InMemorySigner, KeysManager, NodeSigner, OutputSpender,
+-	PeerStorageKey, Recipient, SignerProvider, SpendableOutputDescriptor,
++	ChangeDestinationSource, EntropySource, KeysManager, NodeSigner, OutputSpender, PeerStorageKey,
++	Recipient, SignerProvider, SpendableOutputDescriptor,
+ };
+ use lightning::util::message_signing;
+ use lightning::util::wallet_utils::{
+@@ -66,6 +66,7 @@ use crate::payment::{
+ 	PendingPaymentDetails, TransactionType,
+ };
+ use crate::runtime::Runtime;
++use crate::signer::{ExternalFundingSigner, NodeChannelSigner};
+ use crate::types::{Broadcaster, PaymentStore, PendingPaymentStore};
+ use crate::{ChainSource, Error};
+ 
+@@ -2468,6 +2469,7 @@ pub(crate) struct WalletKeysManager {
+ 	inner: KeysManager,
+ 	wallet: Arc<Wallet>,
+ 	logger: Arc<Logger>,
++	external_funding_signer: Option<Arc<dyn ExternalFundingSigner>>,
+ }
+ 
+ impl WalletKeysManager {
+@@ -2480,7 +2482,12 @@ impl WalletKeysManager {
+ 		logger: Arc<Logger>,
+ 	) -> Self {
+ 		let inner = KeysManager::new(seed, starting_time_secs, starting_time_nanos, true);
+-		Self { inner, wallet, logger }
++		Self { inner, wallet, logger, external_funding_signer: None }
++	}
++
++	/// Routes channel funding keys (and the signatures made with them) to `signer`.
++	pub fn set_external_funding_signer(&mut self, signer: Arc<dyn ExternalFundingSigner>) {
++		self.external_funding_signer = Some(signer);
+ 	}
+ 
+ 	pub fn sign_message(&self, msg: &[u8]) -> String {
+@@ -2564,14 +2571,35 @@ impl EntropySource for WalletKeysManager {
+ }
+ 
+ impl SignerProvider for WalletKeysManager {
+-	type EcdsaSigner = InMemorySigner;
++	type EcdsaSigner = NodeChannelSigner;
+ 
+ 	fn generate_channel_keys_id(&self, inbound: bool, user_channel_id: u128) -> [u8; 32] {
+ 		self.inner.generate_channel_keys_id(inbound, user_channel_id)
+ 	}
+ 
+ 	fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
+-		self.inner.derive_channel_signer(channel_keys_id)
++		let inner = self.inner.derive_channel_signer(channel_keys_id);
++		match &self.external_funding_signer {
++			None => NodeChannelSigner::local(inner),
++			Some(signer) => match signer.funding_pubkey(channel_keys_id, None) {
++				Ok(funding_pubkey) => NodeChannelSigner::with_external_funding(
++					inner,
++					Arc::clone(signer),
++					funding_pubkey,
++				),
++				Err(()) => {
++					// Without the funding key we cannot construct a usable signer, and LDK
++					// offers no way to report failure here. Abort rather than continue with
++					// a signer whose funding key would not match the channel's.
++					log_error!(
++						self.logger,
++						"External funding signer failed to provide the funding pubkey for channel keys id {:?}",
++						channel_keys_id
++					);
++					panic!("External funding signer unavailable: cannot derive channel signer");
++				},
++			},
++		}
+ 	}
+ 
+ 	fn get_destination_script(&self, _channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
+-- 
+2.50.1 (Apple Git-155)
+

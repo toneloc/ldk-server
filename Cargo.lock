@@ -1511,6 +1511,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ldk-server-mpc"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "clap",
+ "hex-conservative 0.2.2",
+ "log",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.177"
 source = "registry+https://github.com/rust-lang/crates.io-index"

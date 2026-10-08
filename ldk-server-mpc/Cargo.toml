@@ -1,0 +1,26 @@
+[package]
+name = "ldk-server-mpc"
+version = "0.1.0"
+authors = ["Tony Giorgio <tony@stablechannels.com>"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Coinbase cb-mpc 2-of-2 ECDSA signing service and client for LDK Server channel funding keys."
+repository = "https://github.com/lightningdevkit/ldk-server/"
+readme = "README.md"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "ldk-server-mpc-party"
+path = "src/bin/party.rs"
+
+[[bin]]
+name = "ldk-server-mpc-bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+bitcoin = { version = "0.32", default-features = false, features = ["std", "rand-std"] }
+hex-conservative = { version = "0.2", default-features = false, features = ["std"] }
+log = { version = "0.4", features = ["std"] }
+clap = { version = "4.0.5", default-features = false, features = ["derive", "std", "error-context", "suggestions", "help", "env"] }
