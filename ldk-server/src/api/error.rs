@@ -47,6 +47,9 @@ pub(crate) enum LdkServerErrorCode {
 	/// Please refer to [`protos::error::ErrorCode::AuthError`].
 	AuthError,
 
+	/// The request was authenticated, but the key does not have the required permission.
+	AuthorizationError,
+
 	/// Please refer to [`protos::error::ErrorCode::LightningError`].
 	LightningError,
 
@@ -59,6 +62,7 @@ impl fmt::Display for LdkServerErrorCode {
 		match self {
 			LdkServerErrorCode::InvalidRequestError => write!(f, "InvalidRequestError"),
 			LdkServerErrorCode::AuthError => write!(f, "AuthError"),
+			LdkServerErrorCode::AuthorizationError => write!(f, "AuthorizationError"),
 			LdkServerErrorCode::LightningError => write!(f, "LightningError"),
 			LdkServerErrorCode::InternalServerError => write!(f, "InternalServerError"),
 		}
@@ -72,9 +76,12 @@ impl From<NodeError> for LdkServerError {
 			| NodeError::InvalidSocketAddress
 			| NodeError::InvalidPublicKey
 			| NodeError::InvalidSecretKey
+			| NodeError::InvalidMnemonic
 			| NodeError::InvalidOfferId
 			| NodeError::InvalidNodeId
 			| NodeError::InvalidPaymentId
+			| NodeError::InvalidForwardedPaymentId
+			| NodeError::InvalidChannelPairForwardingStatsId
 			| NodeError::InvalidPaymentHash
 			| NodeError::InvalidPaymentPreimage
 			| NodeError::InvalidPaymentSecret
@@ -89,11 +96,14 @@ impl From<NodeError> for LdkServerError {
 			| NodeError::InvalidNodeAlias
 			| NodeError::InvalidDateTime
 			| NodeError::InvalidFeeRate
+			| NodeError::InvalidPageToken
 			| NodeError::UriParameterParsingFailed
 			| NodeError::InvalidBlindedPaths
-			| NodeError::AsyncPaymentServicesDisabled
-			| NodeError::InvalidScriptPubKey
-			| NodeError::HrnParsingFailed => (error.to_string(), LdkServerErrorCode::InvalidRequestError),
+			| NodeError::InvalidPayerProof
+			| NodeError::PayerProofCreationFailed
+			| NodeError::AsyncPaymentServicesDisabled => {
+				(error.to_string(), LdkServerErrorCode::InvalidRequestError)
+			},
 			NodeError::ConnectionFailed
 			| NodeError::InvoiceCreationFailed
 			| NodeError::InvoiceRequestCreationFailed
@@ -109,6 +119,7 @@ impl From<NodeError> for LdkServerError {
 			| NodeError::DuplicatePayment
 			| NodeError::InsufficientFunds
 			| NodeError::UnsupportedCurrency
+			| NodeError::HrnParsingFailed
 			| NodeError::LiquidityFeeTooHigh => (error.to_string(), LdkServerErrorCode::LightningError),
 			NodeError::AlreadyRunning
 			| NodeError::NotRunning
@@ -124,8 +135,25 @@ impl From<NodeError> for LdkServerError {
 			| NodeError::OnchainTxCreationFailed
 			| NodeError::OnchainTxSigningFailed
 			| NodeError::TxSyncFailed
+			| NodeError::InvalidScriptPubKey
+			| NodeError::LnurlAuthFailed
+			| NodeError::LnurlAuthTimeout
+			| NodeError::InvalidLnurl
+			| NodeError::ChainSourceNotSupported
 			| NodeError::TxSyncTimeout => (error.to_string(), LdkServerErrorCode::InternalServerError),
 		};
 		LdkServerError::new(error_code, message)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn payer_proof_creation_failure_is_invalid_request() {
+		let error = LdkServerError::from(NodeError::PayerProofCreationFailed);
+
+		assert_eq!(error.error_code, LdkServerErrorCode::InvalidRequestError);
 	}
 }

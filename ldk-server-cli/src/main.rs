@@ -7,84 +7,114 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+use std::fmt::Write;
 use std::path::PathBuf;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use config::{
-	api_key_path_for_storage_dir, cert_path_for_storage_dir, get_default_api_key_path,
-	get_default_cert_path, get_default_config_path, load_config,
-};
-use hex_conservative::DisplayHex;
+use hex_conservative::{DisplayHex, FromHex};
 use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::config::{
+	get_default_config_path, load_config, read_tls_certificate, resolve_base_url,
+	resolve_cert_path, resolve_macaroon, resolve_macaroon_path, Config,
+	DEFAULT_GRPC_SERVICE_ADDRESS,
+};
 use ldk_server_client::error::LdkServerError;
 use ldk_server_client::error::LdkServerErrorCode::{
-	AuthError, InternalError, InternalServerError, InvalidRequestError, LightningError,
+	AuthError, AuthorizationError, InternalError, InternalServerError, InvalidRequestError,
+	LightningError,
 };
-use ldk_server_client::ldk_server_protos::api::{
-	Bolt11ReceiveRequest, Bolt11ReceiveResponse, Bolt11SendRequest, Bolt11SendResponse,
-	Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRequest, Bolt12SendResponse,
-	CloseChannelRequest, CloseChannelResponse, ConnectPeerRequest, ConnectPeerResponse,
-	DisconnectPeerRequest, DisconnectPeerResponse, ExportPathfindingScoresRequest,
-	ForceCloseChannelRequest, ForceCloseChannelResponse, GetBalancesRequest, GetBalancesResponse,
+use ldk_server_client::ldk_server_grpc::api::{
+	onchain_send_request, open_channel_request, splice_in_request, AllFunds,
+	Bolt11ClaimForIdRequest, Bolt11ClaimForIdResponse, Bolt11FailForIdRequest,
+	Bolt11FailForIdResponse, Bolt11ReceiveForHashRequest, Bolt11ReceiveForHashResponse,
+	Bolt11ReceiveRequest, Bolt11ReceiveResponse,
+	Bolt11ReceiveVariableAmountViaJitChannelForHashRequest,
+	Bolt11ReceiveVariableAmountViaJitChannelForHashResponse,
+	Bolt11ReceiveVariableAmountViaJitChannelRequest,
+	Bolt11ReceiveVariableAmountViaJitChannelResponse, Bolt11ReceiveViaJitChannelForHashRequest,
+	Bolt11ReceiveViaJitChannelForHashResponse, Bolt11ReceiveViaJitChannelRequest,
+	Bolt11ReceiveViaJitChannelResponse, Bolt11SendRequest, Bolt11SendResponse,
+	Bolt11SendUnderpayingRequest, Bolt11SendUnderpayingResponse, Bolt12CreatePayerProofRequest,
+	Bolt12CreatePayerProofResponse, Bolt12ReceiveRefundRequest, Bolt12ReceiveRefundResponse,
+	Bolt12ReceiveRequest, Bolt12ReceiveResponse, Bolt12SendRefundRequest, Bolt12SendRefundResponse,
+	Bolt12SendRequest, Bolt12SendResponse, BumpChannelFundingFeeRequest,
+	BumpChannelFundingFeeResponse, CloseChannelRequest, CloseChannelResponse, ConnectPeerRequest,
+	ConnectPeerResponse, CreateMacaroonRequest, CreateMacaroonResponse, DecodeInvoiceRequest,
+	DecodeInvoiceResponse, DecodeOfferRequest, DecodeOfferResponse, DisconnectPeerRequest,
+	DisconnectPeerResponse, ExportPathfindingScoresRequest, ForceCloseChannelRequest,
+	ForceCloseChannelResponse, GetBalancesRequest, GetBalancesResponse,
+	GetChannelForwardingStatsRequest, GetChannelForwardingStatsResponse,
+	GetForwardedPaymentDetailsRequest, GetForwardedPaymentDetailsResponse,
+	GetForwardedPaymentTrackingModeRequest, GetForwardedPaymentTrackingModeResponse,
 	GetNodeInfoRequest, GetNodeInfoResponse, GetPaymentDetailsRequest, GetPaymentDetailsResponse,
-	GraphGetChannelRequest, GraphGetChannelResponse, GraphGetNodeRequest, GraphGetNodeResponse,
-	GraphListChannelsRequest, GraphListChannelsResponse, GraphListNodesRequest,
-	GraphListNodesResponse, ListChannelsRequest, ListChannelsResponse,
-	ListForwardedPaymentsRequest, ListPaymentsRequest, OnchainReceiveRequest,
-	OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse, OpenChannelRequest,
-	OpenChannelResponse, SignMessageRequest, SignMessageResponse, SpliceInRequest,
-	SpliceInResponse, SpliceOutRequest, SpliceOutResponse, SpontaneousSendRequest,
-	SpontaneousSendResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
+	GetPermissionsRequest, GetPermissionsResponse, GraphGetChannelRequest, GraphGetChannelResponse,
+	GraphGetNodeRequest, GraphGetNodeResponse, GraphListChannelsRequest, GraphListChannelsResponse,
+	GraphListNodesRequest, GraphListNodesResponse, ListChannelForwardingStatsRequest,
+	ListChannelPairForwardingStatsRequest, ListChannelsRequest, ListChannelsResponse,
+	ListForwardedPaymentsRequest, ListMacaroonsRequest, ListMacaroonsResponse, ListPaymentsRequest,
+	ListPeersRequest, ListPeersResponse, OnchainBumpFeeRequest, OnchainBumpFeeResponse,
+	OnchainReceiveRequest, OnchainReceiveResponse, OnchainSendRequest, OnchainSendResponse,
+	OpenChannelRequest, OpenChannelResponse, RevokeMacaroonRequest, RevokeMacaroonResponse,
+	SignMessageRequest, SignMessageResponse, SpliceInRequest, SpliceInResponse, SpliceOutRequest,
+	SpliceOutResponse, SpontaneousSendRequest, SpontaneousSendResponse, UnifiedSendRequest,
+	UnifiedSendResponse, UpdateChannelConfigRequest, UpdateChannelConfigResponse,
 	VerifySignatureRequest, VerifySignatureResponse,
 };
-use ldk_server_client::ldk_server_protos::types::{
-	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig, PageToken,
-	RouteParametersConfig,
+use ldk_server_client::ldk_server_grpc::permissions::MacaroonPreset;
+use ldk_server_client::ldk_server_grpc::types::{
+	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelConfig, CustomTlvRecord,
+	PayerProofOptions, RouteParametersConfig,
+};
+use ldk_server_client::{
+	DEFAULT_EXPIRY_SECS, DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF, DEFAULT_MAX_PATH_COUNT,
+	DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
 use types::{
-	Amount, CliListForwardedPaymentsResponse, CliListPaymentsResponse, CliPaginatedResponse,
+	Amount, AmountOrAll, CliListForwardedPaymentsResponse, CliListPaymentsResponse,
+	CliPaginatedResponse, Preimage,
 };
 
-mod config;
+mod pay_wait;
 mod types;
 
-// Having these default values as constants in the Proto file and
-// importing/reusing them here might be better, but Proto3 removed
-// the ability to set default values.
-const DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA: u32 = 1008;
-const DEFAULT_MAX_PATH_COUNT: u32 = 10;
-const DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF: u32 = 2;
-const DEFAULT_EXPIRY_SECS: u32 = 86_400;
+const FULL_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
+
+const DEFAULT_DIR: &str = if cfg!(target_os = "macos") {
+	"~/Library/Application Support/ldk-server"
+} else if cfg!(target_os = "windows") {
+	"%APPDATA%\\ldk-server"
+} else {
+	"~/.ldk-server"
+};
 
 #[derive(Parser, Debug)]
 #[command(
 	name = "ldk-server-cli",
-	version,
+	version = FULL_VERSION,
 	about = "CLI for interacting with an LDK Server node",
 	override_usage = "ldk-server-cli [OPTIONS] <COMMAND>"
 )]
 struct Cli {
-	#[arg(short, long, help = "Base URL of the server. If not provided, reads from config file")]
+	#[arg(
+		short,
+		long,
+		help = format!(
+			"Base URL of the server. Defaults to config file or {DEFAULT_GRPC_SERVICE_ADDRESS}"
+		)
+	)]
 	base_url: Option<String>,
 
-	#[arg(
-		short,
-		long,
-		help = "API key for authentication. Defaults by reading ~/.ldk-server/[network]/api_key"
-	)]
-	api_key: Option<String>,
+	#[arg(short, long, help = format!("Hex macaroon. Defaults to the token in {DEFAULT_DIR}/[network]/macaroons/admin.macaroon"))]
+	macaroon: Option<String>,
 
-	#[arg(
-		short,
-		long,
-		help = "Path to the server's TLS certificate file (PEM format). Defaults to ~/.ldk-server/tls.crt"
-	)]
+	#[arg(short, long, help = format!("Path to the server's TLS certificate file (PEM format). Defaults to {DEFAULT_DIR}/tls.crt"))]
 	tls_cert: Option<String>,
 
-	#[arg(short, long, help = "Path to config file. Defaults to ~/.ldk-server/config.toml")]
+	#[arg(short, long, help = format!("Path to config file. Defaults to {DEFAULT_DIR}/config.toml"))]
 	config: Option<String>,
 
 	#[command(subcommand)]
@@ -104,17 +134,24 @@ enum Commands {
 		#[arg(help = "The address to send coins to")]
 		address: String,
 		#[arg(
-			help = "The amount to send, e.g. 50sat or 50000msat, must be a whole sat amount, cannot send msats on-chain. Will respect any on-chain reserve needed for anchor channels"
+			help = "The amount to send, e.g. 50sat or 50000msat, or 'all' to use all available on-chain funds. Exact amounts must be a whole sat amount. Will respect any on-chain reserve needed for anchor channels"
 		)]
-		amount: Option<Amount>,
-		#[arg(
-			long,
-			help = "Send full balance to the address. Warning: will not retain on-chain reserves for anchor channels"
-		)]
-		send_all: Option<bool>,
+		amount: AmountOrAll,
 		#[arg(
 			long,
 			help = "Fee rate in satoshis per virtual byte. If not set, a reasonable estimate will be used"
+		)]
+		fee_rate_sat_per_vb: Option<u64>,
+	},
+	#[command(about = "Replace an unconfirmed outbound on-chain payment using RBF")]
+	OnchainBumpFee {
+		#[arg(
+			help = "Payment ID from list-payments: 32 bytes encoded as hex, not the transaction ID"
+		)]
+		payment_id: String,
+		#[arg(
+			long,
+			help = "Absolute fee rate in sat/vB, not an increment. Must be positive and high enough for RBF. If omitted, LDK Node selects the rate"
 		)]
 		fee_rate_sat_per_vb: Option<u64>,
 	},
@@ -134,6 +171,120 @@ enum Commands {
 		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
 		expiry_secs: Option<u32>,
 	},
+	#[command(
+		about = "Create a BOLT11 hodl invoice for a given payment hash (manual claim required)"
+	)]
+	Bolt11ReceiveForHash {
+		#[arg(help = "The hex-encoded 32-byte payment hash")]
+		payment_hash: String,
+		#[arg(
+			help = "Amount to request, e.g. 50sat or 50000msat. If unset, a variable-amount invoice is returned"
+		)]
+		amount: Option<Amount>,
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+	},
+	#[command(about = "Claim a held payment by providing the preimage")]
+	Bolt11ClaimForId {
+		#[arg(help = "The hex-encoded 32-byte payment ID from PaymentClaimable")]
+		payment_id: String,
+		#[arg(help = "The hex-encoded 32-byte payment preimage")]
+		preimage: String,
+		#[arg(
+			short,
+			long,
+			help = "The amount from PaymentClaimable, e.g. 50sat or 50000msat. Used for a lower-bound check, not an exact amount check; validate the event amount before claiming"
+		)]
+		claimable_amount: Option<Amount>,
+	},
+	#[command(about = "Fail/reject a held payment")]
+	Bolt11FailForId {
+		#[arg(help = "The hex-encoded 32-byte payment ID from PaymentClaimable")]
+		payment_id: String,
+	},
+	#[command(about = "Create a fixed-amount BOLT11 invoice to receive via an LSPS2 JIT channel")]
+	Bolt11ReceiveViaJitChannel {
+		#[arg(help = "Amount to request, e.g. 50sat or 50000msat")]
+		amount: Amount,
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum total fee an LSP may deduct for opening the JIT channel, e.g. 50sat or 50000msat"
+		)]
+		max_total_lsp_fee_limit: Option<Amount>,
+	},
+	#[command(
+		about = "Create a variable-amount BOLT11 invoice to receive via an LSPS2 JIT channel"
+	)]
+	Bolt11ReceiveVariableAmountViaJitChannel {
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+		#[arg(long, help = "Maximum proportional fee the LSP may deduct in ppm-msat")]
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
+	},
+	#[command(
+		about = "Create a fixed-amount BOLT11 invoice to receive via an LSPS2 JIT channel for a given payment hash (manual claim required)"
+	)]
+	Bolt11ReceiveViaJitChannelForHash {
+		#[arg(help = "The hex-encoded 32-byte payment hash")]
+		payment_hash: String,
+		#[arg(help = "Amount to request, e.g. 50sat or 50000msat")]
+		amount: Amount,
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum total fee an LSP may deduct for opening the JIT channel, e.g. 50sat or 50000msat"
+		)]
+		max_total_lsp_fee_limit: Option<Amount>,
+	},
+	#[command(
+		about = "Create a variable-amount BOLT11 invoice to receive via an LSPS2 JIT channel for a given payment hash (manual claim required)"
+	)]
+	Bolt11ReceiveVariableAmountViaJitChannelForHash {
+		#[arg(help = "The hex-encoded 32-byte payment hash")]
+		payment_hash: String,
+		#[arg(short, long, help = "Description to attach along with the invoice")]
+		description: Option<String>,
+		#[arg(
+			long,
+			help = "SHA-256 hash of the description (hex). Use instead of description for longer text"
+		)]
+		description_hash: Option<String>,
+		#[arg(short, long, help = "Invoice expiry time in seconds (default: 86400)")]
+		expiry_secs: Option<u32>,
+		#[arg(long, help = "Maximum proportional fee the LSP may deduct in ppm-msat")]
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
+	},
 	#[command(about = "Pay a BOLT11 invoice")]
 	Bolt11Send {
 		#[arg(help = "A BOLT11 invoice for a payment within the Lightning Network")]
@@ -142,6 +293,34 @@ enum Commands {
 			help = "Amount to send, e.g. 50sat or 50000msat. Required when paying a zero-amount invoice"
 		)]
 		amount: Option<Amount>,
+		#[arg(
+			long,
+			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of payment + 50 sats"
+		)]
+		max_total_routing_fee: Option<Amount>,
+		#[arg(long, help = "Maximum total CLTV delta we accept for the route (default: 1008)")]
+		max_total_cltv_expiry_delta: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum number of paths that may be used by MPP payments (default: 10)"
+		)]
+		max_path_count: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum share of a channel's total capacity to send over a channel, as a power of 1/2 (default: 2)"
+		)]
+		max_channel_saturation_power_of_half: Option<u32>,
+	},
+	#[command(
+		about = "Send part of a fixed-amount BOLT11 invoice. Other nodes must send partial payments for the same invoice until the combined amount equals the invoice amount"
+	)]
+	Bolt11SendUnderpaying {
+		#[arg(help = "A fixed-amount BOLT11 invoice for a payment within the Lightning Network")]
+		invoice: String,
+		#[arg(
+			help = "Amount from this payer, for example 50sat or 50000msat. Must be less than the invoice amount"
+		)]
+		amount: Amount,
 		#[arg(
 			long,
 			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of payment + 50 sats"
@@ -207,6 +386,64 @@ enum Commands {
 		)]
 		max_channel_saturation_power_of_half: Option<u32>,
 	},
+	#[command(about = "Create a BOLT12 refund")]
+	Bolt12SendRefund {
+		#[arg(help = "Amount to refund, e.g. 50sat or 50000msat")]
+		amount: Amount,
+		#[arg(long, default_value_t = DEFAULT_EXPIRY_SECS, help = "Refund expiry time in seconds")]
+		expiry_secs: u32,
+		#[arg(short, long, help = "Number of items being refunded")]
+		quantity: Option<u64>,
+		#[arg(
+			short,
+			long,
+			help = "Note to include for the recipient. Will be reflected back in the invoice"
+		)]
+		payer_note: Option<String>,
+		#[arg(
+			long,
+			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of the payment amount + 50 sats"
+		)]
+		max_total_routing_fee: Option<Amount>,
+		#[arg(long, help = "Maximum total CLTV delta we accept for the route (default: 1008)")]
+		max_total_cltv_expiry_delta: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum number of paths that may be used by MPP payments (default: 10)"
+		)]
+		max_path_count: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum share of a channel's total capacity to send over a channel, as a power of 1/2 (default: 2)"
+		)]
+		max_channel_saturation_power_of_half: Option<u32>,
+	},
+	#[command(about = "Request payment for a BOLT12 refund")]
+	Bolt12ReceiveRefund {
+		#[arg(help = "A BOLT12 refund from the node that will send the payment")]
+		refund: String,
+	},
+	#[command(about = "Create a BOLT 12 payer proof for a payment this node made")]
+	Bolt12CreatePayerProof {
+		#[arg(help = "The hex-encoded payment id from PaymentSuccessful")]
+		payment_id: String,
+		#[arg(help = "The hex-encoded 32-byte payment preimage from PaymentSuccessful")]
+		payment_preimage: String,
+		#[arg(help = "The hex-encoded BOLT 12 invoice from PaymentSuccessful")]
+		invoice: String,
+		#[arg(long, help = "Optional note to attach to the payer proof")]
+		note: Option<String>,
+		#[arg(long, help = "Disclose the offer description in the proof")]
+		include_offer_description: bool,
+		#[arg(long, help = "Disclose the offer issuer in the proof")]
+		include_offer_issuer: bool,
+		#[arg(long, help = "Disclose the invoice amount in the proof")]
+		include_invoice_amount: bool,
+		#[arg(long, help = "Disclose the invoice creation timestamp in the proof")]
+		include_invoice_created_at: bool,
+		#[arg(long, help = "Additional TLV types to disclose")]
+		extra_tlv_types: Vec<u64>,
+	},
 	#[command(about = "Send a spontaneous payment (keysend) to a node")]
 	SpontaneousSend {
 		#[arg(help = "The hex-encoded public key of the node to send the payment to")]
@@ -230,6 +467,71 @@ enum Commands {
 			help = "Maximum share of a channel's total capacity to send over a channel, as a power of 1/2 (default: 2)"
 		)]
 		max_channel_saturation_power_of_half: Option<u32>,
+		#[arg(
+			long = "custom-tlv",
+			value_parser = parse_custom_tlv,
+			help = "Custom TLV record to attach, format: <type_num>:<hex_value>. Repeatable. type_num must be >= 65536."
+		)]
+		custom_tlvs: Vec<(u64, Vec<u8>)>,
+		#[arg(
+			long,
+			help = "An optional hex-encoded 32-byte payment preimage. If provided, it will be used instead of generating a random one."
+		)]
+		preimage: Option<Preimage>,
+	},
+	#[command(
+		about = "Pay a BIP 21 URI, BIP 353 Human-Readable Name, BOLT11 invoice, or BOLT12 offer"
+	)]
+	Pay {
+		#[arg(help = "A BIP 21 URI, BIP 353 Human-Readable Name, BOLT11 invoice, or BOLT12 offer")]
+		uri: String,
+		#[arg(help = "Amount to send, e.g. 50sat or 50000msat. Required for variable-amount URIs")]
+		amount: Option<Amount>,
+		#[arg(
+			long,
+			help = "Maximum total routing fee, e.g. 50sat or 50000msat. Defaults to 1% of payment + 50 sats"
+		)]
+		max_total_routing_fee: Option<Amount>,
+		#[arg(long, help = "Maximum total CLTV delta we accept for the route (default: 1008)")]
+		max_total_cltv_expiry_delta: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum number of paths that may be used by MPP payments (default: 10)"
+		)]
+		max_path_count: Option<u32>,
+		#[arg(
+			long,
+			help = "Maximum share of a channel's total capacity to send over a channel, as a power of 1/2 (default: 2)"
+		)]
+		max_channel_saturation_power_of_half: Option<u32>,
+		/// Wait for a Lightning payment to reach a terminal state.
+		///
+		/// With no `--wait-timeout`, waits until the payment succeeds or fails.
+		/// On-chain payments already return a transaction id and are not waited on.
+		#[arg(
+			long,
+			help = "Wait until a Lightning payment succeeds or fails. On-chain payments are not waited on"
+		)]
+		wait: bool,
+		/// Optional timeout in seconds for `--wait`. Omit to wait indefinitely.
+		#[arg(
+			long,
+			value_name = "SECS",
+			requires = "wait",
+			value_parser = clap::value_parser!(u64).range(1..),
+			help = "Seconds to wait when --wait is set. Omit to wait until the payment finishes (minimum: 1)"
+		)]
+		wait_timeout: Option<u64>,
+	},
+	#[command(about = "Decode a BOLT11 invoice and display its fields")]
+	DecodeInvoice {
+		#[arg(help = "The BOLT11 invoice string to decode")]
+		invoice: String,
+	},
+	#[command(about = "Decode a BOLT12 offer and display its fields")]
+	DecodeOffer {
+		#[arg(help = "The BOLT12 offer string to decode")]
+		offer: String,
 	},
 	#[command(about = "Cooperatively close the channel specified by the given channel ID")]
 	CloseChannel {
@@ -256,13 +558,18 @@ enum Commands {
 		)]
 		address: String,
 		#[arg(
-			help = "The amount to commit to the channel, e.g. 100sat or 100000msat, must be a whole sat amount, cannot send msats on-chain."
+			help = "The amount to commit to the channel, e.g. 100sat or 100000msat, or 'all' to use all available on-chain funds. Exact amounts must be a whole sat amount."
 		)]
-		channel_amount: Amount,
+		channel_amount: AmountOrAll,
 		#[arg(long, help = "Amount to push to the remote side, e.g. 50sat or 50000msat")]
 		push_to_counterparty: Option<Amount>,
 		#[arg(long, help = "Whether the channel should be public")]
 		announce_channel: bool,
+		#[arg(
+			long,
+			help = "Allow the counterparty to spend all its channel balance. This cannot be set together with `announce_channel`."
+		)]
+		disable_counterparty_reserve: bool,
 		// Channel config options
 		#[arg(
 			long,
@@ -289,9 +596,9 @@ enum Commands {
 		#[arg(help = "The hex-encoded public key of the channel's counterparty node")]
 		counterparty_node_id: String,
 		#[arg(
-			help = "The amount to splice into the channel, e.g. 50sat or 50000msat, must be a whole sat amount, cannot send msats on-chain."
+			help = "The amount to splice into the channel, e.g. 50sat or 50000msat, or 'all' to use all available on-chain funds. Exact amounts must be a whole sat amount."
 		)]
-		splice_amount: Amount,
+		splice_amount: AmountOrAll,
 	},
 	#[command(about = "Decrease the channel balance by the given amount")]
 	SpliceOut {
@@ -310,6 +617,15 @@ enum Commands {
 		)]
 		address: Option<String>,
 	},
+	#[command(
+		about = "Bump a pending splice fee. Does not support general channel-opening fee bumping. LDK Node selects the fee rate; callers cannot set it"
+	)]
+	BumpChannelFundingFee {
+		#[arg(help = "The local user channel ID as a decimal u128 string")]
+		user_channel_id: String,
+		#[arg(help = "The hex-encoded public key of the channel's peer")]
+		counterparty_node_id: String,
+	},
 	#[command(about = "Return a list of known channels")]
 	ListChannels,
 	#[command(about = "Retrieve list of all payments")]
@@ -320,7 +636,7 @@ enum Commands {
 		)]
 		number_of_payments: Option<u64>,
 		#[arg(long)]
-		#[arg(help = "Page token to continue from a previous page (format: token:index)")]
+		#[arg(help = "Opaque page token returned by a previous request")]
 		page_token: Option<String>,
 	},
 	#[command(about = "Get details of a specific payment by its payment ID")]
@@ -328,7 +644,41 @@ enum Commands {
 		#[arg(help = "The payment ID in hex-encoded form")]
 		payment_id: String,
 	},
-	#[command(about = "Retrieves list of all forwarded payments")]
+	#[command(about = "Get a stored forwarded payment by its ID")]
+	GetForwardedPaymentDetails {
+		#[arg(help = "The 32-byte identifier in hex-encoded form")]
+		forwarded_payment_id: String,
+	},
+	#[command(about = "Get the configured forwarding history tracking mode")]
+	GetForwardedPaymentTrackingMode,
+	#[command(about = "Get forwarding statistics for a channel")]
+	GetChannelForwardingStats {
+		#[arg(help = "The 32-byte identifier in hex-encoded form")]
+		channel_id: String,
+	},
+	#[command(about = "List channel forwarding statistics (paginated)")]
+	ListChannelForwardingStats {
+		#[arg(
+			short,
+			long,
+			help = "Fetch at least this many records across pages; otherwise fetch one page"
+		)]
+		number_of_records: Option<u64>,
+		#[arg(long, help = "Opaque page token returned by a previous request")]
+		page_token: Option<String>,
+	},
+	#[command(about = "List channel-pair forwarding statistics (paginated)")]
+	ListChannelPairForwardingStats {
+		#[arg(
+			short,
+			long,
+			help = "Fetch at least this many records across pages; otherwise fetch one page"
+		)]
+		number_of_records: Option<u64>,
+		#[arg(long, help = "Opaque page token returned by a previous request")]
+		page_token: Option<String>,
+	},
+	#[command(about = "Retrieves a paginated list of forwarded payments")]
 	ListForwardedPayments {
 		#[arg(
 			short,
@@ -336,7 +686,7 @@ enum Commands {
 			help = "Fetch at least this many forwarded payments by iterating through multiple pages. Returns combined results with the last page token. If not provided, returns only a single page."
 		)]
 		number_of_payments: Option<u64>,
-		#[arg(long, help = "Page token to continue from a previous page (format: token:index)")]
+		#[arg(long, help = "Opaque page token returned by a previous request")]
 		page_token: Option<String>,
 	},
 	#[command(about = "Update the forwarding fees and CLTV expiry delta for an existing channel")]
@@ -385,6 +735,8 @@ enum Commands {
 		#[arg(help = "The hex-encoded public key of the node to disconnect from")]
 		node_pubkey: String,
 	},
+	#[command(about = "Return a list of peers")]
+	ListPeers,
 	#[command(about = "Sign a message with the node's secret key")]
 	SignMessage {
 		#[arg(help = "The message to sign")]
@@ -415,6 +767,48 @@ enum Commands {
 		#[arg(help = "The hex-encoded node ID to look up")]
 		node_id: String,
 	},
+	#[command(about = "Create a macaroon with chosen permissions")]
+	CreateMacaroon {
+		#[arg(help = "A unique name for the macaroon")]
+		name: String,
+		#[arg(
+			short,
+			long,
+			num_args = 1..,
+			conflicts_with = "preset",
+			required_unless_present = "preset",
+			help = "Permissions to grant, such as node:read or invoices:create"
+		)]
+		permissions: Vec<String>,
+		#[arg(
+            long,
+            value_parser = PossibleValuesParser::new(MacaroonPreset::ALL.map(MacaroonPreset::name))
+                .try_map(|value| value.parse::<MacaroonPreset>()),
+            conflicts_with = "permissions",
+            help = "Use a permission preset"
+        )]
+		preset: Option<MacaroonPreset>,
+	},
+	#[command(about = "Derive a restricted copy without contacting the server")]
+	DeriveMacaroon {
+		#[arg(help = "Hex-encoded macaroon to restrict")]
+		token: String,
+		#[arg(
+			long = "caveat",
+			required = true,
+			help = "Repeat for each condition, e.g. 'permissions = node:read' or 'time-before = 1800000000'"
+		)]
+		caveats: Vec<String>,
+	},
+	#[command(about = "List macaroons without their secrets")]
+	ListMacaroons,
+	#[command(about = "Revoke a macaroon")]
+	RevokeMacaroon {
+		#[arg(help = "The hex-encoded macaroon ID")]
+		id: String,
+	},
+	#[command(about = "Show permissions for the current macaroon")]
+	GetPermissions,
 	#[command(about = "Generate shell completions for the CLI")]
 	Completions {
 		#[arg(
@@ -428,6 +822,16 @@ enum Commands {
 #[tokio::main]
 async fn main() {
 	let cli = Cli::parse();
+	if let Commands::DeriveMacaroon { token, caveats } = &cli.command {
+		match ldk_server_client::macaroon::derive_macaroon(token, caveats) {
+			Ok(token) => println!("{token}"),
+			Err(error) => {
+				eprintln!("{error}");
+				std::process::exit(1);
+			},
+		}
+		return;
+	}
 
 	// short-circuit if generating completions
 	if let Commands::Completions { shell } = cli.command {
@@ -435,61 +839,46 @@ async fn main() {
 		return;
 	}
 
-	let config_path = cli.config.map(PathBuf::from).or_else(get_default_config_path);
-	let config = config_path.as_ref().and_then(|p| load_config(p).ok());
-	let storage_dir =
-		config.as_ref().and_then(|c| c.storage.as_ref()?.disk.as_ref()?.dir_path.as_deref());
-
-	// Get API key from argument, then from api_key file in storage dir, then from default location
-	let api_key = cli
-		.api_key
-		.or_else(|| {
-			let network =
-				config.as_ref().and_then(|c| c.network().ok()).unwrap_or("bitcoin".to_string());
-			storage_dir
-				.map(|dir| api_key_path_for_storage_dir(dir, &network))
-				.and_then(|path| std::fs::read(&path).ok())
-				.or_else(|| {
-					get_default_api_key_path(&network)
-						.and_then(|path| std::fs::read(&path).ok())
-				})
-				.map(|bytes| bytes.to_lower_hex_string())
-		})
-		.unwrap_or_else(|| {
-			eprintln!("API key not provided. Use --api-key or ensure the api_key file exists at ~/.ldk-server/[network]/api_key");
-			std::process::exit(1);
-		});
-
-	// Get base URL from argument then from config file
-	let base_url =
-		cli.base_url.or_else(|| config.as_ref().map(|c| c.node.rest_service_address.clone()))
-			.unwrap_or_else(|| {
-				eprintln!("Base URL not provided. Use --base-url or ensure config file exists at ~/.ldk-server/config.toml");
-				std::process::exit(1);
-			});
-
-	// Get TLS cert path from argument, then from config tls.cert_path, then from storage dir,
-	// then try default location.
-	let tls_cert_path = cli.tls_cert.map(PathBuf::from).or_else(|| {
-		config
-			.as_ref()
-			.and_then(|c| c.tls.as_ref().and_then(|t| t.cert_path.as_ref().map(PathBuf::from)))
-			.or_else(|| {
-				storage_dir.map(cert_path_for_storage_dir).filter(|path| path.exists())
-			})
-			.or_else(get_default_cert_path)
-	})
-		.unwrap_or_else(|| {
-			eprintln!("TLS cert path not provided. Use --tls-cert or ensure config file exists at ~/.ldk-server/config.toml");
-			std::process::exit(1);
-		});
-
-	let server_cert_pem = std::fs::read(&tls_cert_path).unwrap_or_else(|e| {
-		eprintln!("Failed to read server certificate file '{}': {}", tls_cert_path.display(), e);
+	let config = load_client_config(cli.config.map(PathBuf::from)).unwrap_or_else(|e| {
+		eprintln!("{e}");
 		std::process::exit(1);
 	});
 
-	let client = LdkServerClient::new(base_url, api_key, &server_cert_pem).unwrap_or_else(|e| {
+	let macaroon = resolve_macaroon(cli.macaroon, config.as_ref())
+		.unwrap_or_else(|e| {
+			eprintln!("Failed to resolve macaroon: {e}");
+			std::process::exit(1);
+		})
+		.unwrap_or_else(|| {
+			match resolve_macaroon_path(config.as_ref()).unwrap_or_else(|e| {
+				eprintln!("Failed to resolve Macaroon: {e}");
+				std::process::exit(1);
+			}) {
+				Some(path) => eprintln!(
+					"Macaroon not provided. Use --macaroon or ensure the macaroon file exists at '{}'",
+					path.display()
+				),
+				None => eprintln!(
+					"Macaroon not provided. Use --macaroon; no macaroon file path could be resolved from the configuration"
+				),
+			}
+			std::process::exit(1);
+		});
+
+	let base_url = resolve_base_url(cli.base_url, config.as_ref());
+
+	let tls_cert_path = resolve_cert_path(cli.tls_cert.map(PathBuf::from), config.as_ref())
+		.unwrap_or_else(|| {
+			eprintln!("TLS cert path not provided. Use --tls-cert or ensure config file exists at {DEFAULT_DIR}/config.toml");
+			std::process::exit(1);
+		});
+
+	let server_cert_pem = read_tls_certificate(&tls_cert_path).unwrap_or_else(|e| {
+		eprintln!("{e}");
+		std::process::exit(1);
+	});
+
+	let client = LdkServerClient::new(base_url, macaroon, &server_cert_pem).unwrap_or_else(|e| {
 		eprintln!("Failed to create client: {e}");
 		std::process::exit(1);
 	});
@@ -510,20 +899,48 @@ async fn main() {
 				client.onchain_receive(OnchainReceiveRequest {}).await,
 			);
 		},
-		Commands::OnchainSend { address, amount, send_all, fee_rate_sat_per_vb } => {
-			let amount_sats = amount.map(|a| a.to_sat().unwrap_or_else(|e| handle_error_msg(&e)));
+		Commands::OnchainBumpFee { payment_id, fee_rate_sat_per_vb } => {
+			handle_response_result::<_, OnchainBumpFeeResponse>(
+				client
+					.onchain_bump_fee(OnchainBumpFeeRequest { payment_id, fee_rate_sat_per_vb })
+					.await,
+			);
+		},
+		Commands::OnchainSend { address, amount, fee_rate_sat_per_vb } => {
+			let amount = match amount.to_sat().unwrap_or_else(|e| handle_error_msg(e)) {
+				Some(amount_sats) => onchain_send_request::Amount::AmountSats(amount_sats),
+				None => onchain_send_request::Amount::AllFunds(AllFunds {}),
+			};
 			handle_response_result::<_, OnchainSendResponse>(
 				client
 					.onchain_send(OnchainSendRequest {
 						address,
-						amount_sats,
-						send_all,
 						fee_rate_sat_per_vb,
+						amount: Some(amount),
 					})
 					.await,
 			);
 		},
 		Commands::Bolt11Receive { description, description_hash, expiry_secs, amount } => {
+			let amount_msat = amount.map(|a| a.to_msat());
+			let invoice_description =
+				parse_bolt11_invoice_description(description, description_hash);
+
+			let expiry_secs = expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
+			let request =
+				Bolt11ReceiveRequest { description: invoice_description, expiry_secs, amount_msat };
+
+			handle_response_result::<_, Bolt11ReceiveResponse>(
+				client.bolt11_receive(request).await,
+			);
+		},
+		Commands::Bolt11ReceiveForHash {
+			payment_hash,
+			amount,
+			description,
+			description_hash,
+			expiry_secs,
+		} => {
 			let amount_msat = amount.map(|a| a.to_msat());
 			let invoice_description = match (description, description_hash) {
 				(Some(desc), None) => Some(Bolt11InvoiceDescription {
@@ -534,7 +951,7 @@ async fn main() {
 				}),
 				(Some(_), Some(_)) => {
 					handle_error(LdkServerError::new(
-						InternalError,
+						InvalidRequestError,
 						"Only one of description or description_hash can be set.".to_string(),
 					));
 				},
@@ -542,11 +959,101 @@ async fn main() {
 			};
 
 			let expiry_secs = expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
-			let request =
-				Bolt11ReceiveRequest { description: invoice_description, expiry_secs, amount_msat };
+			let request = Bolt11ReceiveForHashRequest {
+				description: invoice_description,
+				expiry_secs,
+				amount_msat,
+				payment_hash,
+			};
 
-			handle_response_result::<_, Bolt11ReceiveResponse>(
-				client.bolt11_receive(request).await,
+			handle_response_result::<_, Bolt11ReceiveForHashResponse>(
+				client.bolt11_receive_for_hash(request).await,
+			);
+		},
+		Commands::Bolt11ClaimForId { payment_id, preimage, claimable_amount } => {
+			handle_response_result::<_, Bolt11ClaimForIdResponse>(
+				client
+					.bolt11_claim_for_id(Bolt11ClaimForIdRequest {
+						payment_id,
+						claimable_amount_msat: claimable_amount.map(|a| a.to_msat()),
+						preimage,
+					})
+					.await,
+			);
+		},
+		Commands::Bolt11FailForId { payment_id } => {
+			handle_response_result::<_, Bolt11FailForIdResponse>(
+				client.bolt11_fail_for_id(Bolt11FailForIdRequest { payment_id }).await,
+			);
+		},
+		Commands::Bolt11ReceiveViaJitChannel {
+			amount,
+			description,
+			description_hash,
+			expiry_secs,
+			max_total_lsp_fee_limit,
+		} => {
+			let request = Bolt11ReceiveViaJitChannelRequest {
+				amount_msat: amount.to_msat(),
+				description: parse_bolt11_invoice_description(description, description_hash),
+				expiry_secs: expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS),
+				max_total_lsp_fee_limit_msat: max_total_lsp_fee_limit.map(|a| a.to_msat()),
+			};
+
+			handle_response_result::<_, Bolt11ReceiveViaJitChannelResponse>(
+				client.bolt11_receive_via_jit_channel(request).await,
+			);
+		},
+		Commands::Bolt11ReceiveVariableAmountViaJitChannel {
+			description,
+			description_hash,
+			expiry_secs,
+			max_proportional_lsp_fee_limit_ppm_msat,
+		} => {
+			let request = Bolt11ReceiveVariableAmountViaJitChannelRequest {
+				description: parse_bolt11_invoice_description(description, description_hash),
+				expiry_secs: expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS),
+				max_proportional_lsp_fee_limit_ppm_msat,
+			};
+
+			handle_response_result::<_, Bolt11ReceiveVariableAmountViaJitChannelResponse>(
+				client.bolt11_receive_variable_amount_via_jit_channel(request).await,
+			);
+		},
+		Commands::Bolt11ReceiveViaJitChannelForHash {
+			amount,
+			description,
+			description_hash,
+			expiry_secs,
+			max_total_lsp_fee_limit,
+			payment_hash,
+		} => {
+			let request = Bolt11ReceiveViaJitChannelForHashRequest {
+				amount_msat: amount.to_msat(),
+				description: parse_bolt11_invoice_description(description, description_hash),
+				expiry_secs: expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS),
+				max_total_lsp_fee_limit_msat: max_total_lsp_fee_limit.map(|a| a.to_msat()),
+				payment_hash,
+			};
+			handle_response_result::<_, Bolt11ReceiveViaJitChannelForHashResponse>(
+				client.bolt11_receive_via_jit_channel_for_hash(request).await,
+			);
+		},
+		Commands::Bolt11ReceiveVariableAmountViaJitChannelForHash {
+			description,
+			description_hash,
+			expiry_secs,
+			max_proportional_lsp_fee_limit_ppm_msat,
+			payment_hash,
+		} => {
+			let request = Bolt11ReceiveVariableAmountViaJitChannelForHashRequest {
+				description: parse_bolt11_invoice_description(description, description_hash),
+				expiry_secs: expiry_secs.unwrap_or(DEFAULT_EXPIRY_SECS),
+				max_proportional_lsp_fee_limit_ppm_msat,
+				payment_hash,
+			};
+			handle_response_result::<_, Bolt11ReceiveVariableAmountViaJitChannelForHashResponse>(
+				client.bolt11_receive_variable_amount_via_jit_channel_for_hash(request).await,
 			);
 		},
 		Commands::Bolt11Send {
@@ -570,6 +1077,34 @@ async fn main() {
 			handle_response_result::<_, Bolt11SendResponse>(
 				client
 					.bolt11_send(Bolt11SendRequest {
+						invoice,
+						amount_msat,
+						route_parameters: Some(route_parameters),
+					})
+					.await,
+			);
+		},
+		Commands::Bolt11SendUnderpaying {
+			invoice,
+			amount,
+			max_total_routing_fee,
+			max_total_cltv_expiry_delta,
+			max_path_count,
+			max_channel_saturation_power_of_half,
+		} => {
+			let amount_msat = amount.to_msat();
+			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
+			let route_parameters = RouteParametersConfig {
+				max_total_routing_fee_msat,
+				max_total_cltv_expiry_delta: max_total_cltv_expiry_delta
+					.unwrap_or(DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA),
+				max_path_count: max_path_count.unwrap_or(DEFAULT_MAX_PATH_COUNT),
+				max_channel_saturation_power_of_half: max_channel_saturation_power_of_half
+					.unwrap_or(DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF),
+			};
+			handle_response_result::<_, Bolt11SendUnderpayingResponse>(
+				client
+					.bolt11_send_underpaying(Bolt11SendUnderpayingRequest {
 						invoice,
 						amount_msat,
 						route_parameters: Some(route_parameters),
@@ -623,6 +1158,73 @@ async fn main() {
 					.await,
 			);
 		},
+		Commands::Bolt12SendRefund {
+			amount,
+			expiry_secs,
+			quantity,
+			payer_note,
+			max_total_routing_fee,
+			max_total_cltv_expiry_delta,
+			max_path_count,
+			max_channel_saturation_power_of_half,
+		} => {
+			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
+			let route_parameters = RouteParametersConfig {
+				max_total_routing_fee_msat,
+				max_total_cltv_expiry_delta: max_total_cltv_expiry_delta
+					.unwrap_or(DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA),
+				max_path_count: max_path_count.unwrap_or(DEFAULT_MAX_PATH_COUNT),
+				max_channel_saturation_power_of_half: max_channel_saturation_power_of_half
+					.unwrap_or(DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF),
+			};
+
+			handle_response_result::<_, Bolt12SendRefundResponse>(
+				client
+					.bolt12_send_refund(Bolt12SendRefundRequest {
+						amount_msat: amount.to_msat(),
+						expiry_secs,
+						quantity,
+						payer_note,
+						route_parameters: Some(route_parameters),
+					})
+					.await,
+			);
+		},
+		Commands::Bolt12ReceiveRefund { refund } => {
+			handle_response_result::<_, Bolt12ReceiveRefundResponse>(
+				client.bolt12_receive_refund(Bolt12ReceiveRefundRequest { refund }).await,
+			);
+		},
+		Commands::Bolt12CreatePayerProof {
+			payment_id,
+			payment_preimage,
+			invoice,
+			note,
+			include_offer_description,
+			include_offer_issuer,
+			include_invoice_amount,
+			include_invoice_created_at,
+			extra_tlv_types,
+		} => {
+			let options = PayerProofOptions {
+				note,
+				include_offer_description,
+				include_offer_issuer,
+				include_invoice_amount,
+				include_invoice_created_at,
+				extra_tlv_types,
+			};
+			handle_response_result::<_, Bolt12CreatePayerProofResponse>(
+				client
+					.bolt12_create_payer_proof(Bolt12CreatePayerProofRequest {
+						payment_id,
+						payment_preimage,
+						invoice,
+						options: Some(options),
+					})
+					.await,
+			);
+		},
 		Commands::SpontaneousSend {
 			node_id,
 			amount,
@@ -630,6 +1232,8 @@ async fn main() {
 			max_total_cltv_expiry_delta,
 			max_path_count,
 			max_channel_saturation_power_of_half,
+			custom_tlvs,
+			preimage,
 		} => {
 			let amount_msat = amount.to_msat();
 			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
@@ -642,14 +1246,62 @@ async fn main() {
 					.unwrap_or(DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF),
 			};
 
+			let proto_custom_tlvs: Vec<_> = custom_tlvs
+				.into_iter()
+				.map(|(type_num, value)| CustomTlvRecord { type_num, value: value.into() })
+				.collect();
+
 			handle_response_result::<_, SpontaneousSendResponse>(
 				client
 					.spontaneous_send(SpontaneousSendRequest {
 						amount_msat,
 						node_id,
 						route_parameters: Some(route_parameters),
+						custom_tlvs: proto_custom_tlvs,
+						preimage: preimage.map(|p| p.to_hex_string()),
 					})
 					.await,
+			);
+		},
+		Commands::Pay {
+			uri,
+			amount,
+			max_total_routing_fee,
+			max_total_cltv_expiry_delta,
+			max_path_count,
+			max_channel_saturation_power_of_half,
+			wait,
+			wait_timeout,
+		} => {
+			let amount_msat = amount.map(|a| a.to_msat());
+			let max_total_routing_fee_msat = max_total_routing_fee.map(|a| a.to_msat());
+			let route_parameters = RouteParametersConfig {
+				max_total_routing_fee_msat,
+				max_total_cltv_expiry_delta: max_total_cltv_expiry_delta
+					.unwrap_or(DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA),
+				max_path_count: max_path_count.unwrap_or(DEFAULT_MAX_PATH_COUNT),
+				max_channel_saturation_power_of_half: max_channel_saturation_power_of_half
+					.unwrap_or(DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF),
+			};
+			let request =
+				UnifiedSendRequest { uri, amount_msat, route_parameters: Some(route_parameters) };
+			if wait {
+				let timeout = wait_timeout.map(std::time::Duration::from_secs);
+				pay_wait::pay_and_wait(&client, request, timeout).await;
+			} else {
+				handle_response_result::<_, UnifiedSendResponse>(
+					client.unified_send(request).await,
+				);
+			}
+		},
+		Commands::DecodeInvoice { invoice } => {
+			handle_response_result::<_, DecodeInvoiceResponse>(
+				client.decode_invoice(DecodeInvoiceRequest { invoice }).await,
+			);
+		},
+		Commands::DecodeOffer { offer } => {
+			handle_response_result::<_, DecodeOfferResponse>(
+				client.decode_offer(DecodeOfferRequest { offer }).await,
 			);
 		},
 		Commands::CloseChannel { user_channel_id, counterparty_node_id } => {
@@ -680,48 +1332,59 @@ async fn main() {
 			channel_amount,
 			push_to_counterparty,
 			announce_channel,
+			disable_counterparty_reserve,
 			forwarding_fee_proportional_millionths,
 			forwarding_fee_base_msat,
 			cltv_expiry_delta,
 		} => {
-			let channel_amount_sats =
-				channel_amount.to_sat().unwrap_or_else(|e| handle_error_msg(&e));
+			let amount = match channel_amount.to_sat().unwrap_or_else(|e| handle_error_msg(e)) {
+				Some(amount_sats) => open_channel_request::Amount::ChannelAmountSats(amount_sats),
+				None => open_channel_request::Amount::AllFunds(AllFunds {}),
+			};
 			let push_to_counterparty_msat = push_to_counterparty.map(|a| a.to_msat());
 			let channel_config = build_open_channel_config(
 				forwarding_fee_proportional_millionths,
 				forwarding_fee_base_msat,
 				cltv_expiry_delta,
 			);
+			if announce_channel && disable_counterparty_reserve {
+				handle_error(LdkServerError::new(
+					InvalidRequestError,
+					"Cannot set both `announce_channel` and `disable_counterparty_reserve`",
+				));
+			}
 
 			handle_response_result::<_, OpenChannelResponse>(
 				client
 					.open_channel(OpenChannelRequest {
 						node_pubkey,
 						address,
-						channel_amount_sats,
+						amount: Some(amount),
 						push_to_counterparty_msat,
 						channel_config,
 						announce_channel,
+						disable_counterparty_reserve,
 					})
 					.await,
 			);
 		},
 		Commands::SpliceIn { user_channel_id, counterparty_node_id, splice_amount } => {
-			let splice_amount_sats =
-				splice_amount.to_sat().unwrap_or_else(|e| handle_error_msg(&e));
+			let amount = match splice_amount.to_sat().unwrap_or_else(|e| handle_error_msg(e)) {
+				Some(amount_sats) => splice_in_request::Amount::SpliceAmountSats(amount_sats),
+				None => splice_in_request::Amount::AllFunds(AllFunds {}),
+			};
 			handle_response_result::<_, SpliceInResponse>(
 				client
 					.splice_in(SpliceInRequest {
 						user_channel_id,
 						counterparty_node_id,
-						splice_amount_sats,
+						amount: Some(amount),
 					})
 					.await,
 			);
 		},
 		Commands::SpliceOut { user_channel_id, counterparty_node_id, address, splice_amount } => {
-			let splice_amount_sats =
-				splice_amount.to_sat().unwrap_or_else(|e| handle_error_msg(&e));
+			let splice_amount_sats = splice_amount.to_sat().unwrap_or_else(|e| handle_error_msg(e));
 			handle_response_result::<_, SpliceOutResponse>(
 				client
 					.splice_out(SpliceOutRequest {
@@ -733,15 +1396,22 @@ async fn main() {
 					.await,
 			);
 		},
+		Commands::BumpChannelFundingFee { user_channel_id, counterparty_node_id } => {
+			handle_response_result::<_, BumpChannelFundingFeeResponse>(
+				client
+					.bump_channel_funding_fee(BumpChannelFundingFeeRequest {
+						user_channel_id,
+						counterparty_node_id,
+					})
+					.await,
+			);
+		},
 		Commands::ListChannels => {
 			handle_response_result::<_, ListChannelsResponse>(
 				client.list_channels(ListChannelsRequest {}).await,
 			);
 		},
 		Commands::ListPayments { number_of_payments, page_token } => {
-			let page_token = page_token
-				.map(|token_str| parse_page_token(&token_str).unwrap_or_else(|e| handle_error(e)));
-
 			handle_response_result::<_, CliListPaymentsResponse>(
 				fetch_paginated(
 					number_of_payments,
@@ -757,10 +1427,70 @@ async fn main() {
 				client.get_payment_details(GetPaymentDetailsRequest { payment_id }).await,
 			);
 		},
+		Commands::GetForwardedPaymentDetails { forwarded_payment_id } => {
+			handle_response_result::<_, GetForwardedPaymentDetailsResponse>(
+				client
+					.get_forwarded_payment_details(GetForwardedPaymentDetailsRequest {
+						forwarded_payment_id,
+					})
+					.await,
+			);
+		},
+		Commands::GetForwardedPaymentTrackingMode => {
+			handle_response_result::<_, GetForwardedPaymentTrackingModeResponse>(
+				client
+					.get_forwarded_payment_tracking_mode(GetForwardedPaymentTrackingModeRequest {})
+					.await,
+			);
+		},
+		Commands::GetChannelForwardingStats { channel_id } => {
+			handle_response_result::<_, GetChannelForwardingStatsResponse>(
+				client
+					.get_channel_forwarding_stats(GetChannelForwardingStatsRequest { channel_id })
+					.await,
+			);
+		},
+		Commands::ListChannelForwardingStats { number_of_records, page_token } => {
+			handle_response_result::<
+				_,
+				CliPaginatedResponse<
+					ldk_server_client::ldk_server_grpc::types::ChannelForwardingStats,
+				>,
+			>(
+				fetch_paginated(
+					number_of_records,
+					page_token,
+					|page_token| {
+						client.list_channel_forwarding_stats(ListChannelForwardingStatsRequest {
+							page_token,
+						})
+					},
+					|r| (r.stats, r.next_page_token),
+				)
+				.await,
+			);
+		},
+		Commands::ListChannelPairForwardingStats { number_of_records, page_token } => {
+			handle_response_result::<
+				_,
+				CliPaginatedResponse<
+					ldk_server_client::ldk_server_grpc::types::ChannelPairForwardingStats,
+				>,
+			>(
+				fetch_paginated(
+					number_of_records,
+					page_token,
+					|page_token| {
+						client.list_channel_pair_forwarding_stats(
+							ListChannelPairForwardingStatsRequest { page_token },
+						)
+					},
+					|r| (r.stats, r.next_page_token),
+				)
+				.await,
+			);
+		},
 		Commands::ListForwardedPayments { number_of_payments, page_token } => {
-			let page_token = page_token
-				.map(|token_str| parse_page_token(&token_str).unwrap_or_else(|e| handle_error(e)));
-
 			handle_response_result::<_, CliListForwardedPaymentsResponse>(
 				fetch_paginated(
 					number_of_payments,
@@ -819,6 +1549,11 @@ async fn main() {
 				client.disconnect_peer(DisconnectPeerRequest { node_pubkey }).await,
 			);
 		},
+		Commands::ListPeers => {
+			handle_response_result::<_, ListPeersResponse>(
+				client.list_peers(ListPeersRequest {}).await,
+			);
+		},
 		Commands::SignMessage { message } => {
 			handle_response_result::<_, SignMessageResponse>(
 				client
@@ -867,7 +1602,40 @@ async fn main() {
 				client.graph_get_node(GraphGetNodeRequest { node_id }).await,
 			);
 		},
+		Commands::CreateMacaroon { name, permissions, preset } => {
+			let permissions = preset.map(MacaroonPreset::permissions).unwrap_or(permissions);
+			handle_response_result::<_, CreateMacaroonResponse>(
+				client.create_macaroon(CreateMacaroonRequest { name, permissions }).await,
+			);
+		},
+		Commands::ListMacaroons => {
+			handle_response_result::<_, ListMacaroonsResponse>(
+				client.list_macaroons(ListMacaroonsRequest {}).await,
+			);
+		},
+		Commands::RevokeMacaroon { id } => {
+			handle_response_result::<_, RevokeMacaroonResponse>(
+				client.revoke_macaroon(RevokeMacaroonRequest { id }).await,
+			);
+		},
+		Commands::GetPermissions => {
+			handle_response_result::<_, GetPermissionsResponse>(
+				client.get_permissions(GetPermissionsRequest {}).await,
+			);
+		},
+		Commands::DeriveMacaroon { .. } => unreachable!("Handled before connecting"),
 		Commands::Completions { .. } => unreachable!("Handled above"),
+	}
+}
+
+fn load_client_config(explicit_path: Option<PathBuf>) -> Result<Option<Config>, String> {
+	let config_path = explicit_path.clone().or_else(get_default_config_path);
+	match config_path {
+		Some(path) if path.is_file() => load_config(&path).map(Some),
+		Some(path) if explicit_path.is_some() => {
+			Err(format!("Config file '{}' does not exist or is not a file", path.display()))
+		},
+		_ => Ok(None),
 	}
 }
 
@@ -894,9 +1662,8 @@ fn build_open_channel_config(
 }
 
 async fn fetch_paginated<T, R, Fut>(
-	target_count: Option<u64>, initial_page_token: Option<PageToken>,
-	fetch_page: impl Fn(Option<PageToken>) -> Fut,
-	extract: impl Fn(R) -> (Vec<T>, Option<PageToken>),
+	target_count: Option<u64>, initial_page_token: Option<String>,
+	fetch_page: impl Fn(Option<String>) -> Fut, extract: impl Fn(R) -> (Vec<T>, Option<String>),
 ) -> Result<CliPaginatedResponse<T>, LdkServerError>
 where
 	Fut: std::future::Future<Output = Result<R, LdkServerError>>,
@@ -929,7 +1696,52 @@ where
 	}
 }
 
-fn handle_response_result<Rs, Js>(response: Result<Rs, LdkServerError>)
+/// Escapes Unicode bidirectional control characters as `\uXXXX` so they are visible
+/// in terminal output rather than silently reordering displayed text.
+/// serde_json already escapes ASCII control characters (U+0000–U+001F), but bidi
+/// overrides (U+200E–U+2069) pass through unescaped.
+pub(crate) fn sanitize_for_terminal(s: String) -> String {
+	fn is_bidi_control(c: char) -> bool {
+		matches!(
+			c,
+			'\u{200E}' // LEFT-TO-RIGHT MARK
+			| '\u{200F}' // RIGHT-TO-LEFT MARK
+			| '\u{202A}' // LEFT-TO-RIGHT EMBEDDING
+			| '\u{202B}' // RIGHT-TO-LEFT EMBEDDING
+			| '\u{202C}' // POP DIRECTIONAL FORMATTING
+			| '\u{202D}' // LEFT-TO-RIGHT OVERRIDE
+			| '\u{202E}' // RIGHT-TO-LEFT OVERRIDE
+			| '\u{2066}' // LEFT-TO-RIGHT ISOLATE
+			| '\u{2067}' // RIGHT-TO-LEFT ISOLATE
+			| '\u{2068}' // FIRST STRONG ISOLATE
+			| '\u{2069}' // POP DIRECTIONAL ISOLATE
+		)
+	}
+	if !s.chars().any(is_bidi_control) {
+		return s;
+	}
+	let mut out = String::with_capacity(s.len());
+	for c in s.chars() {
+		if is_bidi_control(c) {
+			write!(out, "\\u{:04X}", c as u32).unwrap();
+		} else {
+			out.push(c);
+		}
+	}
+	out
+}
+
+pub(crate) fn print_response<T: Serialize + std::fmt::Debug>(value: &T) {
+	match serde_json::to_string_pretty(value) {
+		Ok(json) => println!("{}", sanitize_for_terminal(json)),
+		Err(e) => {
+			eprintln!("Error serializing response ({value:?}) to JSON: {e}");
+			std::process::exit(1);
+		},
+	}
+}
+
+pub(crate) fn handle_response_result<Rs, Js>(response: Result<Rs, LdkServerError>)
 where
 	Rs: Into<Js>,
 	Js: Serialize + std::fmt::Debug,
@@ -937,13 +1749,7 @@ where
 	match response {
 		Ok(response) => {
 			let json_response: Js = response.into();
-			match serde_json::to_string_pretty(&json_response) {
-				Ok(json) => println!("{json}"),
-				Err(e) => {
-					eprintln!("Error serializing response ({json_response:?}) to JSON: {e}");
-					std::process::exit(1);
-				},
-			}
+			print_response(&json_response);
 		},
 		Err(e) => {
 			handle_error(e);
@@ -951,33 +1757,203 @@ where
 	}
 }
 
-fn parse_page_token(token_str: &str) -> Result<PageToken, LdkServerError> {
-	let parts: Vec<&str> = token_str.split(':').collect();
-	if parts.len() != 2 {
-		return Err(LdkServerError::new(
-			InternalError,
-			"Page token must be in format 'token:index'".to_string(),
-		));
+fn parse_bolt11_invoice_description(
+	description: Option<String>, description_hash: Option<String>,
+) -> Option<Bolt11InvoiceDescription> {
+	match (description, description_hash) {
+		(Some(desc), None) => Some(Bolt11InvoiceDescription {
+			kind: Some(bolt11_invoice_description::Kind::Direct(desc)),
+		}),
+		(None, Some(hash)) => Some(Bolt11InvoiceDescription {
+			kind: Some(bolt11_invoice_description::Kind::Hash(hash)),
+		}),
+		(Some(_), Some(_)) => handle_error(LdkServerError::new(
+			InvalidRequestError,
+			"Only one of description or description_hash can be set.".to_string(),
+		)),
+		(None, None) => None,
 	}
-	let index = parts[1]
-		.parse::<i64>()
-		.map_err(|_| LdkServerError::new(InternalError, "Invalid page token index".to_string()))?;
-	Ok(PageToken { token: parts[0].to_string(), index })
 }
 
-fn handle_error_msg(msg: &str) -> ! {
-	eprintln!("Error: {msg}");
+fn parse_custom_tlv(s: &str) -> Result<(u64, Vec<u8>), String> {
+	let (type_str, hex_str) =
+		s.split_once(':').ok_or_else(|| format!("expected <type_num>:<hex_value>, got '{s}'"))?;
+	let type_num: u64 =
+		type_str.parse().map_err(|e| format!("invalid type number '{type_str}': {e}"))?;
+	if type_num < 65536 {
+		return Err(format!("type number must be >= 65536, got {type_num}"));
+	}
+	let value =
+		Vec::<u8>::from_hex(hex_str).map_err(|e| format!("invalid hex value '{hex_str}': {e}"))?;
+	Ok((type_num, value))
+}
+
+fn handle_error_msg(msg: String) -> ! {
+	eprintln!("Error: {}", sanitize_for_terminal(msg));
 	std::process::exit(1);
 }
 
-fn handle_error(e: LdkServerError) -> ! {
+pub(crate) fn handle_error(e: LdkServerError) -> ! {
 	let error_type = match e.error_code {
 		InvalidRequestError => "Invalid Request",
 		AuthError => "Authentication Error",
+		AuthorizationError => "Permission Denied",
 		LightningError => "Lightning Error",
 		InternalServerError => "Internal Server Error",
 		InternalError => "Internal Error",
 	};
 	eprintln!("Error ({}): {}", error_type, e.message);
 	std::process::exit(1); // Exit with status code 1 on error.
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn macaroon_presets_parse_and_appear_in_help() {
+		for (name, expected) in [
+			("readonly", MacaroonPreset::Readonly),
+			("invoice", MacaroonPreset::Invoice),
+			("admin", MacaroonPreset::Admin),
+		] {
+			let cli = Cli::try_parse_from([
+				"ldk-server-cli",
+				"create-macaroon",
+				"test",
+				"--preset",
+				name,
+			])
+			.unwrap();
+			let Commands::CreateMacaroon { preset, .. } = cli.command else {
+				panic!("Expected CreateMacaroon");
+			};
+			assert_eq!(preset, Some(expected));
+		}
+		assert!(Cli::try_parse_from([
+			"ldk-server-cli",
+			"create-macaroon",
+			"test",
+			"--preset",
+			"unknown",
+		])
+		.is_err());
+		let help = Cli::try_parse_from(["ldk-server-cli", "create-macaroon", "--help"])
+			.err()
+			.unwrap()
+			.to_string();
+		assert!(help.contains("[possible values: readonly, invoice, admin]"));
+	}
+
+	#[test]
+	fn onchain_bump_fee_arguments() {
+		for rate in [None, Some("12")] {
+			let mut args = vec!["ldk-server-cli", "onchain-bump-fee", "payment"];
+			if let Some(rate) = rate {
+				args.extend(["--fee-rate-sat-per-vb", rate]);
+			}
+			let cli = Cli::try_parse_from(args).unwrap();
+			match cli.command {
+				Commands::OnchainBumpFee { payment_id, fee_rate_sat_per_vb } => {
+					assert_eq!(payment_id, "payment");
+					assert_eq!(fee_rate_sat_per_vb, rate.map(|r| r.parse().unwrap()));
+				},
+				_ => panic!("wrong command"),
+			}
+		}
+		for rate in ["-1", "1.5", "18446744073709551616"] {
+			assert!(Cli::try_parse_from([
+				"ldk-server-cli",
+				"onchain-bump-fee",
+				"payment",
+				"--fee-rate-sat-per-vb",
+				rate
+			])
+			.is_err());
+		}
+	}
+
+	#[test]
+	fn bump_channel_funding_fee_arguments() {
+		let cli = Cli::try_parse_from(["ldk-server-cli", "bump-channel-funding-fee", "42", "peer"])
+			.unwrap();
+		match cli.command {
+			Commands::BumpChannelFundingFee { user_channel_id, counterparty_node_id } => {
+				assert_eq!(user_channel_id, "42");
+				assert_eq!(counterparty_node_id, "peer");
+			},
+			_ => panic!("wrong command"),
+		}
+		assert!(Cli::try_parse_from([
+			"ldk-server-cli",
+			"bump-channel-funding-fee",
+			"42",
+			"peer",
+			"--fee-rate-sat-per-vb",
+			"10"
+		])
+		.is_err());
+	}
+
+	#[tokio::test]
+	async fn fetch_paginated_collects_multiple_pages() {
+		let response = fetch_paginated(
+			Some(3),
+			None,
+			|page_token| async move {
+				match page_token {
+					None => {
+						Ok::<_, LdkServerError>((vec![1, 2], Some("store:v2:cursor:7".to_string())))
+					},
+					Some(token) => {
+						assert_eq!(token, "store:v2:cursor:7");
+						Ok((vec![3], None))
+					},
+				}
+			},
+			|response| response,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(response.list, vec![1, 2, 3]);
+		assert!(response.next_page_token.is_none());
+	}
+
+	#[test]
+	fn load_client_config_rejects_missing_explicit_path() {
+		let nonce =
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+		let path = std::env::temp_dir()
+			.join(format!("ldk-server-cli-missing-config-{}-{nonce}.toml", std::process::id()));
+
+		let error = load_client_config(Some(path.clone())).unwrap_err();
+
+		assert!(error.contains(&path.display().to_string()));
+	}
+
+	#[test]
+	fn parse_custom_tlv_accepts_valid_record() {
+		let (type_num, value) = parse_custom_tlv("65537:deadbeef").unwrap();
+		assert_eq!(type_num, 65537);
+		assert_eq!(value, vec![0xde, 0xad, 0xbe, 0xef]);
+	}
+
+	#[test]
+	fn parse_custom_tlv_rejects_missing_separator() {
+		let err = parse_custom_tlv("65537").unwrap_err();
+		assert!(err.contains("expected <type_num>:<hex_value>"));
+	}
+
+	#[test]
+	fn parse_custom_tlv_rejects_reserved_type() {
+		let err = parse_custom_tlv("65535:00").unwrap_err();
+		assert!(err.contains("type number must be >= 65536"));
+	}
+
+	#[test]
+	fn parse_custom_tlv_rejects_invalid_hex() {
+		let err = parse_custom_tlv("65537:not-hex").unwrap_err();
+		assert!(err.contains("invalid hex value"));
+	}
 }

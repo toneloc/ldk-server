@@ -192,3 +192,9 @@ Browser → nginx:8080 → /api/* → ldk-server:3002 (internal)
 ```
 
 This eliminates CORS issues since everything is served from the same origin.
+
+> **Status (2026-10-07):** This GUI targets the pre-gRPC REST API and the old
+> `ldk-server-protos` crate. After syncing with upstream (which replaced the REST
+> API with gRPC + macaroons), the GUI no longer compiles and has been excluded
+> from the Cargo workspace. It is kept for reference pending a port to the new
+> `ldk-server-grpc` client.

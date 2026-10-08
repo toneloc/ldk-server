@@ -1,0 +1,751 @@
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+use hex_conservative::DisplayHex;
+use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::ldk_server_grpc::api::{
+	Bolt11ClaimForIdRequest, Bolt11FailForIdRequest, Bolt11ReceiveForHashRequest,
+	Bolt11ReceiveRequest, Bolt11ReceiveVariableAmountViaJitChannelForHashRequest,
+	Bolt11ReceiveVariableAmountViaJitChannelRequest, Bolt11ReceiveViaJitChannelForHashRequest,
+	Bolt11ReceiveViaJitChannelRequest, Bolt11SendRequest, Bolt11SendUnderpayingRequest,
+	Bolt12CreatePayerProofRequest, Bolt12ReceiveRefundRequest, Bolt12ReceiveRequest,
+	Bolt12SendRefundRequest, Bolt12SendRequest, BumpChannelFundingFeeRequest, CloseChannelRequest,
+	ConnectPeerRequest, CreateMacaroonRequest, DecodeInvoiceRequest, DecodeOfferRequest,
+	DisconnectPeerRequest, ExportPathfindingScoresRequest, ForceCloseChannelRequest,
+	GetBalancesRequest, GetChannelForwardingStatsRequest, GetForwardedPaymentDetailsRequest,
+	GetForwardedPaymentTrackingModeRequest, GetNodeInfoRequest, GetPaymentDetailsRequest,
+	GetPermissionsRequest, GraphGetChannelRequest, GraphGetNodeRequest, GraphListChannelsRequest,
+	GraphListNodesRequest, ListChannelForwardingStatsRequest,
+	ListChannelPairForwardingStatsRequest, ListChannelsRequest, ListForwardedPaymentsRequest,
+	ListMacaroonsRequest, ListPaymentsRequest, ListPeersRequest, OnchainBumpFeeRequest,
+	OnchainReceiveRequest, OnchainSendRequest, OpenChannelRequest, RevokeMacaroonRequest,
+	SignMessageRequest, SpliceInRequest, SpliceOutRequest, SpontaneousSendRequest,
+	UnifiedSendRequest, UpdateChannelConfigRequest, VerifySignatureRequest,
+};
+use ldk_server_client::ldk_server_grpc::types::RouteParametersConfig;
+use ldk_server_client::{
+	DEFAULT_EXPIRY_SECS, DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF, DEFAULT_MAX_PATH_COUNT,
+	DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::protocol::McpError;
+
+fn parse_request<T: DeserializeOwned>(args: Value) -> Result<T, McpError> {
+	serde_json::from_value(args).map_err(|e| McpError::invalid_params(e.to_string()))
+}
+
+fn parse_request_with_amount<T: DeserializeOwned>(
+	mut args: Value, amount_field: &str,
+) -> Result<T, McpError> {
+	{
+		let args =
+			args.as_object_mut().ok_or_else(|| McpError::invalid_params("Expected an object"))?;
+		let amount = args
+			.remove(amount_field)
+			.ok_or_else(|| McpError::invalid_params(format!("Missing `{amount_field}`")))?;
+		let amount = match amount {
+			Value::String(value) if value == "all" => json!({"all_funds": {}}),
+			Value::Number(_) => {
+				let mut amount_choice = serde_json::Map::new();
+				amount_choice.insert(amount_field.to_string(), amount);
+				Value::Object(amount_choice)
+			},
+			_ => {
+				return Err(McpError::invalid_params(format!(
+					"`{amount_field}` must be an integer or 'all'"
+				)));
+			},
+		};
+		args.insert("amount".to_string(), amount);
+	}
+	parse_request(args)
+}
+
+fn serialize_response<T: Serialize>(response: T) -> Result<Value, McpError> {
+	serde_json::to_value(response)
+		.map_err(|e| McpError::internal(format!("Failed to serialize response: {e}")))
+}
+
+#[derive(Default)]
+struct RouteParameterDefaults {
+	max_total_cltv_expiry_delta: bool,
+	max_path_count: bool,
+	max_channel_saturation_power_of_half: bool,
+}
+
+impl RouteParameterDefaults {
+	fn from_args(args: &Value) -> Option<Self> {
+		let route_parameters = args.get("route_parameters")?.as_object()?;
+		Some(Self {
+			max_total_cltv_expiry_delta: !route_parameters
+				.contains_key("max_total_cltv_expiry_delta"),
+			max_path_count: !route_parameters.contains_key("max_path_count"),
+			max_channel_saturation_power_of_half: !route_parameters
+				.contains_key("max_channel_saturation_power_of_half"),
+		})
+	}
+
+	fn apply(self, route_parameters: &mut RouteParametersConfig) {
+		if self.max_total_cltv_expiry_delta {
+			route_parameters.max_total_cltv_expiry_delta = DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA;
+		}
+		if self.max_path_count {
+			route_parameters.max_path_count = DEFAULT_MAX_PATH_COUNT;
+		}
+		if self.max_channel_saturation_power_of_half {
+			route_parameters.max_channel_saturation_power_of_half =
+				DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF;
+		}
+	}
+}
+
+fn parse_request_with_route_parameters<T, F>(
+	args: Value, route_parameters: F,
+) -> Result<T, McpError>
+where
+	T: DeserializeOwned,
+	F: FnOnce(&mut T) -> &mut Option<RouteParametersConfig>,
+{
+	let route_defaults = RouteParameterDefaults::from_args(&args);
+	let mut request = parse_request(args)?;
+	if let Some(route_defaults) = route_defaults {
+		if let Some(route_parameters) = route_parameters(&mut request).as_mut() {
+			route_defaults.apply(route_parameters);
+		}
+	}
+	Ok(request)
+}
+
+pub async fn handle_create_macaroon(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: CreateMacaroonRequest = parse_request(args)?;
+	let response = client.create_macaroon(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_list_macaroons(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: ListMacaroonsRequest = parse_request(args)?;
+	let response = client.list_macaroons(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_revoke_macaroon(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: RevokeMacaroonRequest = parse_request(args)?;
+	let response = client.revoke_macaroon(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_get_permissions(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: GetPermissionsRequest = parse_request(args)?;
+	let response = client.get_permissions(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_get_node_info(
+	client: &LdkServerClient, _args: Value,
+) -> Result<Value, McpError> {
+	let response = client.get_node_info(GetNodeInfoRequest {}).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_get_balances(
+	client: &LdkServerClient, _args: Value,
+) -> Result<Value, McpError> {
+	let response = client.get_balances(GetBalancesRequest {}).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_onchain_receive(
+	client: &LdkServerClient, _args: Value,
+) -> Result<Value, McpError> {
+	let response =
+		client.onchain_receive(OnchainReceiveRequest {}).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_onchain_bump_fee(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: OnchainBumpFeeRequest = parse_request(args)?;
+	let response = client.onchain_bump_fee(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_onchain_send(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: OnchainSendRequest = parse_request_with_amount(args, "amount_sats")?;
+	let response = client.onchain_send(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_receive(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let mut request: Bolt11ReceiveRequest = parse_request(args)?;
+	if request.expiry_secs == 0 {
+		request.expiry_secs = DEFAULT_EXPIRY_SECS;
+	}
+	let response = client.bolt11_receive(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_receive_for_hash(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let mut request: Bolt11ReceiveForHashRequest = parse_request(args)?;
+	if request.expiry_secs == 0 {
+		request.expiry_secs = DEFAULT_EXPIRY_SECS;
+	}
+	let response = client.bolt11_receive_for_hash(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_claim_for_id(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: Bolt11ClaimForIdRequest = parse_request(args)?;
+	let response = client.bolt11_claim_for_id(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_fail_for_id(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: Bolt11FailForIdRequest = parse_request(args)?;
+	let response = client.bolt11_fail_for_id(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_receive_via_jit_channel(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let mut request: Bolt11ReceiveViaJitChannelRequest = parse_request(args)?;
+	if request.expiry_secs == 0 {
+		request.expiry_secs = DEFAULT_EXPIRY_SECS;
+	}
+	let response = client.bolt11_receive_via_jit_channel(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_receive_variable_amount_via_jit_channel(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let mut request: Bolt11ReceiveVariableAmountViaJitChannelRequest = parse_request(args)?;
+	if request.expiry_secs == 0 {
+		request.expiry_secs = DEFAULT_EXPIRY_SECS;
+	}
+	let response = client
+		.bolt11_receive_variable_amount_via_jit_channel(request)
+		.await
+		.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_receive_via_jit_channel_for_hash(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let mut request: Bolt11ReceiveViaJitChannelForHashRequest = parse_request(args)?;
+	if request.expiry_secs == 0 {
+		request.expiry_secs = DEFAULT_EXPIRY_SECS;
+	}
+	let response =
+		client.bolt11_receive_via_jit_channel_for_hash(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_receive_variable_amount_via_jit_channel_for_hash(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let mut request: Bolt11ReceiveVariableAmountViaJitChannelForHashRequest = parse_request(args)?;
+	if request.expiry_secs == 0 {
+		request.expiry_secs = DEFAULT_EXPIRY_SECS;
+	}
+	let response = client
+		.bolt11_receive_variable_amount_via_jit_channel_for_hash(request)
+		.await
+		.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_send(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: Bolt11SendRequest =
+		parse_request_with_route_parameters(args, |request: &mut Bolt11SendRequest| {
+			&mut request.route_parameters
+		})?;
+	let response = client.bolt11_send(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt11_send_underpaying(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: Bolt11SendUnderpayingRequest =
+		parse_request_with_route_parameters(args, |request: &mut Bolt11SendUnderpayingRequest| {
+			&mut request.route_parameters
+		})?;
+	let response = client.bolt11_send_underpaying(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt12_receive(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: Bolt12ReceiveRequest = parse_request(args)?;
+	let response = client.bolt12_receive(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt12_send(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: Bolt12SendRequest =
+		parse_request_with_route_parameters(args, |request: &mut Bolt12SendRequest| {
+			&mut request.route_parameters
+		})?;
+	let response = client.bolt12_send(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt12_send_refund(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let mut request: Bolt12SendRefundRequest =
+		parse_request_with_route_parameters(args, |request: &mut Bolt12SendRefundRequest| {
+			&mut request.route_parameters
+		})?;
+	if request.expiry_secs == 0 {
+		request.expiry_secs = DEFAULT_EXPIRY_SECS;
+	}
+	let response = client.bolt12_send_refund(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt12_receive_refund(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: Bolt12ReceiveRefundRequest = parse_request(args)?;
+	let response = client.bolt12_receive_refund(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bolt12_create_payer_proof(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: Bolt12CreatePayerProofRequest = parse_request(args)?;
+	let response = client.bolt12_create_payer_proof(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_spontaneous_send(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: SpontaneousSendRequest =
+		parse_request_with_route_parameters(args, |request: &mut SpontaneousSendRequest| {
+			&mut request.route_parameters
+		})?;
+	let response = client.spontaneous_send(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_unified_send(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: UnifiedSendRequest =
+		parse_request_with_route_parameters(args, |request: &mut UnifiedSendRequest| {
+			&mut request.route_parameters
+		})?;
+	let response = client.unified_send(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_open_channel(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: OpenChannelRequest = parse_request_with_amount(args, "channel_amount_sats")?;
+	let response = client.open_channel(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_splice_in(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: SpliceInRequest = parse_request_with_amount(args, "splice_amount_sats")?;
+	let response = client.splice_in(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_splice_out(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: SpliceOutRequest = parse_request(args)?;
+	let response = client.splice_out(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_bump_channel_funding_fee(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: BumpChannelFundingFeeRequest = parse_request(args)?;
+	let response = client.bump_channel_funding_fee(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_close_channel(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: CloseChannelRequest = parse_request(args)?;
+	let response = client.close_channel(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_force_close_channel(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: ForceCloseChannelRequest = parse_request(args)?;
+	let response = client.force_close_channel(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_list_channels(
+	client: &LdkServerClient, _args: Value,
+) -> Result<Value, McpError> {
+	let response = client.list_channels(ListChannelsRequest {}).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_update_channel_config(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: UpdateChannelConfigRequest = parse_request(args)?;
+	let response = client.update_channel_config(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_list_payments(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: ListPaymentsRequest = parse_request(args)?;
+	let response = client.list_payments(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_get_payment_details(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: GetPaymentDetailsRequest = parse_request(args)?;
+	let response = client.get_payment_details(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_get_forwarded_payment_details(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: GetForwardedPaymentDetailsRequest = parse_request(args)?;
+	let response = client.get_forwarded_payment_details(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_get_forwarded_payment_tracking_mode(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: GetForwardedPaymentTrackingModeRequest = parse_request(args)?;
+	let response =
+		client.get_forwarded_payment_tracking_mode(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_get_channel_forwarding_stats(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: GetChannelForwardingStatsRequest = parse_request(args)?;
+	let response = client.get_channel_forwarding_stats(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_list_channel_forwarding_stats(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: ListChannelForwardingStatsRequest = parse_request(args)?;
+	let response = client.list_channel_forwarding_stats(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_list_channel_pair_forwarding_stats(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: ListChannelPairForwardingStatsRequest = parse_request(args)?;
+	let response =
+		client.list_channel_pair_forwarding_stats(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_list_forwarded_payments(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: ListForwardedPaymentsRequest = parse_request(args)?;
+	let response = client.list_forwarded_payments(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_connect_peer(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: ConnectPeerRequest = parse_request(args)?;
+	let response = client.connect_peer(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_disconnect_peer(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: DisconnectPeerRequest = parse_request(args)?;
+	let response = client.disconnect_peer(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_list_peers(client: &LdkServerClient, _args: Value) -> Result<Value, McpError> {
+	let response = client.list_peers(ListPeersRequest {}).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_decode_invoice(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: DecodeInvoiceRequest = parse_request(args)?;
+	let response = client.decode_invoice(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_decode_offer(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let request: DecodeOfferRequest = parse_request(args)?;
+	let response = client.decode_offer(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+// The proto `message` field is `bytes`, whose Deserialize impl expects a numeric array, but MCP
+// clients naturally pass a UTF-8 string. We deserialize into a local args struct first and then
+// build the proto request from it.
+#[derive(Deserialize)]
+struct SignMessageArgs {
+	message: String,
+}
+
+pub async fn handle_sign_message(client: &LdkServerClient, args: Value) -> Result<Value, McpError> {
+	let SignMessageArgs { message } = parse_request(args)?;
+	let request = SignMessageRequest { message: message.into_bytes().into() };
+	let response = client.sign_message(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+#[derive(Deserialize)]
+struct VerifySignatureArgs {
+	message: String,
+	signature: String,
+	public_key: String,
+}
+
+pub async fn handle_verify_signature(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let VerifySignatureArgs { message, signature, public_key } = parse_request(args)?;
+	let request =
+		VerifySignatureRequest { message: message.into_bytes().into(), signature, public_key };
+	let response = client.verify_signature(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_export_pathfinding_scores(
+	client: &LdkServerClient, _args: Value,
+) -> Result<Value, McpError> {
+	let response = client
+		.export_pathfinding_scores(ExportPathfindingScoresRequest {})
+		.await
+		.map_err(McpError::from)?;
+	Ok(json!({ "pathfinding_scores": response.scores.to_lower_hex_string() }))
+}
+
+pub async fn handle_graph_list_channels(
+	client: &LdkServerClient, _args: Value,
+) -> Result<Value, McpError> {
+	let response =
+		client.graph_list_channels(GraphListChannelsRequest {}).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_graph_get_channel(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: GraphGetChannelRequest = parse_request(args)?;
+	let response = client.graph_get_channel(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_graph_list_nodes(
+	client: &LdkServerClient, _args: Value,
+) -> Result<Value, McpError> {
+	let response =
+		client.graph_list_nodes(GraphListNodesRequest {}).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+pub async fn handle_graph_get_node(
+	client: &LdkServerClient, args: Value,
+) -> Result<Value, McpError> {
+	let request: GraphGetNodeRequest = parse_request(args)?;
+	let response = client.graph_get_node(request).await.map_err(McpError::from)?;
+	serialize_response(response)
+}
+
+#[cfg(test)]
+mod tests {
+	use ldk_server_client::ldk_server_grpc::api::{
+		onchain_send_request, open_channel_request, splice_in_request, CreateMacaroonRequest,
+		RevokeMacaroonRequest,
+	};
+
+	use super::*;
+
+	const NODE_PUBKEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+	#[test]
+	fn parses_macaroon_management_arguments() {
+		let request: CreateMacaroonRequest =
+			parse_request(json!({"name": "reader", "permissions": ["node:read"]})).unwrap();
+		assert_eq!(request.name, "reader");
+		assert_eq!(request.permissions, vec!["node:read"]);
+		assert!(parse_request::<CreateMacaroonRequest>(
+			json!({"name": "reader", "permissions": "node:read"})
+		)
+		.is_err());
+		assert!(parse_request::<RevokeMacaroonRequest>(json!({"id": 123})).is_err());
+	}
+
+	#[test]
+	fn onchain_bump_fee_argument_mapping() {
+		let id = "ab".repeat(32);
+		for rate in [None, Some(12)] {
+			let mut args = json!({"payment_id": id});
+			if let Some(rate) = rate {
+				args["fee_rate_sat_per_vb"] = json!(rate);
+			}
+			let request: OnchainBumpFeeRequest = parse_request(args).unwrap();
+			assert_eq!(request.payment_id, id);
+			assert_eq!(request.fee_rate_sat_per_vb, rate);
+		}
+		for rate in [json!(-1), json!(1.5), json!("10")] {
+			assert!(parse_request::<OnchainBumpFeeRequest>(json!({
+				"payment_id": id, "fee_rate_sat_per_vb": rate
+			}))
+			.is_err());
+		}
+	}
+
+	#[test]
+	fn bump_channel_funding_fee_argument_mapping() {
+		let args = json!({
+			"user_channel_id": "340282366920938463463374607431768211455",
+			"counterparty_node_id": "peer"
+		});
+		let request: BumpChannelFundingFeeRequest = parse_request(args).unwrap();
+		assert_eq!(request.user_channel_id, u128::MAX.to_string());
+		assert_eq!(request.counterparty_node_id, "peer");
+	}
+
+	#[test]
+	fn parse_request_with_amount_accepts_all() {
+		let request: OpenChannelRequest = parse_request_with_amount(
+			json!({
+				"node_pubkey": NODE_PUBKEY,
+				"address": "127.0.0.1:9735",
+				"channel_amount_sats": "all"
+			}),
+			"channel_amount_sats",
+		)
+		.unwrap();
+
+		assert!(matches!(request.amount, Some(open_channel_request::Amount::AllFunds(_))));
+	}
+
+	#[test]
+	fn parse_request_with_amount_preserves_exact_amount() {
+		let splice_amount_sats = 50_000;
+		let request: SpliceInRequest = parse_request_with_amount(
+			json!({
+				"user_channel_id": "42",
+				"counterparty_node_id": NODE_PUBKEY,
+				"splice_amount_sats": splice_amount_sats
+			}),
+			"splice_amount_sats",
+		)
+		.unwrap();
+
+		assert!(matches!(
+			request.amount,
+			Some(splice_in_request::Amount::SpliceAmountSats(amount_sats))
+				if amount_sats == splice_amount_sats
+		));
+	}
+
+	#[test]
+	fn parse_request_with_amount_populates_onchain_oneof() {
+		let request: OnchainSendRequest = parse_request_with_amount(
+			json!({
+				"address": "bc1qexample",
+				"amount_sats": "all"
+			}),
+			"amount_sats",
+		)
+		.unwrap();
+
+		assert!(matches!(request.amount, Some(onchain_send_request::Amount::AllFunds(_))));
+	}
+
+	#[test]
+	fn parse_request_with_route_parameters_fills_missing_defaults() {
+		let request: Bolt11SendRequest = parse_request_with_route_parameters(
+			json!({
+				"invoice": "lnbc1example",
+				"route_parameters": {
+					"max_path_count": 3
+				}
+			}),
+			|request: &mut Bolt11SendRequest| &mut request.route_parameters,
+		)
+		.unwrap();
+
+		let route_parameters = request.route_parameters.unwrap();
+		assert_eq!(
+			route_parameters.max_total_cltv_expiry_delta,
+			DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA
+		);
+		assert_eq!(route_parameters.max_path_count, 3);
+		assert_eq!(
+			route_parameters.max_channel_saturation_power_of_half,
+			DEFAULT_MAX_CHANNEL_SATURATION_POWER_OF_HALF
+		);
+	}
+
+	#[test]
+	fn parse_request_with_route_parameters_preserves_explicit_values() {
+		let request: UnifiedSendRequest = parse_request_with_route_parameters(
+			json!({
+				"uri": "bitcoin:tb1qexample?amount=0.001",
+				"route_parameters": {
+					"max_total_cltv_expiry_delta": 0,
+					"max_path_count": 1,
+					"max_channel_saturation_power_of_half": 4
+				}
+			}),
+			|request: &mut UnifiedSendRequest| &mut request.route_parameters,
+		)
+		.unwrap();
+
+		let route_parameters = request.route_parameters.unwrap();
+		assert_eq!(route_parameters.max_total_cltv_expiry_delta, 0);
+		assert_eq!(route_parameters.max_path_count, 1);
+		assert_eq!(route_parameters.max_channel_saturation_power_of_half, 4);
+	}
+}

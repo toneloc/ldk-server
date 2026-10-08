@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["ldk-server-cli", "ldk-server-client", "ldk-server-protos", "ldk-server", "ldk-server-gui"]
-exclude = ["e2e-tests"]
+members = ["ldk-server-cli", "ldk-server-client", "ldk-server-grpc", "ldk-server", "ldk-server-mcp", "ldk-server-macaroons"]
+exclude = ["e2e-tests", "ldk-server-gui"]
 
 [profile.release]
 panic = "abort"

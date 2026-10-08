@@ -2,6 +2,13 @@ name: Continuous Integration Checks
 
 on: [ push, pull_request ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     strategy:
@@ -23,7 +30,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
       - name: Install Rust ${{ matrix.toolchain }} toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain ${{ matrix.toolchain }}
@@ -31,18 +38,22 @@ jobs:
           if [ "${{ matrix.msrv }}" = "true" ]; then rustup component add clippy; fi
       - name: Check formatting
         if: matrix.check-fmt
-        run: rustup component add rustfmt && cargo fmt --all -- --check
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all -- --check
+          # e2e-tests is excluded from the workspace and must be checked separately
+          cargo fmt --manifest-path e2e-tests/Cargo.toml --all -- --check
       - name: Pin packages to allow for MSRV
         if: matrix.msrv
-        run: | # None needed yet
-          echo "No packages need pinning for MSRV ${{ matrix.toolchain }}"
+        run: |
+          cargo update -p idna_adapter --precise "1.2.0" --verbose # idna_adapter 1.2.1 uses ICU4X 2.2.0, requiring 1.86 and newer
       - name: Build on Rust ${{ matrix.toolchain }}
         run: cargo build --verbose --color always
       - name: Check clippy if on msrv
         if: matrix.msrv
         run: cargo clippy --all-features -- -D warnings
       - name: Test on Rust ${{ matrix.toolchain }}
-        run: cargo test
+        run: cargo test --all-features
       - name: Cargo check release on Rust ${{ matrix.toolchain }}
         run: cargo check --release
       - name: Cargo check doc on Rust ${{ matrix.toolchain }}

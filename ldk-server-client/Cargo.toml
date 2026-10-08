@@ -1,21 +1,33 @@
 [package]
 name = "ldk-server-client"
 version = "0.1.0"
+authors = ["benthecarman <benthecarman@live.com>", "Elias Rohrer <dev@tnull.de>"]
+homepage = "https://lightningdevkit.org/"
+license = "MIT OR Apache-2.0"
 edition = "2021"
+rust-version = "1.85"
+description = "An async Rust client library for communicating with LDK Server."
+repository = "https://github.com/lightningdevkit/ldk-server/"
+documentation = "https://docs.rs/ldk-server-client"
+readme = "README.md"
+keywords = ["bitcoin", "lightning", "ldk", "server"]
+categories = ["cryptography::cryptocurrencies"]
 
 [features]
-default = ["native"]
-native = []
-serde = ["ldk-server-protos/serde"]
+default = []
+serde = ["dep:serde", "dep:toml", "ldk-server-grpc/serde"]
 
 [dependencies]
-ldk-server-protos = { path = "../ldk-server-protos" }
+ldk-server-grpc = { path = "../ldk-server-grpc" }
+ldk-server-macaroons = { path = "../ldk-server-macaroons" }
+reqwest = { version = "0.11.13", default-features = false, features = ["rustls-tls"] }
 prost = { version = "0.11.6", default-features = false, features = ["std", "prost-derive"] }
-bitcoin_hashes = "0.14"
+hyper = { version = "0.14", default-features = false, features = ["client", "http2", "runtime", "tcp"] }
+hyper-rustls = { version = "0.24", default-features = false, features = ["http2", "tls12", "tokio-runtime"] }
+rustls = "0.21"
+rustls-pemfile = "1"
+serde = { version = "1.0", features = ["derive"], optional = true }
+toml = { version = "0.8", default-features = false, features = ["parse"], optional = true }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-reqwest = { version = "0.12", default-features = false }
-js-sys = "0.3"
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

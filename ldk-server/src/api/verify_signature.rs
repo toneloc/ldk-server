@@ -8,16 +8,17 @@
 // licenses.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
-use ldk_server_protos::api::{VerifySignatureRequest, VerifySignatureResponse};
+use ldk_server_grpc::api::{VerifySignatureRequest, VerifySignatureResponse};
 
 use crate::api::error::LdkServerError;
 use crate::api::error::LdkServerErrorCode::InvalidRequestError;
 use crate::service::Context;
 
-pub(crate) fn handle_verify_signature_request(
-	context: Context, request: VerifySignatureRequest,
+pub(crate) async fn handle_verify_signature_request(
+	context: Arc<Context>, request: VerifySignatureRequest,
 ) -> Result<VerifySignatureResponse, LdkServerError> {
 	let public_key = PublicKey::from_str(&request.public_key).map_err(|_| {
 		LdkServerError::new(InvalidRequestError, "Invalid public_key provided.".to_string())

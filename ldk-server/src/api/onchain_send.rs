@@ -8,16 +8,19 @@
 // licenses.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
-use ldk_node::bitcoin::{Address, FeeRate};
-use ldk_server_protos::api::{OnchainSendRequest, OnchainSendResponse};
+use ldk_node::bitcoin::Address;
+use ldk_server_grpc::api::onchain_send_request::Amount;
+use ldk_server_grpc::api::{OnchainSendRequest, OnchainSendResponse};
 
 use crate::api::error::LdkServerError;
 use crate::api::error::LdkServerErrorCode::InvalidRequestError;
+use crate::api::{parse_fee_rate, require_amount};
 use crate::service::Context;
 
-pub(crate) fn handle_onchain_send_request(
-	context: Context, request: OnchainSendRequest,
+pub(crate) async fn handle_onchain_send_request(
+	context: Arc<Context>, request: OnchainSendRequest,
 ) -> Result<OnchainSendResponse, LdkServerError> {
 	let address = Address::from_str(&request.address)
 		.map_err(|_| ldk_node::NodeError::InvalidAddress)?
@@ -29,20 +32,13 @@ pub(crate) fn handle_onchain_send_request(
 			)
 		})?;
 
-	let fee_rate = request.fee_rate_sat_per_vb.and_then(FeeRate::from_sat_per_vb);
-	let txid = match (request.amount_sats, request.send_all) {
-		(Some(amount_sats), None) => {
+	let fee_rate = parse_fee_rate(request.fee_rate_sat_per_vb)?;
+	let txid = match require_amount(request.amount)? {
+		Amount::AmountSats(amount_sats) => {
 			context.node.onchain_payment().send_to_address(&address, amount_sats, fee_rate)?
 		},
-		// Retain existing api behaviour to not retain reserves on `send_all_to_address`.
-		(None, Some(true)) => {
-			context.node.onchain_payment().send_all_to_address(&address, false, fee_rate)?
-		},
-		_ => {
-			return Err(LdkServerError::new(
-				InvalidRequestError,
-				"Must specify either `send_all` or `amount_sats`, but not both or neither",
-			))
+		Amount::AllFunds(_) => {
+			context.node.onchain_payment().send_all_to_address(&address, true, fee_rate)?
 		},
 	};
 	let response = OnchainSendResponse { txid: txid.to_string() };

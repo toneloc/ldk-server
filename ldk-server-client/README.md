@@ -1,0 +1,114 @@
+# ldk-server-client
+
+Async Rust client library for communicating with an [LDK Server](https://github.com/lightningdevkit/ldk-server)
+node over gRPC. Uses `reqwest` for unary RPCs and `hyper` for server-streaming (event
+subscriptions).
+
+## Usage
+
+```rust,no_run
+use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::ldk_server_grpc::api::GetNodeInfoRequest;
+
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+let cert_pem = std::fs::read("/path/to/tls.crt").unwrap();
+let macaroon = "your_hex_macaroon".to_string();
+
+let client = LdkServerClient::new(
+    "localhost:3536".to_string(),
+    macaroon,
+    &cert_pem,
+).unwrap();
+
+let info = client.get_node_info(GetNodeInfoRequest {}).await.unwrap();
+println!("Node ID: {}", info.node_id);
+# }
+```
+
+## Authentication
+
+Pass your hex macaroon and the server's TLS certificate to `LdkServerClient::new`.
+The default files are `<storage_dir>/<network>/macaroons/admin.macaroon` and
+`<storage_dir>/tls.crt`.
+
+The client keeps your macaroon private and sends a copy tied to each request's method, body,
+and time. Keep client and server clocks within 60 seconds. The same request can still be
+replayed while its token is valid.
+
+For custom transports, use `macaroon::bind_macaroon_to_request`.
+See [Request binding](../docs/api-guide.md#request-binding) for the required body format.
+
+## Event Streaming
+
+Subscribe to real-time payment and channel events:
+
+```rust,no_run
+# use ldk_server_client::client::LdkServerClient;
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+# let cert_pem = std::fs::read("/path/to/tls.crt").unwrap();
+# let client = LdkServerClient::new("localhost:3536".to_string(), "key".to_string(), &cert_pem).unwrap();
+let mut stream = client.subscribe_events().await.unwrap();
+while let Some(result) = stream.next_message().await {
+    match result {
+        Ok(event) => println!("Event: {:?}", event),
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
+# }
+```
+
+Pattern-match channel state changes:
+
+```rust,no_run
+# use ldk_server_client::client::LdkServerClient;
+# use ldk_server_client::ldk_server_grpc::events::{event_envelope, ChannelState};
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+# let cert_pem = std::fs::read("/path/to/tls.crt").unwrap();
+# let client = LdkServerClient::new("localhost:3536".to_string(), "key".to_string(), &cert_pem).unwrap();
+let mut stream = client.subscribe_events().await.unwrap();
+while let Some(result) = stream.next_message().await {
+    match result {
+        Ok(event) => {
+            if let Some(event_envelope::Event::ChannelStateChanged(channel_event)) = event.event {
+                let state = ChannelState::from_i32(channel_event.state)
+                    .unwrap_or(ChannelState::Unspecified);
+                println!(
+                    "channel {} -> {}",
+                    channel_event.channel_id,
+                    state.as_str_name()
+                );
+
+                if let Some(reason) = channel_event.reason {
+                    println!("reason: {}", reason.message);
+                }
+            }
+        }
+        Err(e) => eprintln!("Error: {}", e),
+    }
+}
+# }
+```
+
+## Features
+
+- **`serde`**: Enables `serde::Serialize` and `serde::Deserialize` on all proto types
+  (via `ldk-server-grpc/serde`). Useful for JSON serialization.
+
+## Error Handling
+
+All methods return `Result<T, LdkServerError>`. Error codes map to gRPC status codes:
+
+| `LdkServerErrorCode`  | gRPC Code               | Meaning                   |
+|-----------------------|-------------------------|---------------------------|
+| `InvalidRequestError` | INVALID_ARGUMENT (3)    | Bad request parameters    |
+| `LightningError`      | FAILED_PRECONDITION (9) | Lightning operation error |
+| `InternalServerError` | INTERNAL (13)           | Server bug                |
+| `AuthError`           | UNAUTHENTICATED (16)    | Invalid credentials       |
+| `AuthorizationError`  | PERMISSION_DENIED (7)   | Missing permission        |
+
+## Documentation
+
+- [API Guide](../docs/api-guide.md): full endpoint reference, auth details, and usage patterns

@@ -7,18 +7,35 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::{fs, io};
+use std::time::Duration;
 
 use clap::Parser;
+use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::Network;
+use ldk_node::config::{
+	AsyncPaymentsRole, ForwardedPaymentTrackingMode, HRNResolverConfig, HumanReadableNamesConfig,
+};
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::routing::gossip::NodeAlias;
 use ldk_node::liquidity::LSPS2ServiceConfig;
+use ldk_node::probing::{ProbingConfig, ProbingConfigBuilder};
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
+
+use crate::util::read_to_string_with_limit;
+
+const CONFIG_FILE_SIZE_LIMIT: usize = 1024 * 1024;
+const POSTGRES_CERTIFICATE_SIZE_LIMIT: usize = 1024 * 1024;
+const DEFAULT_GRPC_SERVICE_ADDRESS: &str = "127.0.0.1:3536";
+const DEFAULT_PATHFINDING_SCORES_SOURCE_URL: &str =
+	"https://rapidsync.lightningdevkit.org/scoring/scorer.bin";
+const DEFAULT_LOG_MAX_SIZE_MB: u64 = 50;
+const DEFAULT_LOG_ROTATION_INTERVAL_HOURS: u64 = 24;
+const DEFAULT_LOG_MAX_FILES: usize = 5;
 
 #[cfg(not(test))]
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
@@ -43,14 +60,39 @@ pub struct Config {
 	pub alias: Option<NodeAlias>,
 	pub network: Network,
 	pub tls_config: Option<TlsConfig>,
-	pub rest_service_addr: SocketAddr,
+	pub grpc_service_addr: SocketAddr,
 	pub storage_dir_path: Option<String>,
+	pub ldk_node_storage: LdkNodeStorageConfig,
 	pub chain_source: ChainSource,
-	pub rabbitmq_connection_string: String,
-	pub rabbitmq_exchange_name: String,
+	pub rgs_server_url: Option<String>,
+	pub lsps_client_config: Option<Vec<LSPSClientConfig>>,
+	#[cfg_attr(not(feature = "experimental-lsps2-support"), allow(dead_code))]
 	pub lsps2_service_config: Option<LSPS2ServiceConfig>,
 	pub log_level: LevelFilter,
 	pub log_file_path: Option<String>,
+	pub log_max_size_bytes: usize,
+	pub log_rotation_interval_secs: u64,
+	pub log_max_files: usize,
+	pub log_to_file: bool,
+	pub pathfinding_scores_source_url: Option<String>,
+	pub probing_config: Option<ProbingConfig>,
+	pub async_payments_role: Option<AsyncPaymentsRole>,
+	pub enable_zero_fee_commitments: bool,
+	pub forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode,
+	pub metrics_enabled: bool,
+	pub poll_metrics_interval: Option<u64>,
+	pub metrics_username: Option<String>,
+	pub metrics_password: Option<String>,
+	pub tor_config: Option<TorConfig>,
+	pub hrn_config: HumanReadableNamesConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LSPSClientConfig {
+	pub node_id: PublicKey,
+	pub address: SocketAddress,
+	pub token: Option<String>,
+	pub trust_peer_0conf: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,11 +102,44 @@ pub struct TlsConfig {
 	pub hosts: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LdkNodeStorageConfig {
+	Sqlite,
+	Postgres {
+		connection_string: String,
+		db_name: Option<String>,
+		kv_table_name: Option<String>,
+		certificate_pem: Option<String>,
+	},
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChainSource {
-	Rpc { rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String },
-	Electrum { server_url: String },
-	Esplora { server_url: String },
+	Rpc {
+		rpc_host: String,
+		rpc_port: u16,
+		rpc_user: String,
+		rpc_password: String,
+		/// When set, block/header/tx data is sourced from Bitcoin Core's REST interface
+		/// instead of RPC. RPC is still used for calls REST doesn't support (e.g.
+		/// transaction broadcast).
+		rest_host: Option<String>,
+		rest_port: Option<u16>,
+		wallet_rescan_from_height: Option<u32>,
+	},
+	Electrum {
+		server_url: String,
+		force_wallet_full_scan: bool,
+	},
+	Esplora {
+		server_url: String,
+		force_wallet_full_scan: bool,
+	},
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct TorConfig {
+	pub proxy_address: SocketAddress,
 }
 
 /// A builder for `Config`.
@@ -75,18 +150,36 @@ struct ConfigBuilder {
 	alias: Option<String>,
 	network: Option<Network>,
 	tls_config: Option<TlsConfig>,
-	rest_service_address: Option<String>,
+	grpc_service_address: Option<String>,
 	storage_dir_path: Option<String>,
+	ldk_node_postgres: Option<PostgresStorageConfig>,
 	electrum_url: Option<String>,
 	esplora_url: Option<String>,
 	bitcoind_rpc_address: Option<String>,
 	bitcoind_rpc_user: Option<String>,
 	bitcoind_rpc_password: Option<String>,
-	rabbitmq_connection_string: Option<String>,
-	rabbitmq_exchange_name: Option<String>,
-	lsps2: Option<LiquidityConfig>,
+	bitcoind_rest_address: Option<String>,
+	rescan_from_height: Option<u32>,
+	force_wallet_full_scan: bool,
+	rgs_server_url: Option<String>,
+	lsps: Option<LiquidityConfig>,
 	log_level: Option<String>,
 	log_file_path: Option<String>,
+	log_max_size_mb: Option<u64>,
+	log_rotation_interval_hours: Option<u64>,
+	log_max_files: Option<usize>,
+	log_to_file: Option<bool>,
+	pathfinding_scores_source_url: Option<String>,
+	probing: Option<ProbingTomlConfig>,
+	async_payments_role: Option<String>,
+	enable_zero_fee_commitments: Option<bool>,
+	forwarded_payment_tracking_mode: Option<String>,
+	metrics_enabled: Option<bool>,
+	poll_metrics_interval: Option<u64>,
+	metrics_username: Option<String>,
+	metrics_password: Option<String>,
+	tor_proxy_address: Option<String>,
+	hrn: Option<HrnTomlConfig>,
 }
 
 impl ConfigBuilder {
@@ -97,14 +190,28 @@ impl ConfigBuilder {
 				node.listening_addresses.or(self.listening_addresses.clone());
 			self.announcement_addresses =
 				node.announcement_addresses.or(self.announcement_addresses.clone());
-			self.rest_service_address =
-				node.rest_service_address.or(self.rest_service_address.clone());
+			self.grpc_service_address =
+				node.grpc_service_address.or(self.grpc_service_address.clone());
 			self.alias = node.alias.or(self.alias.clone());
+			self.pathfinding_scores_source_url =
+				node.pathfinding_scores_source_url.or(self.pathfinding_scores_source_url.clone());
+			self.async_payments_role =
+				node.async_payments_role.or(self.async_payments_role.clone());
+			self.enable_zero_fee_commitments =
+				node.enable_zero_fee_commitments.or(self.enable_zero_fee_commitments);
+			self.forwarded_payment_tracking_mode = node
+				.forwarded_payment_tracking_mode
+				.or(self.forwarded_payment_tracking_mode.clone());
+			self.rgs_server_url = node.rgs_server_url.or(self.rgs_server_url.clone());
 		}
 
 		if let Some(storage) = toml.storage {
-			self.storage_dir_path =
-				storage.disk.and_then(|d| d.dir_path).or(self.storage_dir_path.clone());
+			self.storage_dir_path = storage
+				.disk
+				.as_ref()
+				.and_then(|d| d.dir_path.clone())
+				.or(self.storage_dir_path.clone());
+			self.ldk_node_postgres = storage.postgres.or(self.ldk_node_postgres.clone());
 		}
 
 		if let Some(bitcoind) = toml.bitcoind {
@@ -112,6 +219,8 @@ impl ConfigBuilder {
 			self.bitcoind_rpc_user = bitcoind.rpc_user.or(self.bitcoind_rpc_user.clone());
 			self.bitcoind_rpc_password =
 				bitcoind.rpc_password.or(self.bitcoind_rpc_password.clone());
+			self.bitcoind_rest_address =
+				bitcoind.rest_address.or(self.bitcoind_rest_address.clone());
 		}
 
 		if let Some(electrum) = toml.electrum {
@@ -125,15 +234,15 @@ impl ConfigBuilder {
 		if let Some(log) = toml.log {
 			self.log_level = log.level.or(self.log_level.clone());
 			self.log_file_path = log.file.or(self.log_file_path.clone());
-		}
-
-		if let Some(rabbitmq) = toml.rabbitmq {
-			self.rabbitmq_connection_string = Some(rabbitmq.connection_string);
-			self.rabbitmq_exchange_name = Some(rabbitmq.exchange_name);
+			self.log_max_size_mb = log.max_size_mb.or(self.log_max_size_mb);
+			self.log_rotation_interval_hours =
+				log.rotation_interval_hours.or(self.log_rotation_interval_hours);
+			self.log_max_files = log.max_files.or(self.log_max_files);
+			self.log_to_file = log.log_to_file.or(self.log_to_file);
 		}
 
 		if let Some(liquidity) = toml.liquidity {
-			self.lsps2 = Some(liquidity);
+			self.lsps = Some(liquidity);
 		}
 
 		if let Some(tls) = toml.tls {
@@ -142,6 +251,26 @@ impl ConfigBuilder {
 				key_path: tls.key_path,
 				hosts: tls.hosts.unwrap_or_default(),
 			});
+		}
+
+		if let Some(metrics) = toml.metrics {
+			self.metrics_enabled = metrics.enabled.or(self.metrics_enabled);
+			self.poll_metrics_interval =
+				metrics.poll_metrics_interval.or(self.poll_metrics_interval);
+			self.metrics_username = metrics.username.or(self.metrics_username.clone());
+			self.metrics_password = metrics.password.or(self.metrics_password.clone());
+		}
+
+		if let Some(probing) = toml.probing {
+			self.probing = Some(probing);
+		}
+
+		if let Some(tor) = toml.tor {
+			self.tor_proxy_address = Some(tor.proxy_address)
+		}
+
+		if let Some(hrn) = toml.hrn {
+			self.hrn = Some(hrn);
 		}
 	}
 
@@ -158,8 +287,8 @@ impl ConfigBuilder {
 			self.announcement_addresses = Some(node_announcement_addresses.clone());
 		}
 
-		if let Some(node_rest_service_address) = &args.node_rest_service_address {
-			self.rest_service_address = Some(node_rest_service_address.clone());
+		if let Some(node_grpc_service_address) = &args.node_grpc_service_address {
+			self.grpc_service_address = Some(node_grpc_service_address.clone());
 		}
 
 		if let Some(node_alias) = &args.node_alias {
@@ -178,17 +307,131 @@ impl ConfigBuilder {
 			self.bitcoind_rpc_password = Some(bitcoind_rpc_password.clone());
 		}
 
+		if let Some(bitcoind_rest_address) = &args.bitcoind_rest_address {
+			self.bitcoind_rest_address = Some(bitcoind_rest_address.clone());
+		}
+
+		if let Some(rescan_from_height) = args.rescan_from_height {
+			self.rescan_from_height = Some(rescan_from_height);
+		}
+
+		if args.force_wallet_full_scan {
+			self.force_wallet_full_scan = true;
+		}
+
 		if let Some(storage_dir_path) = &args.storage_dir_path {
 			self.storage_dir_path = Some(storage_dir_path.clone());
+		}
+
+		if args.storage_postgres_connection_string.is_some()
+			|| args.storage_postgres_db_name.is_some()
+			|| args.storage_postgres_kv_table_name.is_some()
+			|| args.storage_postgres_certificate_path.is_some()
+		{
+			let postgres = self.ldk_node_postgres.get_or_insert_default();
+			if let Some(connection_string) = &args.storage_postgres_connection_string {
+				postgres.connection_string = Some(connection_string.clone());
+			}
+			if let Some(db_name) = &args.storage_postgres_db_name {
+				postgres.db_name = Some(db_name.clone());
+			}
+			if let Some(kv_table_name) = &args.storage_postgres_kv_table_name {
+				postgres.kv_table_name = Some(kv_table_name.clone());
+			}
+			if let Some(certificate_path) = &args.storage_postgres_certificate_path {
+				postgres.certificate_path = Some(certificate_path.clone());
+			}
+		}
+
+		if let Some(pathfinding_scores_source_url) = &args.pathfinding_scores_source_url {
+			self.pathfinding_scores_source_url = Some(pathfinding_scores_source_url.clone());
+		}
+
+		if let Some(async_payments_role) = &args.node_async_payments_role {
+			self.async_payments_role = Some(async_payments_role.clone());
+		}
+
+		if let Some(enable_zero_fee_commitments) = args.node_enable_zero_fee_commitments {
+			self.enable_zero_fee_commitments = Some(enable_zero_fee_commitments);
+		}
+
+		if let Some(mode) = &args.node_forwarded_payment_tracking_mode {
+			self.forwarded_payment_tracking_mode = Some(mode.clone());
+		}
+
+		if args.has_probing_options() {
+			let probing = self.probing.get_or_insert_default();
+			if let Some(probing_strategy) = &args.probing_strategy {
+				probing.strategy = Some(probing_strategy.clone());
+				match probing_strategy.trim().to_ascii_lowercase().as_str() {
+					"high_degree" | "high-degree" => probing.max_hops = None,
+					"random_walk" | "random-walk" => probing.top_node_count = None,
+					_ => {},
+				}
+			}
+			if let Some(top_node_count) = args.probing_top_node_count {
+				probing.top_node_count = Some(top_node_count);
+			}
+			if let Some(max_hops) = args.probing_max_hops {
+				probing.max_hops = Some(max_hops);
+			}
+			if let Some(interval_secs) = args.probing_interval_secs {
+				probing.interval_secs = Some(interval_secs);
+			}
+			if let Some(max_locked_msat) = args.probing_max_locked_msat {
+				probing.max_locked_msat = Some(max_locked_msat);
+			}
+			if let Some(diversity_penalty_msat) = args.probing_diversity_penalty_msat {
+				probing.diversity_penalty_msat = Some(diversity_penalty_msat);
+			}
+			if let Some(cooldown_secs) = args.probing_cooldown_secs {
+				probing.cooldown_secs = Some(cooldown_secs);
+			}
+		}
+
+		if args.metrics_enabled {
+			self.metrics_enabled = Some(true);
+		}
+
+		if let Some(poll_metrics_interval) = &args.poll_metrics_interval {
+			self.poll_metrics_interval = Some(*poll_metrics_interval);
+		}
+
+		if let Some(metrics_username) = &args.metrics_username {
+			self.metrics_username = Some(metrics_username.clone());
+		}
+
+		if let Some(metrics_password) = &args.metrics_password {
+			self.metrics_password = Some(metrics_password.clone());
+		}
+
+		if let Some(tor_proxy_address) = &args.tor_proxy_address {
+			self.tor_proxy_address = Some(tor_proxy_address.clone());
+		}
+
+		if let Some(log_max_size_mb) = args.log_max_size_mb {
+			self.log_max_size_mb = Some(log_max_size_mb);
+		}
+
+		if let Some(log_rotation_interval_hours) = args.log_rotation_interval_hours {
+			self.log_rotation_interval_hours = Some(log_rotation_interval_hours);
+		}
+
+		if let Some(log_max_files) = args.log_max_files {
+			self.log_max_files = Some(log_max_files);
+		}
+
+		if let Some(log_to_file) = args.log_to_file {
+			self.log_to_file = Some(log_to_file);
 		}
 	}
 
 	fn build(self) -> io::Result<Config> {
 		let network = self.network.ok_or_else(|| missing_field_err("network"))?;
 
-		let rest_service_addr = self
-			.rest_service_address
-			.ok_or_else(|| missing_field_err("rest_service_address"))?
+		let grpc_service_addr = self
+			.grpc_service_address
+			.unwrap_or_else(|| DEFAULT_GRPC_SERVICE_ADDRESS.to_string())
 			.parse::<SocketAddr>()
 			.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
@@ -238,7 +481,8 @@ impl ConfigBuilder {
 
 		let rpc_configured = self.bitcoind_rpc_address.is_some()
 			|| self.bitcoind_rpc_user.is_some()
-			|| self.bitcoind_rpc_password.is_some();
+			|| self.bitcoind_rpc_password.is_some()
+			|| self.bitcoind_rest_address.is_some();
 		let electrum_configured = self.electrum_url.is_some();
 		let esplora_configured = self.esplora_url.is_some();
 
@@ -255,6 +499,13 @@ impl ConfigBuilder {
 		}
 
 		let chain_source = if rpc_configured {
+			if self.force_wallet_full_scan {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"`--force-wallet-full-scan` requires the Electrum or Esplora chain source.",
+				));
+			}
+
 			let rpc_address = self
 				.bitcoind_rpc_address
 				.ok_or_else(|| missing_field_err("bitcoind_rpc_address"))?;
@@ -267,13 +518,48 @@ impl ConfigBuilder {
 				.bitcoind_rpc_password
 				.ok_or_else(|| missing_field_err("bitcoind_rpc_password"))?;
 
-			ChainSource::Rpc { rpc_host, rpc_port, rpc_user, rpc_password }
+			let (rest_host, rest_port) = self
+				.bitcoind_rest_address
+				.map(|rest_address| parse_host_port(&rest_address))
+				.transpose()?
+				.unzip();
+
+			ChainSource::Rpc {
+				rpc_host,
+				rpc_port,
+				rpc_user,
+				rpc_password,
+				rest_host,
+				rest_port,
+				wallet_rescan_from_height: self.rescan_from_height,
+			}
 		} else if let Some(url) = self.electrum_url {
-			ChainSource::Electrum { server_url: url }
+			if self.rescan_from_height.is_some() {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"`--rescan-from-height` requires the bitcoind RPC chain source.",
+				));
+			}
+			ChainSource::Electrum {
+				server_url: url,
+				force_wallet_full_scan: self.force_wallet_full_scan,
+			}
 		} else if let Some(url) = self.esplora_url {
-			ChainSource::Esplora { server_url: url }
+			if self.rescan_from_height.is_some() {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"`--rescan-from-height` requires the bitcoind RPC chain source.",
+				));
+			}
+			ChainSource::Esplora {
+				server_url: url,
+				force_wallet_full_scan: self.force_wallet_full_scan,
+			}
 		} else {
-			return Err(io::Error::new(io::ErrorKind::InvalidInput, "No valid Chain Source configured. Provide Bitcoind RPC, Electrum, or Esplora details."));
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"No valid Chain Source configured. Provide Bitcoind, Electrum, or Esplora details.",
+			));
 		};
 
 		let log_level = self
@@ -290,33 +576,70 @@ impl ConfigBuilder {
 			.transpose()?
 			.unwrap_or(LevelFilter::Debug);
 
-		#[cfg(feature = "events-rabbitmq")]
-		let (rabbitmq_connection_string, rabbitmq_exchange_name) = {
-			let connection_string = self.rabbitmq_connection_string.ok_or_else(|| io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"Both `rabbitmq.connection_string` and `rabbitmq.exchange_name` must be configured if enabling `events-rabbitmq` feature."
-			))?;
-			let exchange_name = self.rabbitmq_exchange_name.ok_or_else(|| io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"Both `rabbitmq.connection_string` and `rabbitmq.exchange_name` must be configured if enabling `events-rabbitmq` feature."
-			))?;
+		let log_max_size_bytes =
+			self.log_max_size_mb.unwrap_or(DEFAULT_LOG_MAX_SIZE_MB) * 1024 * 1024;
+		let log_rotation_interval_secs =
+			self.log_rotation_interval_hours.unwrap_or(DEFAULT_LOG_ROTATION_INTERVAL_HOURS)
+				* 60 * 60;
+		let log_max_files = self.log_max_files.unwrap_or(DEFAULT_LOG_MAX_FILES);
+		let log_to_file = self.log_to_file.unwrap_or(true);
 
-			if connection_string.is_empty() || exchange_name.is_empty() {
-				return Err(io::Error::new(
-					io::ErrorKind::InvalidInput,
-					"Both `rabbitmq.connection_string` and `rabbitmq.exchange_name` must be configured if enabling `events-rabbitmq` feature."
-				));
+		let ldk_node_storage = if let Some(postgres) = self.ldk_node_postgres {
+			LdkNodeStorageConfig::Postgres {
+				connection_string: postgres
+					.connection_string
+					.ok_or_else(|| missing_field_err("storage_postgres_connection_string"))?,
+				db_name: postgres.db_name,
+				kv_table_name: postgres.kv_table_name,
+				certificate_pem: postgres
+					.certificate_path
+					.map(|path| {
+						read_to_string_with_limit(Path::new(&path), POSTGRES_CERTIFICATE_SIZE_LIMIT)
+							.map_err(|e| {
+								io::Error::new(
+									e.kind(),
+									format!(
+										"Failed to read PostgreSQL certificate file '{}': {}",
+										path, e
+									),
+								)
+							})
+					})
+					.transpose()?,
 			}
-
-			(connection_string, exchange_name)
+		} else {
+			LdkNodeStorageConfig::Sqlite
 		};
 
-		#[cfg(not(feature = "events-rabbitmq"))]
-		let (rabbitmq_connection_string, rabbitmq_exchange_name) = (String::new(), String::new());
+		let lsps_client_config = self
+			.lsps
+			.as_ref()
+			.and_then(|liquidity| liquidity.lsps_client.as_ref())
+			.map(|clients| {
+				let clients = clients
+					.iter()
+					.map(LSPSClientConfig::try_from)
+					.collect::<io::Result<Vec<_>>>()?;
+				let mut seen = std::collections::HashSet::new();
+				for client in &clients {
+					if !seen.insert(client.node_id) {
+						return Err(io::Error::new(
+							io::ErrorKind::InvalidInput,
+							format!(
+								"Duplicate liquidity client node pubkey configured: {}",
+								client.node_id
+							),
+						));
+					}
+				}
+
+				Ok(clients)
+			})
+			.transpose()?;
 
 		#[cfg(feature = "experimental-lsps2-support")]
 		let lsps2_service_config = {
-			let liquidity = self.lsps2.ok_or_else(|| io::Error::new(
+			let liquidity = self.lsps.ok_or_else(|| io::Error::new(
 				io::ErrorKind::InvalidInput,
 				"`liquidity.lsps2_service` must be defined in config if enabling `experimental-lsps2-support` feature."
 			))?;
@@ -330,87 +653,194 @@ impl ConfigBuilder {
 		#[cfg(not(feature = "experimental-lsps2-support"))]
 		let lsps2_service_config = None;
 
+		let pathfinding_scores_source_url = match self.pathfinding_scores_source_url {
+			Some(url) if url.is_empty() => None,
+			Some(url) => Some(url),
+			None if network == Network::Bitcoin => {
+				Some(DEFAULT_PATHFINDING_SCORES_SOURCE_URL.to_string())
+			},
+			None => None,
+		};
+
+		let probing_config = build_probing_config(self.probing)?;
+
+		let async_payments_role =
+			self.async_payments_role.as_deref().map(parse_async_payments_role).transpose()?;
+
+		let forwarded_payment_tracking_mode = match self.forwarded_payment_tracking_mode.as_deref() {
+			None => ForwardedPaymentTrackingMode::default(),
+			Some(mode) if mode.eq_ignore_ascii_case("detailed") => ForwardedPaymentTrackingMode::Detailed,
+			Some(mode) if mode.eq_ignore_ascii_case("stats") => ForwardedPaymentTrackingMode::Stats,
+			Some(mode) => return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("Invalid forwarded_payment_tracking_mode '{mode}': expected 'stats' or 'detailed'"),
+			)),
+		};
+
+		let metrics_enabled = self.metrics_enabled.unwrap_or(false);
+
+		let poll_metrics_interval = self.poll_metrics_interval;
+
+		if let Some(0) = poll_metrics_interval {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"poll_metrics_interval must be greater than 0",
+			));
+		}
+
+		let metrics_username = self.metrics_username;
+		let metrics_password = self.metrics_password;
+
+		if self.metrics_enabled.unwrap_or(false)
+			&& (metrics_username.is_some() != metrics_password.is_some())
+		{
+			return Err(io::Error::new(io::ErrorKind::InvalidInput,
+				"Both `metrics.username` and `metrics.password` must be set if authentication is used for metrics."));
+		}
+
+		let tor_proxy_address: Option<SocketAddress> = self
+			.tor_proxy_address
+			.map(|addrs| {
+				SocketAddress::from_str(&addrs).map_err(|e| {
+					io::Error::new(
+						io::ErrorKind::InvalidInput,
+						format!("Invalid proxy address configured: {}", e),
+					)
+				})
+			})
+			.transpose()?;
+
+		let hrn_config = match self.hrn {
+			Some(hrn) => HumanReadableNamesConfig::try_from(hrn)?,
+			None => HumanReadableNamesConfig::default(),
+		};
+
 		Ok(Config {
 			network,
 			listening_addrs,
 			announcement_addrs,
 			alias,
 			tls_config: self.tls_config,
-			rest_service_addr,
+			grpc_service_addr,
 			storage_dir_path: self.storage_dir_path,
+			ldk_node_storage,
 			chain_source,
-			rabbitmq_connection_string,
-			rabbitmq_exchange_name,
+			rgs_server_url: self.rgs_server_url,
+			lsps_client_config,
 			lsps2_service_config,
 			log_level,
 			log_file_path: self.log_file_path,
+			log_max_size_bytes: log_max_size_bytes as usize,
+			log_rotation_interval_secs,
+			log_max_files,
+			log_to_file,
+			pathfinding_scores_source_url,
+			probing_config,
+			async_payments_role,
+			enable_zero_fee_commitments: self.enable_zero_fee_commitments.unwrap_or(false),
+			forwarded_payment_tracking_mode,
+			metrics_enabled,
+			poll_metrics_interval,
+			metrics_username,
+			metrics_password,
+			tor_config: tor_proxy_address.map(|proxy_address| TorConfig { proxy_address }),
+			hrn_config,
 		})
 	}
 }
 
 /// Configuration loaded from a TOML file.
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TomlConfig {
 	node: Option<NodeConfig>,
 	storage: Option<StorageConfig>,
 	bitcoind: Option<BitcoindConfig>,
 	electrum: Option<ElectrumConfig>,
 	esplora: Option<EsploraConfig>,
-	rabbitmq: Option<RabbitmqConfig>,
 	liquidity: Option<LiquidityConfig>,
 	log: Option<LogConfig>,
 	tls: Option<TomlTlsConfig>,
+	metrics: Option<MetricsTomlConfig>,
+	probing: Option<ProbingTomlConfig>,
+	tor: Option<TomlTorConfig>,
+	hrn: Option<HrnTomlConfig>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct NodeConfig {
 	network: Option<Network>,
 	listening_addresses: Option<Vec<String>>,
 	announcement_addresses: Option<Vec<String>>,
-	rest_service_address: Option<String>,
+	grpc_service_address: Option<String>,
 	alias: Option<String>,
+	pathfinding_scores_source_url: Option<String>,
+	async_payments_role: Option<String>,
+	enable_zero_fee_commitments: Option<bool>,
+	forwarded_payment_tracking_mode: Option<String>,
+	rgs_server_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StorageConfig {
 	disk: Option<DiskConfig>,
+	postgres: Option<PostgresStorageConfig>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DiskConfig {
 	dir_path: Option<String>,
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PostgresStorageConfig {
+	connection_string: Option<String>,
+	db_name: Option<String>,
+	kv_table_name: Option<String>,
+	certificate_path: Option<String>,
+}
+
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct BitcoindConfig {
 	rpc_address: Option<String>,
 	rpc_user: Option<String>,
 	rpc_password: Option<String>,
+	/// When set, block/header/tx data is sourced from Bitcoin Core's REST interface instead of
+	/// RPC (RPC is still used for calls REST doesn't support, e.g. transaction broadcast).
+	/// This is normally the same host:port as `rpc_address`.
+	rest_address: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ElectrumConfig {
 	server_url: String,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct EsploraConfig {
 	server_url: String,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct LogConfig {
 	level: Option<String>,
 	file: Option<String>,
+	max_size_mb: Option<u64>,
+	rotation_interval_hours: Option<u64>,
+	max_files: Option<usize>,
+	log_to_file: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
-struct RabbitmqConfig {
-	connection_string: String,
-	exchange_name: String,
-}
-
-#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TomlTlsConfig {
 	cert_path: Option<String>,
 	key_path: Option<String>,
@@ -418,11 +848,232 @@ struct TomlTlsConfig {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsTomlConfig {
+	enabled: Option<bool>,
+	poll_metrics_interval: Option<u64>,
+	username: Option<String>,
+	password: Option<String>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProbingTomlConfig {
+	strategy: Option<String>,
+	top_node_count: Option<usize>,
+	max_hops: Option<usize>,
+	interval_secs: Option<u64>,
+	max_locked_msat: Option<u64>,
+	diversity_penalty_msat: Option<u64>,
+	cooldown_secs: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TomlTorConfig {
+	proxy_address: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HrnTomlConfig {
+	mode: Option<String>,
+	dns_server_address: Option<String>,
+	enable_resolution_service: Option<bool>,
+}
+
+impl TryFrom<HrnTomlConfig> for HumanReadableNamesConfig {
+	type Error = io::Error;
+
+	fn try_from(value: HrnTomlConfig) -> Result<Self, Self::Error> {
+		let HrnTomlConfig { mode, dns_server_address, enable_resolution_service } = value;
+
+		let resolution_config = match mode.as_deref() {
+			None | Some("dns") => {
+				// Start from LDK Node's DNS defaults so we don't have to hardcode them, but fall
+				// back to explicit values if the upstream default ever stops being `Dns`.
+				let (mut dns_server_address_val, mut enable_hrn_resolution_service) =
+					if let HRNResolverConfig::Dns {
+						dns_server_address,
+						enable_hrn_resolution_service,
+					} = HumanReadableNamesConfig::default().resolution_config
+					{
+						(dns_server_address, enable_hrn_resolution_service)
+					} else {
+						(
+							SocketAddress::from_str("8.8.8.8:53")
+								.expect("`8.8.8.8:53` is a valid socket address"),
+							false,
+						)
+					};
+
+				if let Some(addr) = dns_server_address.as_deref() {
+					dns_server_address_val = parse_dns_server_address(addr)?;
+				}
+				if let Some(enable) = enable_resolution_service {
+					enable_hrn_resolution_service = enable;
+				}
+
+				HRNResolverConfig::Dns {
+					dns_server_address: dns_server_address_val,
+					enable_hrn_resolution_service,
+				}
+			},
+			Some("blip32") => {
+				if dns_server_address.is_some() {
+					return Err(io::Error::new(
+						io::ErrorKind::InvalidInput,
+						"`hrn.dns_server_address` only applies when `hrn.mode = \"dns\"`"
+							.to_string(),
+					));
+				}
+				if enable_resolution_service.is_some() {
+					return Err(io::Error::new(
+						io::ErrorKind::InvalidInput,
+						"`hrn.enable_resolution_service` only applies when `hrn.mode = \"dns\"`"
+							.to_string(),
+					));
+				}
+				HRNResolverConfig::Blip32
+			},
+			Some(other) => {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					format!("Invalid HRN mode '{}' configured; expected 'dns' or 'blip32'", other),
+				))
+			},
+		};
+
+		Ok(HumanReadableNamesConfig { resolution_config })
+	}
+}
+
+/// Parses a DNS server address, falling back to port 53 if the user omitted the port.
+fn parse_dns_server_address(addr: &str) -> io::Result<SocketAddress> {
+	if let Ok(sa) = SocketAddress::from_str(addr) {
+		return Ok(sa);
+	}
+	let with_default_port = if addr.contains(':') && !addr.starts_with('[') {
+		format!("[{}]:53", addr)
+	} else {
+		format!("{}:53", addr)
+	};
+	SocketAddress::from_str(&with_default_port).map_err(|e| {
+		io::Error::new(
+			io::ErrorKind::InvalidInput,
+			format!("Invalid HRN DNS server address configured: {}", e),
+		)
+	})
+}
+
+fn parse_async_payments_role(role: &str) -> io::Result<AsyncPaymentsRole> {
+	match role.trim().to_ascii_lowercase().as_str() {
+		"client" => Ok(AsyncPaymentsRole::Client),
+		"server" => Ok(AsyncPaymentsRole::Server),
+		other => Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			format!(
+				"Invalid async payments role '{}' configured; expected 'client' or 'server'",
+				other
+			),
+		)),
+	}
+}
+
+fn build_probing_config(config: Option<ProbingTomlConfig>) -> io::Result<Option<ProbingConfig>> {
+	let Some(config) = config else {
+		return Ok(None);
+	};
+	let ProbingTomlConfig {
+		strategy,
+		top_node_count,
+		max_hops,
+		interval_secs,
+		max_locked_msat,
+		diversity_penalty_msat,
+		cooldown_secs,
+	} = config;
+
+	let strategy = strategy.ok_or_else(|| missing_field_err("probing.strategy"))?;
+	let mut builder = match strategy.trim().to_ascii_lowercase().as_str() {
+		"high_degree" | "high-degree" => {
+			if max_hops.is_some() {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"`probing.max_hops` only applies to the `random_walk` strategy",
+				));
+			}
+			let top_node_count =
+				top_node_count.ok_or_else(|| missing_field_err("probing.top_node_count"))?;
+			if top_node_count == 0 {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"`probing.top_node_count` must be greater than 0",
+				));
+			}
+			ProbingConfigBuilder::high_degree(top_node_count)
+		},
+		"random_walk" | "random-walk" => {
+			if top_node_count.is_some() {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"`probing.top_node_count` only applies to the `high_degree` strategy",
+				));
+			}
+			let max_hops = max_hops.ok_or_else(|| missing_field_err("probing.max_hops"))?;
+			if max_hops < 2 {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"`probing.max_hops` must be at least 2",
+				));
+			}
+			ProbingConfigBuilder::random_walk(max_hops)
+		},
+		other => {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!(
+					"Invalid probing strategy '{}' configured; expected 'high_degree' or 'random_walk'",
+					other
+				),
+			))
+		},
+	};
+
+	if let Some(interval_secs) = interval_secs {
+		builder.interval(Duration::from_secs(interval_secs));
+	}
+	if let Some(max_locked_msat) = max_locked_msat {
+		builder.max_locked_msat(max_locked_msat);
+	}
+	if let Some(diversity_penalty_msat) = diversity_penalty_msat {
+		builder.diversity_penalty_msat(diversity_penalty_msat);
+	}
+	if let Some(cooldown_secs) = cooldown_secs {
+		builder.cooldown(Duration::from_secs(cooldown_secs));
+	}
+
+	Ok(Some(builder.build()))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct LiquidityConfig {
+	lsps_client: Option<Vec<LSPSClientTomlConfig>>,
 	lsps2_service: Option<LSPS2ServiceTomlConfig>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct LSPSClientTomlConfig {
+	node_pubkey: String,
+	address: String,
+	token: Option<String>,
+	trust_peer_0conf: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct LSPS2ServiceTomlConfig {
 	advertise_service: bool,
 	channel_opening_fee_ppm: u32,
@@ -433,6 +1084,7 @@ struct LSPS2ServiceTomlConfig {
 	min_payment_size_msat: u64,
 	max_payment_size_msat: u64,
 	client_trusts_lsp: bool,
+	disable_client_reserve: bool,
 	require_token: Option<String>,
 }
 
@@ -448,6 +1100,7 @@ impl From<LSPS2ServiceTomlConfig> for LSPS2ServiceConfig {
 			min_payment_size_msat,
 			max_payment_size_msat,
 			client_trusts_lsp,
+			disable_client_reserve,
 			require_token,
 		} = val;
 
@@ -461,14 +1114,41 @@ impl From<LSPS2ServiceTomlConfig> for LSPS2ServiceConfig {
 			max_client_to_self_delay,
 			max_payment_size_msat,
 			client_trusts_lsp,
+			disable_client_reserve,
 			require_token,
 		}
 	}
 }
 
+impl TryFrom<&LSPSClientTomlConfig> for LSPSClientConfig {
+	type Error = io::Error;
+
+	fn try_from(value: &LSPSClientTomlConfig) -> Result<Self, Self::Error> {
+		let node_id = PublicKey::from_str(&value.node_pubkey).map_err(|e| {
+			io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("Invalid liquidity client node pubkey configured: {e}"),
+			)
+		})?;
+		let address = SocketAddress::from_str(&value.address).map_err(|e| {
+			io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("Invalid liquidity client address configured: {e}"),
+			)
+		})?;
+
+		Ok(Self {
+			node_id,
+			address,
+			token: value.token.clone(),
+			trust_peer_0conf: value.trust_peer_0conf,
+		})
+	}
+}
+
 #[derive(Parser, Debug)]
 #[command(
-	version,
+	version = crate::FULL_VERSION,
 	about = "LDK Server Configuration",
 	long_about = None,
 	override_usage = "ldk-server [config_path]"
@@ -500,10 +1180,10 @@ pub struct ArgsConfig {
 
 	#[arg(
 		long,
-		env = "LDK_SERVER_NODE_REST_SERVICE_ADDRESS",
-		help = "The rest service address for the LDK Server API."
+		env = "LDK_SERVER_NODE_GRPC_SERVICE_ADDRESS",
+		help = "The gRPC service address for the LDK Server API."
 	)]
-	node_rest_service_address: Option<String>,
+	node_grpc_service_address: Option<String>,
 
 	#[arg(
 		long,
@@ -511,6 +1191,34 @@ pub struct ArgsConfig {
 		help = "The node alias that will be used when broadcasting announcements to the gossip network."
 	)]
 	node_alias: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_LOG_MAX_SIZE_MB",
+		help = "The maximum size of the log file in MB before rotation. Defaults to 50MB."
+	)]
+	log_max_size_mb: Option<u64>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_LOG_ROTATION_INTERVAL_HOURS",
+		help = "The maximum age of the log file in hours before rotation. Defaults to 24h."
+	)]
+	log_rotation_interval_hours: Option<u64>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_LOG_MAX_FILES",
+		help = "The maximum number of rotated log files to keep. Defaults to 5."
+	)]
+	log_max_files: Option<usize>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_LOG_TO_FILE",
+		help = "The option to enable logging to a file. Defaults to true. If false, logging to file is disabled."
+	)]
+	log_to_file: Option<bool>,
 
 	#[arg(
 		long,
@@ -535,10 +1243,186 @@ pub struct ArgsConfig {
 
 	#[arg(
 		long,
+		env = "LDK_SERVER_BITCOIND_REST_ADDRESS",
+		help = "bitcoind REST address (host:port). Uses REST for chain data, RPC still handles the rest."
+	)]
+	bitcoind_rest_address: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_RESCAN_FROM_HEIGHT",
+		help = "Rescan the wallet from this block height on first startup. Only supported with the bitcoind RPC chain source."
+	)]
+	rescan_from_height: Option<u32>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_FORCE_WALLET_FULL_SCAN",
+		help = "Force wallet full scans until one succeeds. Only supported with Electrum and Esplora chain sources."
+	)]
+	force_wallet_full_scan: bool,
+
+	#[arg(
+		long,
 		env = "LDK_SERVER_STORAGE_DIR_PATH",
 		help = "The path where the underlying LDK and BDK persist their data."
 	)]
 	storage_dir_path: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_STORAGE_POSTGRES_CONNECTION_STRING",
+		help = "PostgreSQL connection string for LDK Node wallet and channel state."
+	)]
+	storage_postgres_connection_string: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_STORAGE_POSTGRES_DB_NAME",
+		help = "Optional PostgreSQL database name for LDK Node storage."
+	)]
+	storage_postgres_db_name: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_STORAGE_POSTGRES_KV_TABLE_NAME",
+		help = "Optional PostgreSQL key-value table name for LDK Node storage."
+	)]
+	storage_postgres_kv_table_name: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_STORAGE_POSTGRES_CERTIFICATE_PATH",
+		help = "Path to a PEM-encoded CA certificate required to enable PostgreSQL TLS. If omitted, the default sslmode=prefer uses plaintext and sslmode=require fails to connect."
+	)]
+	storage_postgres_certificate_path: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PATHFINDING_SCORES_SOURCE_URL",
+		help = "The external scores source that is merged into the local scoring system to improve routing. Defaults to https://rapidsync.lightningdevkit.org/scoring/scorer.bin on mainnet. Set to an empty string to disable."
+	)]
+	pathfinding_scores_source_url: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_NODE_ASYNC_PAYMENTS_ROLE",
+		help = "The async payments role for the node. Valid values are `client` or `server`."
+	)]
+	node_async_payments_role: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_NODE_ENABLE_ZERO_FEE_COMMITMENTS",
+		help = "Whether to enable zero-fee commitment channels. Defaults to false."
+	)]
+	node_enable_zero_fee_commitments: Option<bool>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_NODE_FORWARDED_PAYMENT_TRACKING_MODE",
+		value_parser = ["stats", "detailed"],
+		ignore_case = true,
+		help = "Forwarded payment tracking mode: stats or detailed (case-insensitive). Defaults to stats."
+	)]
+	node_forwarded_payment_tracking_mode: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PROBING_STRATEGY",
+		help = "Enable background probing with `high_degree` or `random_walk`."
+	)]
+	probing_strategy: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PROBING_TOP_NODE_COUNT",
+		help = "Number of highly connected nodes to cycle through with the `high_degree` probing strategy."
+	)]
+	probing_top_node_count: Option<usize>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PROBING_MAX_HOPS",
+		help = "Maximum path length for the `random_walk` probing strategy."
+	)]
+	probing_max_hops: Option<usize>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PROBING_INTERVAL_SECS",
+		help = "Interval between background probe attempts in seconds."
+	)]
+	probing_interval_secs: Option<u64>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PROBING_MAX_LOCKED_MSAT",
+		help = "Maximum total millisatoshis that background probes may lock in flight."
+	)]
+	probing_max_locked_msat: Option<u64>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PROBING_DIVERSITY_PENALTY_MSAT",
+		help = "Scoring penalty for recently probed channels. Useful with `high_degree`."
+	)]
+	probing_diversity_penalty_msat: Option<u64>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_PROBING_COOLDOWN_SECS",
+		help = "Time before a node can be probed again. Applies to `high_degree`."
+	)]
+	probing_cooldown_secs: Option<u64>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_METRICS_ENABLED",
+		help = "The option to enable the metrics endpoint. WARNING: This endpoint is unauthenticated."
+	)]
+	metrics_enabled: bool,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_POLL_METRICS_INTERVAL",
+		help = "The polling interval for metrics in seconds. Required when
+		metrics is enabled, but defaults to 60secs if unset."
+	)]
+	poll_metrics_interval: Option<u64>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_METRICS_USERNAME",
+		help = "The username required to access the metrics endpoint (Basic Auth)."
+	)]
+	metrics_username: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_METRICS_PASSWORD",
+		help = "The password required to access the metrics endpoint (Basic Auth)."
+	)]
+	metrics_password: Option<String>,
+
+	#[arg(
+		long,
+		env = "LDK_SERVER_TOR_PROXY_ADDRESS",
+		help = "Tor daemon SOCKS proxy address. Only connections to OnionV3 peers will be made via this proxy; other connections (IPv4 peers, Electrum server) will not be routed over Tor."
+	)]
+	tor_proxy_address: Option<String>,
+}
+
+impl ArgsConfig {
+	fn has_probing_options(&self) -> bool {
+		self.probing_strategy.is_some()
+			|| self.probing_top_node_count.is_some()
+			|| self.probing_max_hops.is_some()
+			|| self.probing_interval_secs.is_some()
+			|| self.probing_max_locked_msat.is_some()
+			|| self.probing_diversity_penalty_msat.is_some()
+			|| self.probing_cooldown_secs.is_some()
+	}
 }
 
 pub fn load_config(args: &ArgsConfig) -> io::Result<Config> {
@@ -551,7 +1435,7 @@ pub fn load_config(args: &ArgsConfig) -> io::Result<Config> {
 	};
 
 	if let Some(path) = config_file {
-		let content = fs::read_to_string(&path).map_err(|e| {
+		let content = read_to_string_with_limit(&path, CONFIG_FILE_SIZE_LIMIT).map_err(|e| {
 			io::Error::new(e.kind(), format!("Failed to read config file '{:?}': {}", path, e))
 		})?;
 		let toml_config: TomlConfig = toml::from_str(&content).map_err(|e| {
@@ -604,8 +1488,11 @@ fn parse_host_port(addr: &str) -> io::Result<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
 	use std::str::FromStr;
 
+	use clap::Parser;
+	use ldk_node::bitcoin::secp256k1::PublicKey;
 	use ldk_node::bitcoin::Network;
 	use ldk_node::lightning::ln::msgs::SocketAddress;
 
@@ -616,8 +1503,11 @@ mod tests {
 				network = "regtest"
 				listening_addresses = ["localhost:3001"]
 				announcement_addresses = ["54.3.7.81:3001"]
-				rest_service_address = "127.0.0.1:3002"
+				grpc_service_address = "127.0.0.1:3002"
 				alias = "LDK Server"
+				rgs_server_url = "https://rapidsync.lightningdevkit.org/snapshot/v2/"
+				async_payments_role = "client"
+				enable_zero_fee_commitments = true
 
 				[tls]
 				cert_path = "/path/to/tls.crt"
@@ -630,15 +1520,21 @@ mod tests {
 				[log]
 				level = "Trace"
 				file = "/var/log/ldk-server.log"
+				max_size_mb = 50
+				rotation_interval_hours = 24
+				max_files = 5
+				log_to_file = true
 
 				[bitcoind]
 				rpc_address = "127.0.0.1:8332"
 				rpc_user = "bitcoind-testuser"
 				rpc_password = "bitcoind-testpassword"
 
-				[rabbitmq]
-				connection_string = "rabbitmq_connection_string"
-				exchange_name = "rabbitmq_exchange_name"
+				[[liquidity.lsps_client]]
+				node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+				address = "127.0.0.1:39735"
+				token = "lsps2-token"
+				trust_peer_0conf = true
 
 				[liquidity.lsps2_service]
 				advertise_service = false
@@ -650,6 +1546,10 @@ mod tests {
 				min_payment_size_msat = 10000000          # 10,000 satoshis
 				max_payment_size_msat = 25000000000       # 0.25 BTC
 				client_trusts_lsp = true
+				disable_client_reserve = false
+
+				[tor]
+				proxy_address = "127.0.0.1:9050"
 				"#;
 
 	fn default_args_config() -> ArgsConfig {
@@ -658,12 +1558,39 @@ mod tests {
 			node_network: Some(Network::Regtest),
 			node_listening_addresses: Some(vec!["localhost:3008".to_string()]),
 			node_announcement_addresses: Some(vec!["54.3.7.81:3001".to_string()]),
-			node_rest_service_address: Some(String::from("127.0.0.1:3009")),
+			node_grpc_service_address: Some(String::from("127.0.0.1:3009")),
 			bitcoind_rpc_address: Some(String::from("127.0.1.9:18443")),
 			bitcoind_rpc_user: Some(String::from("bitcoind-testuser_cli")),
 			bitcoind_rpc_password: Some(String::from("bitcoind-testpassword_cli")),
+			bitcoind_rest_address: None,
+			rescan_from_height: None,
+			force_wallet_full_scan: false,
 			storage_dir_path: Some(String::from("/tmp_cli")),
+			storage_postgres_connection_string: None,
+			storage_postgres_db_name: None,
+			storage_postgres_kv_table_name: None,
+			storage_postgres_certificate_path: None,
 			node_alias: Some(String::from("LDK Server CLI")),
+			pathfinding_scores_source_url: Some(String::from("https://example.com/")),
+			node_async_payments_role: Some(String::from("server")),
+			node_enable_zero_fee_commitments: Some(false),
+			node_forwarded_payment_tracking_mode: None,
+			probing_strategy: None,
+			probing_top_node_count: None,
+			probing_max_hops: None,
+			probing_interval_secs: None,
+			probing_max_locked_msat: None,
+			probing_diversity_penalty_msat: None,
+			probing_cooldown_secs: None,
+			metrics_enabled: false,
+			poll_metrics_interval: None,
+			metrics_username: None,
+			metrics_password: None,
+			tor_proxy_address: None,
+			log_to_file: Some(true),
+			log_max_size_mb: Some(50),
+			log_rotation_interval_hours: Some(24),
+			log_max_files: Some(5),
 		}
 	}
 
@@ -673,12 +1600,39 @@ mod tests {
 			node_network: None,
 			node_listening_addresses: None,
 			node_announcement_addresses: None,
-			node_rest_service_address: None,
+			node_grpc_service_address: None,
 			node_alias: None,
 			bitcoind_rpc_address: None,
 			bitcoind_rpc_user: None,
 			bitcoind_rpc_password: None,
+			bitcoind_rest_address: None,
+			rescan_from_height: None,
+			force_wallet_full_scan: false,
 			storage_dir_path: None,
+			storage_postgres_connection_string: None,
+			storage_postgres_db_name: None,
+			storage_postgres_kv_table_name: None,
+			storage_postgres_certificate_path: None,
+			pathfinding_scores_source_url: None,
+			node_async_payments_role: None,
+			node_enable_zero_fee_commitments: None,
+			node_forwarded_payment_tracking_mode: None,
+			probing_strategy: None,
+			probing_top_node_count: None,
+			probing_max_hops: None,
+			probing_interval_secs: None,
+			probing_max_locked_msat: None,
+			probing_diversity_penalty_msat: None,
+			probing_cooldown_secs: None,
+			metrics_enabled: false,
+			poll_metrics_interval: None,
+			metrics_username: None,
+			metrics_password: None,
+			tor_proxy_address: None,
+			log_to_file: Some(true),
+			log_max_size_mb: None,
+			log_rotation_interval_hours: None,
+			log_max_files: None,
 		}
 	}
 
@@ -687,6 +1641,29 @@ mod tests {
 			"Missing `{}`. Please provide it via config file, CLI argument, or environment variable.",
 			field
 		)
+	}
+
+	fn lsps2_service_config_for_feature() -> &'static str {
+		#[cfg(feature = "experimental-lsps2-support")]
+		{
+			r#"
+			[liquidity.lsps2_service]
+			advertise_service = false
+			channel_opening_fee_ppm = 1000
+			channel_over_provisioning_ppm = 500000
+			min_channel_opening_fee_msat = 10000000
+			min_channel_lifetime = 4320
+			max_client_to_self_delay = 1440
+			min_payment_size_msat = 10000000
+			max_payment_size_msat = 25000000000
+			client_trusts_lsp = true
+			disable_client_reserve = false
+			"#
+		}
+		#[cfg(not(feature = "experimental-lsps2-support"))]
+		{
+			""
+		}
 	}
 
 	#[test]
@@ -704,20 +1681,14 @@ mod tests {
 
 		let alias = "LDK Server";
 
-		#[cfg(feature = "events-rabbitmq")]
-		let (expected_rabbit_conn, expected_rabbit_exchange) =
-			("rabbitmq_connection_string".to_string(), "rabbitmq_exchange_name".to_string());
-
-		#[cfg(not(feature = "events-rabbitmq"))]
-		let (expected_rabbit_conn, expected_rabbit_exchange) = (String::new(), String::new());
-
 		let expected = Config {
 			listening_addrs: Some(vec![SocketAddress::from_str("localhost:3001").unwrap()]),
 			announcement_addrs: Some(vec![SocketAddress::from_str("54.3.7.81:3001").unwrap()]),
 			alias: Some(parse_alias(alias).unwrap()),
 			network: Network::Regtest,
-			rest_service_addr: SocketAddr::from_str("127.0.0.1:3002").unwrap(),
+			grpc_service_addr: SocketAddr::from_str("127.0.0.1:3002").unwrap(),
 			storage_dir_path: Some("/tmp".to_string()),
+			ldk_node_storage: LdkNodeStorageConfig::Sqlite,
 			tls_config: Some(TlsConfig {
 				cert_path: Some("/path/to/tls.crt".to_string()),
 				key_path: Some("/path/to/tls.key".to_string()),
@@ -728,9 +1699,20 @@ mod tests {
 				rpc_port: 8332,
 				rpc_user: "bitcoind-testuser".to_string(),
 				rpc_password: "bitcoind-testpassword".to_string(),
+				rest_host: None,
+				rest_port: None,
+				wallet_rescan_from_height: None,
 			},
-			rabbitmq_connection_string: expected_rabbit_conn,
-			rabbitmq_exchange_name: expected_rabbit_exchange,
+			rgs_server_url: Some("https://rapidsync.lightningdevkit.org/snapshot/v2/".to_string()),
+			lsps_client_config: Some(vec![LSPSClientConfig {
+				node_id: PublicKey::from_str(
+					"0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266",
+				)
+				.unwrap(),
+				address: SocketAddress::from_str("127.0.0.1:39735").unwrap(),
+				token: Some("lsps2-token".to_string()),
+				trust_peer_0conf: true,
+			}]),
 			lsps2_service_config: Some(LSPS2ServiceConfig {
 				require_token: None,
 				advertise_service: false,
@@ -742,25 +1724,52 @@ mod tests {
 				min_payment_size_msat: 10000000,
 				max_payment_size_msat: 25000000000,
 				client_trusts_lsp: true,
+				disable_client_reserve: false,
 			}),
 			log_level: LevelFilter::Trace,
 			log_file_path: Some("/var/log/ldk-server.log".to_string()),
+			log_max_size_bytes: 50 * 1024 * 1024,
+			log_rotation_interval_secs: 24 * 60 * 60,
+			log_max_files: 5,
+			log_to_file: true,
+			pathfinding_scores_source_url: None,
+			probing_config: None,
+			async_payments_role: Some(AsyncPaymentsRole::Client),
+			enable_zero_fee_commitments: true,
+			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			metrics_enabled: false,
+			poll_metrics_interval: None,
+			metrics_username: None,
+			metrics_password: None,
+			tor_config: Some(TorConfig {
+				proxy_address: SocketAddress::from_str("127.0.0.1:9050").unwrap(),
+			}),
+			hrn_config: HumanReadableNamesConfig::default(),
 		};
 
 		assert_eq!(config.listening_addrs, expected.listening_addrs);
 		assert_eq!(config.announcement_addrs, expected.announcement_addrs);
 		assert_eq!(config.alias, expected.alias);
 		assert_eq!(config.network, expected.network);
-		assert_eq!(config.rest_service_addr, expected.rest_service_addr);
+		assert_eq!(config.grpc_service_addr, expected.grpc_service_addr);
 		assert_eq!(config.storage_dir_path, expected.storage_dir_path);
+		assert_eq!(config.ldk_node_storage, expected.ldk_node_storage);
 		assert_eq!(config.chain_source, expected.chain_source);
-		assert_eq!(config.rabbitmq_connection_string, expected.rabbitmq_connection_string);
-		assert_eq!(config.rabbitmq_exchange_name, expected.rabbitmq_exchange_name);
+		assert_eq!(config.rgs_server_url, expected.rgs_server_url);
+		assert_eq!(config.lsps_client_config, expected.lsps_client_config);
 		#[cfg(feature = "experimental-lsps2-support")]
 		assert_eq!(config.lsps2_service_config.is_some(), expected.lsps2_service_config.is_some());
 		assert_eq!(config.log_level, expected.log_level);
 		assert_eq!(config.log_file_path, expected.log_file_path);
-
+		assert_eq!(config.pathfinding_scores_source_url, expected.pathfinding_scores_source_url);
+		assert!(matches!(config.async_payments_role, Some(AsyncPaymentsRole::Client)));
+		assert_eq!(config.enable_zero_fee_commitments, expected.enable_zero_fee_commitments);
+		assert_eq!(
+			config.forwarded_payment_tracking_mode,
+			expected.forwarded_payment_tracking_mode
+		);
+		assert_eq!(config.metrics_enabled, expected.metrics_enabled);
+		assert_eq!(config.tor_config, expected.tor_config);
 		// Test case where only electrum is set
 
 		let toml_config = r#"
@@ -768,8 +1777,9 @@ mod tests {
 			network = "regtest"
 			listening_addresses = ["localhost:3001"]
 			announcement_addresses = ["54.3.7.81:3001"]
-			rest_service_address = "127.0.0.1:3002"
+			grpc_service_address = "127.0.0.1:3002"
 			alias = "LDK Server"
+			pathfinding_scores_source_url = "https://example.com/"
 
 			[tls]
 			cert_path = "/path/to/tls.crt"
@@ -786,9 +1796,10 @@ mod tests {
 			[electrum]
 			server_url = "ssl://electrum.blockstream.info:50002"
 
-			[rabbitmq]
-			connection_string = "rabbitmq_connection_string"
-			exchange_name = "rabbitmq_exchange_name"
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39735"
+			trust_peer_0conf = true
 
 			[liquidity.lsps2_service]
 			advertise_service = false
@@ -800,16 +1811,19 @@ mod tests {
 			min_payment_size_msat = 10000000          # 10,000 satoshis
 			max_payment_size_msat = 25000000000       # 0.25 BTC
 			client_trusts_lsp = true
+			disable_client_reserve = false
 			"#;
 
 		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
 		let config = load_config(&args_config).unwrap();
 
-		let ChainSource::Electrum { server_url } = config.chain_source else {
+		let ChainSource::Electrum { server_url, force_wallet_full_scan } = config.chain_source
+		else {
 			panic!("unexpected chain source");
 		};
 
 		assert_eq!(server_url, "ssl://electrum.blockstream.info:50002");
+		assert!(!force_wallet_full_scan);
 
 		// Test case where only bitcoind is set
 
@@ -818,8 +1832,9 @@ mod tests {
 			network = "regtest"
 			listening_addresses = ["localhost:3001"]
 			announcement_addresses = ["54.3.7.81:3001"]
-			rest_service_address = "127.0.0.1:3002"
+			grpc_service_address = "127.0.0.1:3002"
 			alias = "LDK Server"
+			pathfinding_scores_source_url = "https://example.com/"
 
 			[tls]
 			cert_path = "/path/to/tls.crt"
@@ -838,9 +1853,10 @@ mod tests {
 			rpc_user = "bitcoind-testuser"
 			rpc_password = "bitcoind-testpassword"
 
-			[rabbitmq]
-			connection_string = "rabbitmq_connection_string"
-			exchange_name = "rabbitmq_exchange_name"
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39735"
+			trust_peer_0conf = true
 
 			[liquidity.lsps2_service]
 			advertise_service = false
@@ -852,12 +1868,21 @@ mod tests {
 			min_payment_size_msat = 10000000          # 10,000 satoshis
 			max_payment_size_msat = 25000000000       # 0.25 BTC
 			client_trusts_lsp = true
+			disable_client_reserve = false
 			"#;
 
 		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
 		let config = load_config(&args_config).unwrap();
 
-		let ChainSource::Rpc { rpc_host, rpc_port, rpc_user, rpc_password } = config.chain_source
+		let ChainSource::Rpc {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+			rest_host,
+			rest_port,
+			wallet_rescan_from_height,
+		} = config.chain_source
 		else {
 			panic!("unexpected chain source");
 		};
@@ -866,6 +1891,9 @@ mod tests {
 		assert_eq!(rpc_port, 8332);
 		assert_eq!(rpc_user, "bitcoind-testuser");
 		assert_eq!(rpc_password, "bitcoind-testpassword");
+		assert_eq!(rest_host, None);
+		assert_eq!(rest_port, None);
+		assert_eq!(wallet_rescan_from_height, None);
 
 		// Test case where both bitcoind and esplora are set, resulting in an error
 
@@ -874,8 +1902,9 @@ mod tests {
 			network = "regtest"
 			listening_addresses = ["localhost:3001"]
 			announcement_addresses = ["54.3.7.81:3001"]
-			rest_service_address = "127.0.0.1:3002"
+			grpc_service_address = "127.0.0.1:3002"
 			alias = "LDK Server"
+			pathfinding_scores_source_url = "https://example.com/"
 
 			[tls]
 			cert_path = "/path/to/tls.crt"
@@ -897,9 +1926,10 @@ mod tests {
 			[esplora]
 			server_url = "https://mempool.space/api"
 
-			[rabbitmq]
-			connection_string = "rabbitmq_connection_string"
-			exchange_name = "rabbitmq_exchange_name"
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39735"
+			trust_peer_0conf = true
 
 			[liquidity.lsps2_service]
 			advertise_service = false
@@ -911,11 +1941,334 @@ mod tests {
 			min_payment_size_msat = 10000000          # 10,000 satoshis
 			max_payment_size_msat = 25000000000       # 0.25 BTC
 			client_trusts_lsp = true
+			disable_client_reserve = false
 			"#;
 
 		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
 		let error = load_config(&args_config).unwrap_err();
 		assert_eq!(error.to_string(), "Must set a single chain source, multiple were configured");
+	}
+
+	#[test]
+	fn test_rejects_oversized_config_file() {
+		let path = std::env::temp_dir()
+			.join(format!("ldk-server-oversized-config-{}", std::process::id()));
+		fs::write(&path, vec![b'a'; CONFIG_FILE_SIZE_LIMIT + 1]).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file = Some(path.to_string_lossy().to_string());
+
+		let error = load_config(&args_config).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+		fs::remove_file(path).unwrap();
+	}
+
+	#[test]
+	fn test_postgres_certificate_size_limit() {
+		let path = std::env::temp_dir()
+			.join(format!("ldk-server-postgres-cert-limit-{}", std::process::id()));
+		let mut pem = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n".to_string();
+		pem.extend(std::iter::repeat_n(' ', POSTGRES_CERTIFICATE_SIZE_LIMIT - pem.len()));
+		fs::write(&path, &pem).unwrap();
+
+		let config = postgres_config_with_certificate(&path).unwrap();
+		let LdkNodeStorageConfig::Postgres { certificate_pem, .. } = config.ldk_node_storage else {
+			panic!("expected PostgreSQL storage");
+		};
+		assert_eq!(certificate_pem.as_deref(), Some(pem.as_str()));
+
+		pem.push(' ');
+		fs::write(&path, pem).unwrap();
+		let error = postgres_config_with_certificate(&path).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(error.to_string().contains("PostgreSQL certificate file"));
+		assert!(error.to_string().contains("exceeds the 1048576 byte limit"));
+		fs::remove_file(path).unwrap();
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn test_postgres_certificate_rejects_unbounded_file() {
+		let error = postgres_config_with_certificate(Path::new("/dev/zero")).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+		assert!(error.to_string().contains("exceeds the 1048576 byte limit"));
+	}
+
+	fn postgres_config_with_certificate(path: &Path) -> Result<Config, io::Error> {
+		let mut builder = ConfigBuilder::default();
+		builder.merge_toml(toml::from_str(DEFAULT_CONFIG).unwrap());
+		builder.ldk_node_postgres = Some(PostgresStorageConfig {
+			connection_string: Some("postgresql://localhost".to_string()),
+			certificate_path: Some(path.to_string_lossy().to_string()),
+			..Default::default()
+		});
+		builder.build()
+	}
+
+	#[test]
+	fn test_postgres_storage_config_from_file() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_postgres_storage_config_from_file.toml";
+		let cert_path = storage_path.join("test_postgres_storage_cert.pem");
+		fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----").unwrap();
+		let toml_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+
+			[storage.disk]
+			dir_path = "/tmp"
+
+			[storage.postgres]
+			connection_string = "host=localhost user=postgres password=postgres"
+			db_name = "ldk_node"
+			kv_table_name = "ldk_node_kv"
+			certificate_path = "{}"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+			{}
+			"#,
+			cert_path.display(),
+			lsps2_service_config_for_feature()
+		);
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let config = load_config(&args_config).unwrap();
+		assert_eq!(config.storage_dir_path, Some("/tmp".to_string()));
+		assert_eq!(
+			config.ldk_node_storage,
+			LdkNodeStorageConfig::Postgres {
+				connection_string: "host=localhost user=postgres password=postgres".to_string(),
+				db_name: Some("ldk_node".to_string()),
+				kv_table_name: Some("ldk_node_kv".to_string()),
+				certificate_pem: Some(
+					"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----".to_string()
+				),
+			}
+		);
+	}
+
+	#[test]
+	fn test_postgres_storage_config_from_args() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_postgres_storage_config_from_args.toml";
+		let cert_path = storage_path.join("test_postgres_storage_args_cert.pem");
+		fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----").unwrap();
+		let mut args_config = default_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+		fs::write(
+			storage_path.join(config_file_name),
+			format!(
+				r#"
+				[node]
+				network = "regtest"
+
+				[bitcoind]
+				rpc_address = "127.0.0.1:8332"
+				rpc_user = "bitcoind-testuser"
+				rpc_password = "bitcoind-testpassword"
+				{}
+				"#,
+				lsps2_service_config_for_feature()
+			),
+		)
+		.unwrap();
+		args_config.storage_postgres_connection_string =
+			Some("host=localhost user=postgres password=postgres".to_string());
+		args_config.storage_postgres_db_name = Some("ldk_node".to_string());
+		args_config.storage_postgres_kv_table_name = Some("ldk_node_kv".to_string());
+		args_config.storage_postgres_certificate_path =
+			Some(cert_path.to_string_lossy().to_string());
+
+		let config = load_config(&args_config).unwrap();
+		assert_eq!(
+			config.ldk_node_storage,
+			LdkNodeStorageConfig::Postgres {
+				connection_string: "host=localhost user=postgres password=postgres".to_string(),
+				db_name: Some("ldk_node".to_string()),
+				kv_table_name: Some("ldk_node_kv".to_string()),
+				certificate_pem: Some(
+					"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----".to_string()
+				),
+			}
+		);
+	}
+
+	#[test]
+	fn test_postgres_storage_rejects_db_name_in_connection_string_and_field() {
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let result = runtime.block_on(ldk_node::io::postgres_store::PostgresStore::new(
+			"postgresql://postgres@localhost/connection_string_db".to_string(),
+			Some("config_field_db".to_string()),
+			None,
+			None,
+		));
+		let error = match result {
+			Ok(_) => panic!("database names from both sources must be rejected"),
+			Err(error) => error,
+		};
+
+		assert_eq!(error.kind(), ldk_node::bitcoin::io::ErrorKind::InvalidInput);
+		assert!(
+			error.to_string().contains(
+				"db_name must not be set when the connection string already contains a dbname"
+			),
+			"unexpected error: {error}"
+		);
+	}
+
+	#[test]
+	fn test_postgres_storage_config_partial_combinations_from_file() {
+		let storage_path = std::env::temp_dir();
+		let cert_path = storage_path.join("test_postgres_storage_partial_cert.pem");
+		let cert_pem = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----";
+		fs::write(&cert_path, cert_pem).unwrap();
+
+		for mask in 0..8 {
+			let config_file_name =
+				format!("test_postgres_storage_config_partial_combinations_{mask}.toml");
+			let include_db_name = mask & 0b001 != 0;
+			let include_kv_table_name = mask & 0b010 != 0;
+			let include_certificate_path = mask & 0b100 != 0;
+
+			let db_name_line = if include_db_name { "db_name = \"ldk_node\"\n" } else { "" };
+			let kv_table_name_line =
+				if include_kv_table_name { "kv_table_name = \"ldk_node_kv\"\n" } else { "" };
+			let certificate_path_line = if include_certificate_path {
+				format!("certificate_path = \"{}\"\n", cert_path.display())
+			} else {
+				String::new()
+			};
+
+			let toml_config = format!(
+				r#"
+				[node]
+				network = "regtest"
+
+				[storage.postgres]
+				connection_string = "host=localhost user=postgres password=postgres"
+				{db_name_line}{kv_table_name_line}{certificate_path_line}
+
+				[bitcoind]
+				rpc_address = "127.0.0.1:8332"
+				rpc_user = "bitcoind-testuser"
+				rpc_password = "bitcoind-testpassword"
+				{}
+				"#,
+				lsps2_service_config_for_feature()
+			);
+
+			fs::write(storage_path.join(&config_file_name), toml_config).unwrap();
+
+			let mut args_config = empty_args_config();
+			args_config.config_file =
+				Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+			let config = load_config(&args_config).unwrap();
+			assert_eq!(
+				config.ldk_node_storage,
+				LdkNodeStorageConfig::Postgres {
+					connection_string: "host=localhost user=postgres password=postgres".to_string(),
+					db_name: include_db_name.then(|| "ldk_node".to_string()),
+					kv_table_name: include_kv_table_name.then(|| "ldk_node_kv".to_string()),
+					certificate_pem: include_certificate_path.then(|| cert_pem.to_string()),
+				}
+			);
+		}
+	}
+
+	#[test]
+	fn test_postgres_storage_config_requires_connection_string_for_partial_file_configs() {
+		let storage_path = std::env::temp_dir();
+		let cert_path = storage_path.join("test_postgres_storage_missing_connection_cert.pem");
+		fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----").unwrap();
+
+		let cases = [
+			("", "empty_section"),
+			("db_name = \"ldk_node\"", "db_name"),
+			("kv_table_name = \"ldk_node_kv\"", "kv_table_name"),
+			(&format!("certificate_path = \"{}\"", cert_path.display()), "certificate_path"),
+			(
+				&format!(
+					"db_name = \"ldk_node\"\nkv_table_name = \"ldk_node_kv\"\ncertificate_path = \"{}\"",
+					cert_path.display()
+				),
+				"all_optional",
+			),
+		];
+
+		for (postgres_fields, case_name) in cases {
+			let config_file_name =
+				format!("test_postgres_storage_missing_connection_{case_name}.toml");
+			let toml_config = format!(
+				r#"
+				[node]
+				network = "regtest"
+
+				[storage.postgres]
+				{postgres_fields}
+
+				[bitcoind]
+				rpc_address = "127.0.0.1:8332"
+				rpc_user = "bitcoind-testuser"
+				rpc_password = "bitcoind-testpassword"
+				{}
+				"#,
+				lsps2_service_config_for_feature()
+			);
+
+			fs::write(storage_path.join(&config_file_name), toml_config).unwrap();
+
+			let mut args_config = empty_args_config();
+			args_config.config_file =
+				Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+			let err = load_config(&args_config).unwrap_err();
+			assert_eq!(err.to_string(), missing_field_msg("storage_postgres_connection_string"));
+		}
+	}
+
+	#[test]
+	fn test_postgres_storage_config_requires_connection_string_for_partial_args_configs() {
+		let storage_path = std::env::temp_dir();
+		let cert_path = storage_path.join("test_postgres_storage_missing_args_connection_cert.pem");
+		fs::write(&cert_path, "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----").unwrap();
+
+		let mut cases = Vec::new();
+
+		let mut db_name_args = default_args_config();
+		db_name_args.storage_postgres_db_name = Some("ldk_node".to_string());
+		cases.push(db_name_args);
+
+		let mut kv_table_name_args = default_args_config();
+		kv_table_name_args.storage_postgres_kv_table_name = Some("ldk_node_kv".to_string());
+		cases.push(kv_table_name_args);
+
+		let mut certificate_path_args = default_args_config();
+		certificate_path_args.storage_postgres_certificate_path =
+			Some(cert_path.to_string_lossy().to_string());
+		cases.push(certificate_path_args);
+
+		let mut all_optional_args = default_args_config();
+		all_optional_args.storage_postgres_db_name = Some("ldk_node".to_string());
+		all_optional_args.storage_postgres_kv_table_name = Some("ldk_node_kv".to_string());
+		all_optional_args.storage_postgres_certificate_path =
+			Some(cert_path.to_string_lossy().to_string());
+		cases.push(all_optional_args);
+
+		for args_config in cases {
+			let err = load_config(&args_config).unwrap_err();
+			assert_eq!(err.to_string(), missing_field_msg("storage_postgres_connection_string"));
+		}
 	}
 
 	#[test]
@@ -931,16 +2284,12 @@ mod tests {
 		let toml_config = r#"
 			[node]
 			network = "regtest"
-			rest_service_address = "127.0.0.1:3002"
+			grpc_service_address = "127.0.0.1:3002"
 
 			[bitcoind]
 			rpc_address = "127.0.0.1:8332"
 			rpc_user = "bitcoind-testuser"
 			rpc_password = "bitcoind-testpassword"
-
-			[rabbitmq]
-			connection_string = "rabbitmq_connection_string"
-			exchange_name = "rabbitmq_exchange_name"
 
 			[liquidity.lsps2_service]
 			advertise_service = false
@@ -952,10 +2301,247 @@ mod tests {
 			min_payment_size_msat = 10000000          # 10,000 satoshis
 			max_payment_size_msat = 25000000000       # 0.25 BTC
 			client_trusts_lsp = true
+			disable_client_reserve = false
 			"#;
 
 		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
 		assert!(load_config(&args_config).is_ok());
+	}
+
+	#[test]
+	fn test_multiple_liquidity_sources_from_file() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_multiple_liquidity_sources.toml";
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let toml_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+			
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39735"
+			token = "first-lsp-token"
+			trust_peer_0conf = true
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+			address = "127.0.0.1:39736"
+			trust_peer_0conf = false
+			{}"#,
+			lsps2_service_config_for_feature()
+		);
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let config = load_config(&args_config).unwrap();
+
+		let lsps_clients = config.lsps_client_config.expect("liquidity sources configured");
+		assert_eq!(lsps_clients.len(), 2);
+
+		assert_eq!(
+			lsps_clients[0],
+			LSPSClientConfig {
+				node_id: PublicKey::from_str(
+					"0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+				)
+				.unwrap(),
+				address: SocketAddress::from_str("127.0.0.1:39735").unwrap(),
+				token: Some("first-lsp-token".to_string()),
+				trust_peer_0conf: true,
+			}
+		);
+
+		assert_eq!(
+			lsps_clients[1],
+			LSPSClientConfig {
+				node_id: PublicKey::from_str(
+					"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+				)
+				.unwrap(),
+				address: SocketAddress::from_str("127.0.0.1:39736").unwrap(),
+				token: None,
+				trust_peer_0conf: false,
+			}
+		);
+	}
+
+	#[test]
+	fn test_rejects_liquidity_source_without_trust_peer_0conf() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_liquidity_source_missing_trust_peer_0conf.toml";
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		// `trust_peer_0conf` is deliberately not defaulted: accepting 0-conf channels from an LSP
+		// is a trust decision each operator has to state explicitly, per LSP.
+		fs::write(
+			storage_path.join(config_file_name),
+			remove_config_line(DEFAULT_CONFIG, "trust_peer_0conf"),
+		)
+		.unwrap();
+
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+		assert!(err.to_string().contains("missing field `trust_peer_0conf`"));
+	}
+
+	#[test]
+	fn test_rejects_invalid_liquidity_source_among_several() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_invalid_liquidity_source.toml";
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		// A malformed entry following a valid one must fail the whole load rather than being
+		// silently skipped.
+		let invalid_pubkey_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39735"
+			trust_peer_0conf = true
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "invalid-node-pubkey"
+			address = "127.0.0.1:39736"
+			trust_peer_0conf = false
+			{}"#,
+			lsps2_service_config_for_feature()
+		);
+
+		fs::write(storage_path.join(config_file_name), invalid_pubkey_config).unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert!(err.to_string().contains("Invalid liquidity client node pubkey configured"));
+
+		let invalid_address_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39735"
+			trust_peer_0conf = true
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+			address = "not-a-socket-address"
+			trust_peer_0conf = false
+			{}"#,
+			lsps2_service_config_for_feature()
+		);
+
+		fs::write(storage_path.join(config_file_name), invalid_address_config).unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert!(err.to_string().contains("Invalid liquidity client address configured"));
+	}
+
+	#[test]
+	fn test_rejects_duplicate_liquidity_source_node_pubkey() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_duplicate_liquidity_source.toml";
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		// LDK Node ignores duplicate node IDs, so reject them here rather than silently
+		// discarding the second entry's address, token and trust_peer_0conf.
+		let duplicate_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39735"
+			trust_peer_0conf = true
+
+			[[liquidity.lsps_client]]
+			node_pubkey = "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266"
+			address = "127.0.0.1:39736"
+			trust_peer_0conf = false
+			{}"#,
+			lsps2_service_config_for_feature()
+		);
+
+		fs::write(storage_path.join(config_file_name), duplicate_config).unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert!(err.to_string().contains("Duplicate liquidity client node pubkey configured"));
+	}
+
+	#[test]
+	fn test_mainnet_defaults_pathfinding_scores_source_url() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_mainnet_pathfinding_scores_source_url.toml";
+
+		fs::write(storage_path.join(config_file_name), DEFAULT_CONFIG).unwrap();
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+		args_config.node_network = Some(Network::Bitcoin);
+
+		let config = load_config(&args_config).unwrap();
+
+		assert_eq!(
+			config.pathfinding_scores_source_url,
+			Some(DEFAULT_PATHFINDING_SCORES_SOURCE_URL.to_string())
+		);
+	}
+
+	#[test]
+	fn test_empty_pathfinding_scores_source_url_disables_source() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_empty_pathfinding_scores_source_url.toml";
+		let toml_config = DEFAULT_CONFIG.replace(
+			"alias = \"LDK Server\"",
+			"alias = \"LDK Server\"\npathfinding_scores_source_url = \"\"",
+		);
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+		args_config.node_network = Some(Network::Bitcoin);
+
+		let config = load_config(&args_config).unwrap();
+
+		assert_eq!(config.pathfinding_scores_source_url, None);
 	}
 
 	#[test]
@@ -982,25 +2568,97 @@ mod tests {
 
 		#[cfg(feature = "experimental-lsps2-support")]
 		{
-			validate_missing!(
-				"[liquidity.lsps2_service]",
-				"`liquidity.lsps2_service` must be defined in config if enabling `experimental-lsps2-support` feature."
-			);
-		}
+			let toml_config = r#"
+				[node]
+				network = "regtest"
 
-		#[cfg(feature = "events-rabbitmq")]
-		{
-			validate_missing!(
-				"[rabbitmq]",
-				"Both `rabbitmq.connection_string` and `rabbitmq.exchange_name` must be configured if enabling `events-rabbitmq` feature."
+				[bitcoind]
+				rpc_address = "127.0.0.1:8332"
+				rpc_user = "bitcoind-testuser"
+				rpc_password = "bitcoind-testpassword"
+			"#;
+			fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+			let result = load_config(&args_config);
+			assert!(result.is_err());
+			let err = result.unwrap_err();
+			assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+			assert_eq!(
+				err.to_string(),
+				"`liquidity.lsps2_service` must be defined in config if enabling `experimental-lsps2-support` feature."
 			);
 		}
 
 		validate_missing!("rpc_password", missing_field_msg("bitcoind_rpc_password"));
 		validate_missing!("rpc_user", missing_field_msg("bitcoind_rpc_user"));
 		validate_missing!("rpc_address", missing_field_msg("bitcoind_rpc_address"));
-		validate_missing!("rest_service_address =", missing_field_msg("rest_service_address"));
 		validate_missing!("network =", missing_field_msg("network"));
+	}
+
+	#[test]
+	fn test_config_unknown_fields_in_file() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_config_unknown_fields_in_file.toml";
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		fs::write(
+			storage_path.join(config_file_name),
+			format!("{}\n[unknown]\noption = true\n", DEFAULT_CONFIG),
+		)
+		.unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+		assert!(err.to_string().contains("unknown field `unknown`"));
+
+		fs::write(
+			storage_path.join(config_file_name),
+			DEFAULT_CONFIG
+				.replace("network = \"regtest\"", "network = \"regtest\"\nunknown = true"),
+		)
+		.unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+		assert!(err.to_string().contains("unknown field `unknown`"));
+	}
+
+	#[test]
+	#[cfg(not(feature = "experimental-lsps2-support"))]
+	fn test_config_allows_unused_lsps2_service_config_without_feature() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name =
+			"test_config_allows_unused_lsps2_service_config_without_feature.toml";
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let toml_config = r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+
+			[liquidity.lsps2_service]
+			advertise_service = false
+			channel_opening_fee_ppm = 1000
+			channel_over_provisioning_ppm = 500000
+			min_channel_opening_fee_msat = 10000000
+			min_channel_lifetime = 4320
+			max_client_to_self_delay = 1440
+			min_payment_size_msat = 10000000
+			max_payment_size_msat = 25000000000
+			client_trusts_lsp = true
+			disable_client_reserve = false
+			"#;
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let config = load_config(&args_config).unwrap();
+		assert!(config.lsps2_service_config.is_none());
 	}
 
 	fn remove_config_line(config: &str, key: &str) -> String {
@@ -1013,7 +2671,6 @@ mod tests {
 
 	#[test]
 	#[cfg(not(feature = "experimental-lsps2-support"))]
-	#[cfg(not(feature = "events-rabbitmq"))]
 	fn test_config_from_args_config() {
 		let args_config = default_args_config();
 		let config = load_config(&args_config).unwrap();
@@ -1030,40 +2687,71 @@ mod tests {
 			)
 			.unwrap()]),
 			network: Network::Regtest,
-			rest_service_addr: SocketAddr::from_str(
-				args_config.node_rest_service_address.as_deref().unwrap(),
+			grpc_service_addr: SocketAddr::from_str(
+				args_config.node_grpc_service_address.as_deref().unwrap(),
 			)
 			.unwrap(),
 			alias: Some(parse_alias(args_config.node_alias.as_deref().unwrap()).unwrap()),
 			storage_dir_path: Some(args_config.storage_dir_path.unwrap()),
+			ldk_node_storage: LdkNodeStorageConfig::Sqlite,
 			tls_config: None,
 			chain_source: ChainSource::Rpc {
 				rpc_host: host,
 				rpc_port: port,
 				rpc_user: args_config.bitcoind_rpc_user.unwrap(),
 				rpc_password: args_config.bitcoind_rpc_password.unwrap(),
+				wallet_rescan_from_height: None,
+				rest_host: None,
+				rest_port: None,
 			},
-			rabbitmq_connection_string: String::new(),
-			rabbitmq_exchange_name: String::new(),
+			rgs_server_url: None,
+			lsps_client_config: None,
 			lsps2_service_config: None,
 			log_level: LevelFilter::Trace,
 			log_file_path: Some("/var/log/ldk-server.log".to_string()),
+			pathfinding_scores_source_url: Some("https://example.com/".to_string()),
+			probing_config: None,
+			async_payments_role: Some(AsyncPaymentsRole::Server),
+			enable_zero_fee_commitments: false,
+			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			metrics_enabled: false,
+			poll_metrics_interval: None,
+			metrics_username: None,
+			metrics_password: None,
+			tor_config: None,
+			hrn_config: HumanReadableNamesConfig::default(),
+			log_max_size_bytes: 50 * 1024 * 1024,
+			log_rotation_interval_secs: 24 * 60 * 60,
+			log_max_files: 5,
+			log_to_file: true,
 		};
 
 		assert_eq!(config.listening_addrs, expected.listening_addrs);
 		assert_eq!(config.announcement_addrs, expected.announcement_addrs);
 		assert_eq!(config.network, expected.network);
-		assert_eq!(config.rest_service_addr, expected.rest_service_addr);
+		assert_eq!(config.grpc_service_addr, expected.grpc_service_addr);
 		assert_eq!(config.storage_dir_path, expected.storage_dir_path);
+		assert_eq!(config.ldk_node_storage, expected.ldk_node_storage);
 		assert_eq!(config.chain_source, expected.chain_source);
-		assert_eq!(config.rabbitmq_connection_string, expected.rabbitmq_connection_string);
-		assert_eq!(config.rabbitmq_exchange_name, expected.rabbitmq_exchange_name);
+		assert_eq!(config.rgs_server_url, expected.rgs_server_url);
 		assert!(config.lsps2_service_config.is_none());
+		assert_eq!(config.pathfinding_scores_source_url, expected.pathfinding_scores_source_url);
+		assert!(matches!(config.async_payments_role, Some(AsyncPaymentsRole::Server)));
+		assert_eq!(config.enable_zero_fee_commitments, expected.enable_zero_fee_commitments);
+		assert_eq!(
+			config.forwarded_payment_tracking_mode,
+			expected.forwarded_payment_tracking_mode
+		);
+		assert_eq!(config.metrics_enabled, expected.metrics_enabled);
+		assert_eq!(config.tor_config, expected.tor_config);
+		assert_eq!(config.log_max_size_bytes, expected.log_max_size_bytes);
+		assert_eq!(config.log_rotation_interval_secs, expected.log_rotation_interval_secs);
+		assert_eq!(config.log_max_files, expected.log_max_files);
+		assert_eq!(config.log_to_file, expected.log_to_file);
 	}
 
 	#[test]
 	#[cfg(not(feature = "experimental-lsps2-support"))]
-	#[cfg(not(feature = "events-rabbitmq"))]
 	fn test_config_missing_fields_in_args_config() {
 		macro_rules! validate_missing {
 			($field:ident, $err_msg:expr) => {
@@ -1081,7 +2769,6 @@ mod tests {
 		validate_missing!(bitcoind_rpc_user, missing_field_msg("bitcoind_rpc_user"));
 		validate_missing!(bitcoind_rpc_address, missing_field_msg("bitcoind_rpc_address"));
 		validate_missing!(node_network, missing_field_msg("network"));
-		validate_missing!(node_rest_service_address, missing_field_msg("rest_service_address"));
 	}
 
 	#[test]
@@ -1093,13 +2780,6 @@ mod tests {
 		let mut args_config: ArgsConfig = default_args_config();
 		args_config.config_file =
 			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
-
-		#[cfg(feature = "events-rabbitmq")]
-		let (expected_rabbit_conn, expected_rabbit_exchange) =
-			("rabbitmq_connection_string".to_string(), "rabbitmq_exchange_name".to_string());
-
-		#[cfg(not(feature = "events-rabbitmq"))]
-		let (expected_rabbit_conn, expected_rabbit_exchange) = (String::new(), String::new());
 
 		let (host, port) =
 			parse_host_port(args_config.bitcoind_rpc_address.clone().unwrap().as_str()).unwrap();
@@ -1115,12 +2795,13 @@ mod tests {
 			)
 			.unwrap()]),
 			network: Network::Regtest,
-			rest_service_addr: SocketAddr::from_str(
-				args_config.node_rest_service_address.as_deref().unwrap(),
+			grpc_service_addr: SocketAddr::from_str(
+				args_config.node_grpc_service_address.as_deref().unwrap(),
 			)
 			.unwrap(),
 			alias: Some(parse_alias(args_config.node_alias.as_deref().unwrap()).unwrap()),
 			storage_dir_path: Some(args_config.storage_dir_path.unwrap()),
+			ldk_node_storage: LdkNodeStorageConfig::Sqlite,
 			tls_config: Some(TlsConfig {
 				cert_path: Some("/path/to/tls.crt".to_string()),
 				key_path: Some("/path/to/tls.key".to_string()),
@@ -1131,9 +2812,20 @@ mod tests {
 				rpc_port: port,
 				rpc_user: args_config.bitcoind_rpc_user.unwrap(),
 				rpc_password: args_config.bitcoind_rpc_password.unwrap(),
+				wallet_rescan_from_height: None,
+				rest_host: None,
+				rest_port: None,
 			},
-			rabbitmq_connection_string: expected_rabbit_conn,
-			rabbitmq_exchange_name: expected_rabbit_exchange,
+			rgs_server_url: Some("https://rapidsync.lightningdevkit.org/snapshot/v2/".to_string()),
+			lsps_client_config: Some(vec![LSPSClientConfig {
+				node_id: PublicKey::from_str(
+					"0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266",
+				)
+				.unwrap(),
+				address: SocketAddress::from_str("127.0.0.1:39735").unwrap(),
+				token: Some("lsps2-token".to_string()),
+				trust_peer_0conf: true,
+			}]),
 			lsps2_service_config: Some(LSPS2ServiceConfig {
 				require_token: None,
 				advertise_service: false,
@@ -1145,31 +2837,49 @@ mod tests {
 				min_payment_size_msat: 10000000,
 				max_payment_size_msat: 25000000000,
 				client_trusts_lsp: true,
+				disable_client_reserve: false,
 			}),
 			log_level: LevelFilter::Trace,
 			log_file_path: Some("/var/log/ldk-server.log".to_string()),
+			pathfinding_scores_source_url: Some("https://example.com/".to_string()),
+			probing_config: None,
+			async_payments_role: Some(AsyncPaymentsRole::Server),
+			enable_zero_fee_commitments: false,
+			forwarded_payment_tracking_mode: ForwardedPaymentTrackingMode::default(),
+			metrics_enabled: false,
+			poll_metrics_interval: None,
+			metrics_username: None,
+			metrics_password: None,
+			tor_config: Some(TorConfig {
+				proxy_address: SocketAddress::from_str("127.0.0.1:9050").unwrap(),
+			}),
+			hrn_config: HumanReadableNamesConfig::default(),
+			log_max_size_bytes: 50 * 1024 * 1024,
+			log_rotation_interval_secs: 24 * 60 * 60,
+			log_max_files: 5,
+			log_to_file: false,
 		};
 
 		assert_eq!(config.listening_addrs, expected.listening_addrs);
 		assert_eq!(config.announcement_addrs, expected.announcement_addrs);
 		assert_eq!(config.network, expected.network);
-		assert_eq!(config.rest_service_addr, expected.rest_service_addr);
+		assert_eq!(config.grpc_service_addr, expected.grpc_service_addr);
 		assert_eq!(config.storage_dir_path, expected.storage_dir_path);
+		assert_eq!(config.ldk_node_storage, expected.ldk_node_storage);
 		assert_eq!(config.chain_source, expected.chain_source);
-		assert_eq!(config.rabbitmq_connection_string, expected.rabbitmq_connection_string);
-		assert_eq!(config.rabbitmq_exchange_name, expected.rabbitmq_exchange_name);
+		assert_eq!(config.rgs_server_url, expected.rgs_server_url);
+		assert_eq!(config.lsps_client_config, expected.lsps_client_config);
 		#[cfg(feature = "experimental-lsps2-support")]
 		assert_eq!(config.lsps2_service_config.is_some(), expected.lsps2_service_config.is_some());
-	}
-
-	#[test]
-	#[cfg(feature = "events-rabbitmq")]
-	fn test_error_if_rabbitmq_feature_without_valid_config_file() {
-		let args_config = empty_args_config();
-		let result = load_config(&args_config);
-		assert!(result.is_err());
-		let err = result.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(config.pathfinding_scores_source_url, expected.pathfinding_scores_source_url);
+		assert!(matches!(config.async_payments_role, Some(AsyncPaymentsRole::Server)));
+		assert_eq!(config.enable_zero_fee_commitments, expected.enable_zero_fee_commitments);
+		assert_eq!(
+			config.forwarded_payment_tracking_mode,
+			expected.forwarded_payment_tracking_mode
+		);
+		assert_eq!(config.metrics_enabled, expected.metrics_enabled);
+		assert_eq!(config.tor_config, expected.tor_config);
 	}
 
 	#[test]
@@ -1180,5 +2890,825 @@ mod tests {
 		assert!(result.is_err());
 		let err = result.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+	}
+
+	#[test]
+	#[cfg(not(feature = "experimental-lsps2-support"))]
+	fn test_default_grpc_service_address() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_default_grpc_service_address.toml";
+
+		// Config without grpc_service_address
+		let toml_config = r#"
+				[node]
+				network = "regtest"
+
+				[bitcoind]
+				rpc_address = "127.0.0.1:8332"
+				rpc_user = "bitcoind-testuser"
+				rpc_password = "bitcoind-testpassword"
+				"#;
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let config = load_config(&args_config).unwrap();
+		assert_eq!(
+			config.grpc_service_addr,
+			SocketAddr::from_str(DEFAULT_GRPC_SERVICE_ADDRESS).unwrap()
+		);
+	}
+
+	#[test]
+	fn test_metrics_enabled_config() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_metrics_enabled.toml";
+
+		let toml_config = r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "user"
+			rpc_password = "password"
+
+			[metrics]
+			enabled = true
+			username = "admin"
+			password = "password123"
+
+			[liquidity.lsps2_service]
+			advertise_service = false
+			channel_opening_fee_ppm = 1000            # 0.1% fee
+			channel_over_provisioning_ppm = 500000    # 50% extra capacity
+			min_channel_opening_fee_msat = 10000000   # 10,000 satoshis
+			min_channel_lifetime = 4320               # ~30 days
+			max_client_to_self_delay = 1440           # ~10 days
+			min_payment_size_msat = 10000000          # 10,000 satoshis
+			max_payment_size_msat = 25000000000       # 0.25 BTC
+			client_trusts_lsp = true
+			disable_client_reserve = false
+			"#;
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let config = load_config(&args_config).unwrap();
+		assert!(config.metrics_enabled);
+		assert!(config.metrics_username.is_some());
+		assert!(config.metrics_password.is_some());
+	}
+
+	#[test]
+	fn test_metrics_enabled_fails_with_invalid_auth() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_metrics_enabled_with_auth.toml";
+
+		let toml_config = r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "user"
+			rpc_password = "password"
+
+			[metrics]
+			enabled = true
+			username = "admin"
+
+			[liquidity.lsps2_service]
+			advertise_service = false
+			channel_opening_fee_ppm = 1000            # 0.1% fee
+			channel_over_provisioning_ppm = 500000    # 50% extra capacity
+			min_channel_opening_fee_msat = 10000000   # 10,000 satoshis
+			min_channel_lifetime = 4320               # ~30 days
+			max_client_to_self_delay = 1440           # ~10 days
+			min_payment_size_msat = 10000000          # 10,000 satoshis
+			max_payment_size_msat = 25000000000       # 0.25 BTC
+			client_trusts_lsp = true
+			disable_client_reserve = false
+			"#;
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let result = load_config(&args_config);
+		assert!(result.is_err());
+		let err = result.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+	}
+
+	#[test]
+	fn test_hrn_config() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_hrn_config.toml";
+
+		let base_config = r#"
+				[node]
+				network = "regtest"
+
+				[bitcoind]
+				rpc_address = "127.0.0.1:8332"
+				rpc_user = "bitcoind-testuser"
+				rpc_password = "bitcoind-testpassword"
+
+				[liquidity.lsps2_service]
+				advertise_service = false
+				channel_opening_fee_ppm = 1000
+				channel_over_provisioning_ppm = 500000
+				min_channel_opening_fee_msat = 10000000
+				min_channel_lifetime = 4320
+				max_client_to_self_delay = 1440
+				min_payment_size_msat = 10000000
+				max_payment_size_msat = 25000000000
+				client_trusts_lsp = true
+				disable_client_reserve = false
+				"#;
+
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		// Default: no `[hrn]` section -> DNS against 8.8.8.8:53, resolution service disabled.
+		fs::write(storage_path.join(config_file_name), base_config).unwrap();
+		let config = load_config(&args_config).unwrap();
+		match config.hrn_config.resolution_config {
+			HRNResolverConfig::Dns { dns_server_address, enable_hrn_resolution_service } => {
+				assert_eq!(dns_server_address, SocketAddress::from_str("8.8.8.8:53").unwrap());
+				assert!(!enable_hrn_resolution_service);
+			},
+			other => panic!("unexpected default HRN resolver config: {:?}", other),
+		}
+
+		// Custom DNS server address with resolution service enabled.
+		let toml_config = format!(
+			"{}\n[hrn]\ndns_server_address = \"1.1.1.1:53\"\nenable_resolution_service = true\n",
+			base_config
+		);
+		fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+		let config = load_config(&args_config).unwrap();
+		match config.hrn_config.resolution_config {
+			HRNResolverConfig::Dns { dns_server_address, enable_hrn_resolution_service } => {
+				assert_eq!(dns_server_address, SocketAddress::from_str("1.1.1.1:53").unwrap());
+				assert!(enable_hrn_resolution_service);
+			},
+			other => panic!("unexpected HRN resolver config: {:?}", other),
+		}
+
+		// Blip32 mode.
+		let toml_config = format!("{}\n[hrn]\nmode = \"blip32\"\n", base_config);
+		fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+		let config = load_config(&args_config).unwrap();
+		assert!(matches!(config.hrn_config.resolution_config, HRNResolverConfig::Blip32));
+
+		// Invalid mode is rejected.
+		let toml_config = format!("{}\n[hrn]\nmode = \"bogus\"\n", base_config);
+		fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+		// Invalid DNS server address is rejected (contains chars disallowed in hostnames, so
+		// neither the as-is parse nor the `:53` fallback can accept it).
+		let toml_config =
+			format!("{}\n[hrn]\ndns_server_address = \"invalid@address\"\n", base_config);
+		fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+		// DNS server address without an explicit port defaults to port 53.
+		let toml_config = format!("{}\n[hrn]\ndns_server_address = \"1.1.1.1\"\n", base_config);
+		fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+		let config = load_config(&args_config).unwrap();
+		match config.hrn_config.resolution_config {
+			HRNResolverConfig::Dns { dns_server_address, .. } => {
+				assert_eq!(dns_server_address, SocketAddress::from_str("1.1.1.1:53").unwrap());
+			},
+			other => panic!("unexpected HRN resolver config: {:?}", other),
+		}
+
+		// `blip32` mode combined with DNS-only settings is rejected so users aren't confused
+		// by settings that would silently have no effect.
+		let toml_config = format!(
+			"{}\n[hrn]\nmode = \"blip32\"\ndns_server_address = \"1.1.1.1:53\"\n",
+			base_config
+		);
+		fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert!(err.to_string().contains("dns_server_address"));
+
+		let toml_config = format!(
+			"{}\n[hrn]\nmode = \"blip32\"\nenable_resolution_service = true\n",
+			base_config
+		);
+		fs::write(storage_path.join(config_file_name), &toml_config).unwrap();
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert!(err.to_string().contains("enable_resolution_service"));
+	}
+
+	#[test]
+	fn test_parse_dns_server_address() {
+		assert_eq!(
+			parse_dns_server_address("8.8.8.8:53").unwrap(),
+			SocketAddress::from_str("8.8.8.8:53").unwrap()
+		);
+		assert_eq!(
+			parse_dns_server_address("1.1.1.1").unwrap(),
+			SocketAddress::from_str("1.1.1.1:53").unwrap()
+		);
+		assert_eq!(
+			parse_dns_server_address("[2001:db8::1]:53").unwrap(),
+			SocketAddress::from_str("[2001:db8::1]:53").unwrap()
+		);
+		assert_eq!(
+			parse_dns_server_address("2001:db8::1").unwrap(),
+			SocketAddress::from_str("[2001:db8::1]:53").unwrap()
+		);
+		assert!(parse_dns_server_address("invalid@address").is_err());
+	}
+
+	#[test]
+	fn test_forwarded_payment_tracking_mode_config_and_override() {
+		for (mode, expected, override_mode, override_expected) in [
+			(
+				"stats",
+				ForwardedPaymentTrackingMode::Stats,
+				"detailed",
+				ForwardedPaymentTrackingMode::Detailed,
+			),
+			(
+				"detailed",
+				ForwardedPaymentTrackingMode::Detailed,
+				"stats",
+				ForwardedPaymentTrackingMode::Stats,
+			),
+			(
+				"StAtS",
+				ForwardedPaymentTrackingMode::Stats,
+				"DeTaIlEd",
+				ForwardedPaymentTrackingMode::Detailed,
+			),
+			(
+				"DETAILED",
+				ForwardedPaymentTrackingMode::Detailed,
+				"STATS",
+				ForwardedPaymentTrackingMode::Stats,
+			),
+		] {
+			let toml = DEFAULT_CONFIG.replace(
+				"[node]",
+				&format!("[node]\nforwarded_payment_tracking_mode = \"{mode}\""),
+			);
+			let mut builder = ConfigBuilder::default();
+			builder.merge_toml(toml::from_str(&toml).unwrap());
+			assert_eq!(builder.build().unwrap().forwarded_payment_tracking_mode, expected);
+
+			let mut builder = ConfigBuilder::default();
+			builder.merge_toml(toml::from_str(&toml).unwrap());
+			let args = ArgsConfig::try_parse_from([
+				"ldk-server",
+				"--node-forwarded-payment-tracking-mode",
+				override_mode,
+			])
+			.unwrap();
+			builder.merge_args(&args);
+			assert_eq!(builder.build().unwrap().forwarded_payment_tracking_mode, override_expected);
+		}
+	}
+
+	#[test]
+	fn test_forwarded_payment_tracking_mode_rejects_invalid_values() {
+		for mode in ["", "invalid"] {
+			let toml = DEFAULT_CONFIG.replace(
+				"[node]",
+				&format!("[node]\nforwarded_payment_tracking_mode = \"{mode}\""),
+			);
+			let mut builder = ConfigBuilder::default();
+			builder.merge_toml(toml::from_str(&toml).unwrap());
+			let error = builder.build().unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+			assert!(error.to_string().contains("forwarded_payment_tracking_mode"));
+			assert!(ArgsConfig::try_parse_from([
+				"ldk-server",
+				"--node-forwarded-payment-tracking-mode",
+				mode,
+			])
+			.is_err());
+		}
+	}
+
+	#[test]
+	fn test_probing_config_from_file() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_probing_config.toml";
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let high_degree_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "user"
+			rpc_password = "password"
+
+			[probing]
+			strategy = "high_degree"
+			top_node_count = 100
+			interval_secs = 30
+			max_locked_msat = 500000
+			diversity_penalty_msat = 250
+			cooldown_secs = 1800
+			{}"#,
+			lsps2_service_config_for_feature()
+		);
+		fs::write(storage_path.join(config_file_name), high_degree_config).unwrap();
+		assert!(load_config(&args_config).unwrap().probing_config.is_some());
+
+		let random_walk_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "user"
+			rpc_password = "password"
+
+			[probing]
+			strategy = "random_walk"
+			max_hops = 5
+			{}"#,
+			lsps2_service_config_for_feature()
+		);
+		fs::write(storage_path.join(config_file_name), random_walk_config).unwrap();
+		assert!(load_config(&args_config).unwrap().probing_config.is_some());
+	}
+
+	#[test]
+	fn test_probing_config_validation() {
+		let high_degree = ProbingTomlConfig {
+			strategy: Some("high_degree".to_string()),
+			top_node_count: Some(100),
+			interval_secs: Some(30),
+			max_locked_msat: Some(500_000),
+			diversity_penalty_msat: Some(250),
+			cooldown_secs: Some(1800),
+			..ProbingTomlConfig::default()
+		};
+		assert!(build_probing_config(Some(high_degree)).unwrap().is_some());
+
+		let random_walk = ProbingTomlConfig {
+			strategy: Some("random_walk".to_string()),
+			max_hops: Some(5),
+			..ProbingTomlConfig::default()
+		};
+		assert!(build_probing_config(Some(random_walk)).unwrap().is_some());
+
+		let missing_strategy = build_probing_config(Some(ProbingTomlConfig {
+			top_node_count: Some(100),
+			..ProbingTomlConfig::default()
+		}))
+		.unwrap_err();
+		assert!(missing_strategy.to_string().contains("probing.strategy"));
+
+		let missing_strategy_option = build_probing_config(Some(ProbingTomlConfig {
+			strategy: Some("high_degree".to_string()),
+			..ProbingTomlConfig::default()
+		}))
+		.unwrap_err();
+		assert!(missing_strategy_option.to_string().contains("probing.top_node_count"));
+
+		let mismatched_option = build_probing_config(Some(ProbingTomlConfig {
+			strategy: Some("random_walk".to_string()),
+			top_node_count: Some(100),
+			max_hops: Some(5),
+			..ProbingTomlConfig::default()
+		}))
+		.unwrap_err();
+		assert!(mismatched_option.to_string().contains("probing.top_node_count"));
+
+		let invalid_strategy = build_probing_config(Some(ProbingTomlConfig {
+			strategy: Some("invalid".to_string()),
+			..ProbingTomlConfig::default()
+		}))
+		.unwrap_err();
+		assert!(invalid_strategy.to_string().contains("Invalid probing strategy"));
+
+		for max_hops in [0, 1] {
+			let invalid_max_hops = build_probing_config(Some(ProbingTomlConfig {
+				strategy: Some("random_walk".to_string()),
+				max_hops: Some(max_hops),
+				..ProbingTomlConfig::default()
+			}))
+			.unwrap_err();
+			assert!(invalid_max_hops.to_string().contains("`probing.max_hops` must be at least 2"));
+		}
+
+		let clamped_max_hops = ProbingTomlConfig {
+			strategy: Some("random_walk".to_string()),
+			max_hops: Some(20),
+			..ProbingTomlConfig::default()
+		};
+		assert!(build_probing_config(Some(clamped_max_hops)).unwrap().is_some());
+	}
+
+	#[test]
+	fn test_accepts_probing_args() {
+		let args_config = ArgsConfig::try_parse_from([
+			"ldk-server",
+			"--probing-strategy",
+			"high_degree",
+			"--probing-top-node-count",
+			"100",
+			"--probing-interval-secs",
+			"30",
+			"--probing-max-locked-msat",
+			"500000",
+			"--probing-diversity-penalty-msat",
+			"250",
+			"--probing-cooldown-secs",
+			"1800",
+		])
+		.unwrap();
+
+		assert_eq!(args_config.probing_strategy.as_deref(), Some("high_degree"));
+		assert_eq!(args_config.probing_top_node_count, Some(100));
+		assert_eq!(args_config.probing_interval_secs, Some(30));
+		assert_eq!(args_config.probing_max_locked_msat, Some(500_000));
+		assert_eq!(args_config.probing_diversity_penalty_msat, Some(250));
+		assert_eq!(args_config.probing_cooldown_secs, Some(1800));
+	}
+
+	#[test]
+	fn test_accepts_zero_fee_commitments_arg() {
+		for (value, expected) in [("true", true), ("false", false)] {
+			let args_config = ArgsConfig::try_parse_from([
+				"ldk-server",
+				"--node-enable-zero-fee-commitments",
+				value,
+			])
+			.unwrap();
+
+			assert_eq!(args_config.node_enable_zero_fee_commitments, Some(expected));
+		}
+	}
+
+	#[test]
+	fn test_probing_args_override_strategy_specific_file_options() {
+		let mut builder = ConfigBuilder {
+			probing: Some(ProbingTomlConfig {
+				strategy: Some("high_degree".to_string()),
+				top_node_count: Some(100),
+				..ProbingTomlConfig::default()
+			}),
+			..ConfigBuilder::default()
+		};
+		let args_config = ArgsConfig::try_parse_from([
+			"ldk-server",
+			"--probing-strategy",
+			"random_walk",
+			"--probing-max-hops",
+			"5",
+		])
+		.unwrap();
+
+		builder.merge_args(&args_config);
+
+		let probing = builder.probing.unwrap();
+		assert_eq!(probing.strategy.as_deref(), Some("random_walk"));
+		assert_eq!(probing.top_node_count, None);
+		assert_eq!(probing.max_hops, Some(5));
+	}
+
+	#[test]
+	fn test_rejects_node_entropy_config() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_rejects_node_entropy_config.toml";
+
+		let toml_config = r#"
+			[node]
+			network = "regtest"
+			grpc_service_address = "127.0.0.1:3002"
+
+			[node.entropy]
+			mnemonic_file = "/some/path/keys_mnemonic"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+			"#;
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+		assert!(err.to_string().contains("unknown field `entropy`"));
+	}
+
+	#[test]
+	fn test_rejects_seed_file_config() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_rejects_seed_file_config.toml";
+
+		let toml_config = r#"
+			[node]
+			network = "regtest"
+			grpc_service_address = "127.0.0.1:3002"
+
+			[node.entropy]
+			seed_file = "/some/path/keys_seed"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+			"#;
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let err = load_config(&args_config).unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+		assert!(err.to_string().contains("unknown field `entropy`"));
+	}
+
+	#[test]
+	fn test_rejects_node_entropy_args() {
+		let mnemonic_result = ArgsConfig::try_parse_from([
+			"ldk-server",
+			"--node-entropy-mnemonic-file",
+			"/some/path/keys_mnemonic",
+		]);
+		let seed_result = ArgsConfig::try_parse_from([
+			"ldk-server",
+			"--node-entropy-seed-file",
+			"/old/keys_seed",
+		]);
+
+		assert!(mnemonic_result.is_err());
+		assert!(seed_result.is_err());
+	}
+
+	#[test]
+	fn test_accepts_rescan_from_height_arg() {
+		let args_config =
+			ArgsConfig::try_parse_from(["ldk-server", "--rescan-from-height", "144"]).unwrap();
+
+		assert_eq!(args_config.rescan_from_height, Some(144));
+	}
+
+	#[test]
+	fn test_rescan_from_height_configures_bitcoind() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_rescan_from_height_bitcoind.toml";
+		let toml_config = format!(
+			r#"
+			[node]
+			network = "regtest"
+
+			[bitcoind]
+			rpc_address = "127.0.0.1:8332"
+			rpc_user = "bitcoind-testuser"
+			rpc_password = "bitcoind-testpassword"
+			{}
+			"#,
+			lsps2_service_config_for_feature()
+		);
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+		args_config.rescan_from_height = Some(144);
+
+		let config = load_config(&args_config).unwrap();
+		let ChainSource::Rpc { wallet_rescan_from_height, .. } = config.chain_source else {
+			panic!("unexpected chain source");
+		};
+
+		assert_eq!(wallet_rescan_from_height, Some(144));
+	}
+
+	#[test]
+	fn test_rescan_from_height_rejects_non_bitcoind_chain_sources() {
+		for (config_file_name, chain_config) in [
+			(
+				"test_rescan_from_height_rejects_electrum.toml",
+				r#"
+				[node]
+				network = "regtest"
+
+				[electrum]
+				server_url = "ssl://electrum.blockstream.info:50002"
+				"#,
+			),
+			(
+				"test_rescan_from_height_rejects_esplora.toml",
+				r#"
+				[node]
+				network = "regtest"
+
+				[esplora]
+				server_url = "https://mempool.space/api"
+				"#,
+			),
+		] {
+			let storage_path = std::env::temp_dir();
+			fs::write(storage_path.join(config_file_name), chain_config).unwrap();
+			let mut args_config = empty_args_config();
+			args_config.config_file =
+				Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+			args_config.rescan_from_height = Some(144);
+
+			let err = load_config(&args_config).unwrap_err();
+			assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+			assert!(err.to_string().contains("--rescan-from-height"));
+		}
+	}
+
+	#[test]
+	fn test_accepts_force_wallet_full_scan_arg() {
+		let args_config =
+			ArgsConfig::try_parse_from(["ldk-server", "--force-wallet-full-scan"]).unwrap();
+
+		assert!(args_config.force_wallet_full_scan);
+	}
+
+	#[test]
+	fn test_force_wallet_full_scan_configures_electrum_and_esplora() {
+		for (config_file_name, chain_config) in [
+			(
+				"test_force_wallet_full_scan_electrum.toml",
+				r#"
+				[node]
+				network = "regtest"
+
+				[electrum]
+				server_url = "ssl://electrum.blockstream.info:50002"
+				"#,
+			),
+			(
+				"test_force_wallet_full_scan_esplora.toml",
+				r#"
+				[node]
+				network = "regtest"
+
+				[esplora]
+				server_url = "https://mempool.space/api"
+				"#,
+			),
+		] {
+			let storage_path = std::env::temp_dir();
+			let chain_config = format!("{}{}", chain_config, lsps2_service_config_for_feature());
+			fs::write(storage_path.join(config_file_name), chain_config).unwrap();
+			let mut args_config = empty_args_config();
+			args_config.config_file =
+				Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+			args_config.force_wallet_full_scan = true;
+
+			let config = load_config(&args_config).unwrap();
+			let force_wallet_full_scan = match config.chain_source {
+				ChainSource::Electrum { force_wallet_full_scan, .. }
+				| ChainSource::Esplora { force_wallet_full_scan, .. } => force_wallet_full_scan,
+				ChainSource::Rpc { .. } => {
+					panic!("unexpected chain source")
+				},
+			};
+
+			assert!(force_wallet_full_scan);
+		}
+	}
+
+	#[test]
+	fn test_force_wallet_full_scan_rejects_bitcoind() {
+		let mut args_config = default_args_config();
+		args_config.force_wallet_full_scan = true;
+
+		let err = load_config(&args_config).unwrap_err();
+
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert!(err.to_string().contains("--force-wallet-full-scan"));
+	}
+
+	fn bitcoind_rest_toml_config() -> String {
+		r#"
+		[node]
+		network = "regtest"
+
+		[bitcoind]
+		rpc_address = "127.0.0.1:18443"
+		rpc_user = "bitcoind-testuser"
+		rpc_password = "bitcoind-testpassword"
+		rest_address = "127.0.0.1:18443"
+		"#
+		.to_string()
+	}
+
+	#[test]
+	fn test_bitcoind_rest_chain_source() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_bitcoind_rest_chain_source.toml";
+		let toml_config =
+			format!("{}{}", bitcoind_rest_toml_config(), lsps2_service_config_for_feature());
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+
+		let config = load_config(&args_config).unwrap();
+		let ChainSource::Rpc {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+			rest_host,
+			rest_port,
+			wallet_rescan_from_height,
+		} = config.chain_source
+		else {
+			panic!("unexpected chain source");
+		};
+
+		assert_eq!(rpc_host, "127.0.0.1");
+		assert_eq!(rpc_port, 18443);
+		assert_eq!(rpc_user, "bitcoind-testuser");
+		assert_eq!(rpc_password, "bitcoind-testpassword");
+		assert_eq!(rest_host, Some("127.0.0.1".to_string()));
+		assert_eq!(rest_port, Some(18443));
+		assert_eq!(wallet_rescan_from_height, None);
+	}
+
+	#[test]
+	#[cfg(not(feature = "experimental-lsps2-support"))]
+	fn test_bitcoind_rest_chain_source_via_cli() {
+		let mut args_config = default_args_config();
+		args_config.bitcoind_rest_address = Some(String::from("127.0.1.9:18443"));
+
+		let config = load_config(&args_config).unwrap();
+		let ChainSource::Rpc { rest_host, rest_port, .. } = config.chain_source else {
+			panic!("unexpected chain source");
+		};
+
+		assert_eq!(rest_host, Some("127.0.1.9".to_string()));
+		assert_eq!(rest_port, Some(18443));
+	}
+
+	#[test]
+	fn test_rescan_from_height_configures_bitcoind_rest() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_rescan_from_height_bitcoind_rest.toml";
+		let toml_config =
+			format!("{}{}", bitcoind_rest_toml_config(), lsps2_service_config_for_feature());
+
+		fs::write(storage_path.join(config_file_name), toml_config).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+		args_config.rescan_from_height = Some(144);
+
+		let config = load_config(&args_config).unwrap();
+		let ChainSource::Rpc { wallet_rescan_from_height, .. } = config.chain_source else {
+			panic!("unexpected chain source");
+		};
+
+		assert_eq!(wallet_rescan_from_height, Some(144));
+	}
+
+	#[test]
+	fn test_force_wallet_full_scan_rejects_bitcoind_rest() {
+		let storage_path = std::env::temp_dir();
+		let config_file_name = "test_force_wallet_full_scan_rejects_bitcoind_rest.toml";
+
+		fs::write(storage_path.join(config_file_name), bitcoind_rest_toml_config()).unwrap();
+		let mut args_config = empty_args_config();
+		args_config.config_file =
+			Some(storage_path.join(config_file_name).to_string_lossy().to_string());
+		args_config.force_wallet_full_scan = true;
+
+		let err = load_config(&args_config).unwrap_err();
+
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+		assert!(err.to_string().contains("--force-wallet-full-scan"));
 	}
 }

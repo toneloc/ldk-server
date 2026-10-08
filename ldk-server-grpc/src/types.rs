@@ -1,0 +1,1880 @@
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+/// Represents a payment.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.PaymentDetails.html>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Payment {
+	/// An identifier used to uniquely identify a payment in hex-encoded form.
+	#[prost(string, tag = "1")]
+	pub payment_id: ::prost::alloc::string::String,
+	/// The kind of the payment.
+	#[prost(message, optional, tag = "2")]
+	pub kind: ::core::option::Option<PaymentKind>,
+	/// The amount transferred.
+	#[prost(uint64, optional, tag = "3")]
+	pub amount_msat: ::core::option::Option<u64>,
+	/// The fees that were paid for this payment.
+	///
+	/// For Lightning payments, this will only be updated for outbound payments once they
+	/// succeeded.
+	#[prost(uint64, optional, tag = "7")]
+	pub fee_paid_msat: ::core::option::Option<u64>,
+	/// The direction of the payment.
+	#[prost(enumeration = "PaymentDirection", tag = "4")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_payment_direction")
+	)]
+	pub direction: i32,
+	/// The status of the payment.
+	#[prost(enumeration = "PaymentStatus", tag = "5")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_payment_status")
+	)]
+	pub status: i32,
+	/// The timestamp, in seconds since start of the UNIX epoch, when this entry was last updated.
+	#[prost(uint64, tag = "6")]
+	pub latest_update_timestamp: u64,
+}
+/// Options that control which BOLT 12 invoice fields a payer proof discloses.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/payment/struct.PayerProofOptions.html>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PayerProofOptions {
+	/// An optional note to attach to the payer proof itself.
+	#[prost(string, optional, tag = "1")]
+	pub note: ::core::option::Option<::prost::alloc::string::String>,
+	/// Whether to disclose the offer description.
+	#[prost(bool, tag = "2")]
+	pub include_offer_description: bool,
+	/// Whether to disclose the offer issuer.
+	#[prost(bool, tag = "3")]
+	pub include_offer_issuer: bool,
+	/// Whether to disclose the invoice amount.
+	#[prost(bool, tag = "4")]
+	pub include_invoice_amount: bool,
+	/// Whether to disclose the invoice creation timestamp.
+	#[prost(bool, tag = "5")]
+	pub include_invoice_created_at: bool,
+	/// Additional TLV types to disclose, for fields not covered by the flags above.
+	#[prost(uint64, repeated, tag = "6")]
+	pub extra_tlv_types: ::prost::alloc::vec::Vec<u64>,
+}
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaymentKind {
+	#[prost(oneof = "payment_kind::Kind", tags = "1, 2, 3, 4, 5")]
+	pub kind: ::core::option::Option<payment_kind::Kind>,
+}
+/// Nested message and enum types in `PaymentKind`.
+pub mod payment_kind {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum Kind {
+		#[prost(message, tag = "1")]
+		Onchain(super::Onchain),
+		#[prost(message, tag = "2")]
+		Bolt11(super::Bolt11),
+		#[prost(message, tag = "3")]
+		Bolt12Offer(super::Bolt12Offer),
+		#[prost(message, tag = "4")]
+		Bolt12Refund(super::Bolt12Refund),
+		#[prost(message, tag = "5")]
+		Spontaneous(super::Spontaneous),
+	}
+}
+/// Represents an on-chain payment.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Onchain {
+	/// The transaction identifier of this payment.
+	#[prost(string, tag = "1")]
+	pub txid: ::prost::alloc::string::String,
+	/// The confirmation status of this payment.
+	#[prost(message, optional, tag = "2")]
+	pub status: ::core::option::Option<ConfirmationStatus>,
+	/// The classification of this transaction, as reported by LDK when it was broadcast.
+	///
+	/// Unset for plain on-chain sends, and for payments recorded before this classification was
+	/// tracked.
+	#[prost(message, optional, tag = "3")]
+	pub tx_type: ::core::option::Option<TransactionType>,
+}
+/// A channel referenced by a TransactionType variant.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransactionChannel {
+	/// The `node_id` of the channel counterparty.
+	#[prost(string, tag = "1")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The ID of the channel.
+	#[prost(string, tag = "2")]
+	pub channel_id: ::prost::alloc::string::String,
+}
+/// The classification of an on-chain transaction, mirroring LDK Node's
+/// `ldk_node::payment::TransactionType`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransactionType {
+	#[prost(oneof = "transaction_type::Kind", tags = "1, 2, 3, 4, 5, 6, 7")]
+	pub kind: ::core::option::Option<transaction_type::Kind>,
+}
+/// Nested message and enum types in `TransactionType`.
+pub mod transaction_type {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum Kind {
+		#[prost(message, tag = "1")]
+		Funding(super::Funding),
+		#[prost(message, tag = "2")]
+		CooperativeClose(super::CooperativeClose),
+		#[prost(message, tag = "3")]
+		UnilateralClose(super::UnilateralClose),
+		#[prost(message, tag = "4")]
+		AnchorBump(super::AnchorBump),
+		#[prost(message, tag = "5")]
+		Claim(super::Claim),
+		#[prost(message, tag = "6")]
+		Sweep(super::Sweep),
+		#[prost(message, tag = "7")]
+		InteractiveFunding(super::InteractiveFunding),
+	}
+}
+/// A funding transaction establishing one or more new channels.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Funding {
+	/// The channels being funded.
+	#[prost(message, repeated, tag = "1")]
+	pub channels: ::prost::alloc::vec::Vec<TransactionChannel>,
+}
+/// A transaction cooperatively closing a channel.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CooperativeClose {
+	/// The `node_id` of the channel counterparty.
+	#[prost(string, tag = "1")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The ID of the channel being closed.
+	#[prost(string, tag = "2")]
+	pub channel_id: ::prost::alloc::string::String,
+}
+/// A transaction force-closing a channel.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnilateralClose {
+	/// The `node_id` of the channel counterparty.
+	#[prost(string, tag = "1")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The ID of the channel being force-closed.
+	#[prost(string, tag = "2")]
+	pub channel_id: ::prost::alloc::string::String,
+}
+/// An anchor transaction CPFP fee-bumping a closing transaction.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnchorBump {
+	/// The `node_id` of the channel counterparty.
+	#[prost(string, tag = "1")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The ID of the channel whose closing transaction is being fee-bumped.
+	#[prost(string, tag = "2")]
+	pub channel_id: ::prost::alloc::string::String,
+}
+/// A transaction resolving an output spendable by both us and our counterparty.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Claim {
+	/// The `node_id` of the channel counterparty.
+	#[prost(string, tag = "1")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The ID of the channel from which outputs are being claimed.
+	#[prost(string, tag = "2")]
+	pub channel_id: ::prost::alloc::string::String,
+}
+/// A transaction sweeping spendable outputs to the on-chain wallet.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Sweep {
+	/// The channels from which outputs are being swept, if known.
+	#[prost(message, repeated, tag = "1")]
+	pub channels: ::prost::alloc::vec::Vec<TransactionChannel>,
+}
+/// An interactively-negotiated funding transaction: a splice, or (once supported) a V2
+/// dual-funded channel open.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InteractiveFunding {
+	/// The channels participating in the negotiation.
+	#[prost(message, repeated, tag = "1")]
+	pub channels: ::prost::alloc::vec::Vec<TransactionChannel>,
+}
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfirmationStatus {
+	#[prost(oneof = "confirmation_status::Status", tags = "1, 2")]
+	pub status: ::core::option::Option<confirmation_status::Status>,
+}
+/// Nested message and enum types in `ConfirmationStatus`.
+pub mod confirmation_status {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum Status {
+		#[prost(message, tag = "1")]
+		Confirmed(super::Confirmed),
+		#[prost(message, tag = "2")]
+		Unconfirmed(super::Unconfirmed),
+	}
+}
+/// The on-chain transaction is confirmed in the best chain.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Confirmed {
+	/// The hex representation of hash of the block in which the transaction was confirmed.
+	#[prost(string, tag = "1")]
+	pub block_hash: ::prost::alloc::string::String,
+	/// The height under which the block was confirmed.
+	#[prost(uint32, tag = "2")]
+	pub height: u32,
+	/// The timestamp, in seconds since start of the UNIX epoch, when this entry was last updated.
+	#[prost(uint64, tag = "3")]
+	pub timestamp: u64,
+}
+/// The on-chain transaction is unconfirmed.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Unconfirmed {}
+/// Represents a BOLT 11 payment.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11 {
+	/// The payment hash, i.e., the hash of the preimage.
+	#[prost(string, tag = "1")]
+	pub hash: ::prost::alloc::string::String,
+	/// The pre-image used by the payment.
+	#[prost(string, optional, tag = "2")]
+	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
+	/// The secret used by the payment.
+	#[prost(bytes = "bytes", optional, tag = "3")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_opt_bytes_hex")
+	)]
+	pub secret: ::core::option::Option<::prost::bytes::Bytes>,
+	/// The value, in thousands of a satoshi, that was deducted from this payment as an extra
+	/// fee taken by our channel counterparty.
+	///
+	/// Will only ever be `Some` for inbound payments received via an [bLIP-52 / LSPS 2]
+	/// just-in-time channel, and only after the payment is observed; `None` otherwise.
+	///
+	/// [bLIP-52 / LSPS 2]: <https://github.com/lightning/blips/blob/master/blip-0052.md>
+	#[prost(uint64, optional, tag = "4")]
+	pub counterparty_skimmed_fee_msat: ::core::option::Option<u64>,
+}
+/// Represents a BOLT 12 ‘offer’ payment, i.e., a payment for an Offer.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt12Offer {
+	/// The payment hash, i.e., the hash of the preimage.
+	#[prost(string, optional, tag = "1")]
+	pub hash: ::core::option::Option<::prost::alloc::string::String>,
+	/// The pre-image used by the payment.
+	#[prost(string, optional, tag = "2")]
+	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
+	/// The secret used by the payment.
+	#[prost(bytes = "bytes", optional, tag = "3")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_opt_bytes_hex")
+	)]
+	pub secret: ::core::option::Option<::prost::bytes::Bytes>,
+	/// The hex-encoded ID of the offer this payment is for.
+	#[prost(string, tag = "4")]
+	pub offer_id: ::prost::alloc::string::String,
+	/// The payer's note for the payment.
+	/// Truncated to \[PAYER_NOTE_LIMIT\](<https://docs.rs/lightning/latest/lightning/offers/invoice_request/constant.PAYER_NOTE_LIMIT.html>).
+	///
+	/// **Caution**: The `payer_note` field may come from an untrusted source. To prevent potential misuse,
+	/// all non-printable characters will be sanitized and replaced with safe characters.
+	#[prost(string, optional, tag = "5")]
+	pub payer_note: ::core::option::Option<::prost::alloc::string::String>,
+	/// The quantity of an item requested in the offer.
+	#[prost(uint64, optional, tag = "6")]
+	pub quantity: ::core::option::Option<u64>,
+}
+/// Represents a BOLT 12 ‘refund’ payment, i.e., a payment for a Refund.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt12Refund {
+	/// The payment hash, i.e., the hash of the preimage.
+	#[prost(string, optional, tag = "1")]
+	pub hash: ::core::option::Option<::prost::alloc::string::String>,
+	/// The pre-image used by the payment.
+	#[prost(string, optional, tag = "2")]
+	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
+	/// The secret used by the payment.
+	#[prost(bytes = "bytes", optional, tag = "3")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_opt_bytes_hex")
+	)]
+	pub secret: ::core::option::Option<::prost::bytes::Bytes>,
+	/// The payer's note for the payment.
+	/// Truncated to \[PAYER_NOTE_LIMIT\](<https://docs.rs/lightning/latest/lightning/offers/invoice_request/constant.PAYER_NOTE_LIMIT.html>).
+	///
+	/// **Caution**: The `payer_note` field may come from an untrusted source. To prevent potential misuse,
+	/// all non-printable characters will be sanitized and replaced with safe characters.
+	#[prost(string, optional, tag = "5")]
+	pub payer_note: ::core::option::Option<::prost::alloc::string::String>,
+	/// The quantity of an item requested in the offer.
+	#[prost(uint64, optional, tag = "6")]
+	pub quantity: ::core::option::Option<u64>,
+}
+/// Represents a spontaneous (“keysend”) payment.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Spontaneous {
+	/// The payment hash, i.e., the hash of the preimage.
+	#[prost(string, tag = "1")]
+	pub hash: ::prost::alloc::string::String,
+	/// The pre-image used by the payment.
+	#[prost(string, optional, tag = "2")]
+	pub preimage: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Limits applying to how much fee we allow an LSP to deduct from the payment amount.
+/// See \[`LdkChannelConfig::accept_underpaying_htlcs`\] for more information.
+///
+/// \[`LdkChannelConfig::accept_underpaying_htlcs`\]: lightning::util::config::ChannelConfig::accept_underpaying_htlcs
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LspFeeLimits {
+	/// The maximal total amount we allow any configured LSP withhold from us when forwarding the
+	/// payment.
+	#[prost(uint64, optional, tag = "1")]
+	pub max_total_opening_fee_msat: ::core::option::Option<u64>,
+	/// The maximal proportional fee, in parts-per-million millisatoshi, we allow any configured
+	/// LSP withhold from us when forwarding the payment.
+	#[prost(uint64, optional, tag = "2")]
+	pub max_proportional_opening_fee_ppm_msat: ::core::option::Option<u64>,
+}
+/// Identifies the channel and counterparty that an HTLC was processed with.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HtlcLocator {
+	/// The channel that the HTLC was sent or received on.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The `user_channel_id` for the channel.
+	/// This can be unset for older serialized events or if the payment was settled on-chain.
+	#[prost(string, optional, tag = "2")]
+	pub user_channel_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The node id of the counterparty for this HTLC.
+	/// This can be unset for older serialized events.
+	#[prost(string, optional, tag = "3")]
+	pub node_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The amount in millisatoshis of the HTLC that was sent or received, if known.
+	/// This can be unset for events serialized by LDK Node v0.7.0 and prior.
+	#[prost(uint64, optional, tag = "4")]
+	pub amount_msat: ::core::option::Option<u64>,
+}
+/// A stored forwarding record from LDK Node's detailed history.
+/// Each record describes one incoming and one outgoing HTLC.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForwardedPayment {
+	/// The opaque, hex-encoded identifier assigned by LDK Node.
+	#[prost(string, tag = "1")]
+	pub id: ::prost::alloc::string::String,
+	/// The incoming channel ID.
+	#[prost(string, tag = "2")]
+	pub prev_channel_id: ::prost::alloc::string::String,
+	/// The outgoing channel ID.
+	#[prost(string, tag = "3")]
+	pub next_channel_id: ::prost::alloc::string::String,
+	/// The incoming user channel ID as a decimal string, if known.
+	#[prost(string, optional, tag = "4")]
+	pub prev_user_channel_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The outgoing user channel ID as a decimal string, if known.
+	#[prost(string, optional, tag = "5")]
+	pub next_user_channel_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The previous node's public key, if known.
+	#[prost(string, optional, tag = "6")]
+	pub prev_node_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The next node's public key, if known.
+	#[prost(string, optional, tag = "7")]
+	pub next_node_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The incoming amount, in millisatoshis, if known.
+	#[prost(uint64, optional, tag = "8")]
+	pub inbound_amount_forwarded_msat: ::core::option::Option<u64>,
+	/// The total fee earned, in millisatoshis, if known.
+	#[prost(uint64, optional, tag = "9")]
+	pub total_fee_earned_msat: ::core::option::Option<u64>,
+	/// The share of the total fee withheld in addition to the forwarding fee, if known.
+	/// This is included in total_fee_earned_msat; do not add the two amounts.
+	#[prost(uint64, optional, tag = "10")]
+	pub skimmed_fee_msat: ::core::option::Option<u64>,
+	/// Whether the next hop claimed the forwarded HTLC through an on-chain transaction.
+	#[prost(bool, tag = "11")]
+	pub claim_from_onchain_tx: bool,
+	/// The outgoing amount, in millisatoshis, if known.
+	#[prost(uint64, optional, tag = "12")]
+	pub outbound_amount_forwarded_msat: ::core::option::Option<u64>,
+	/// LDK Node's stored forwarding time, in seconds since the Unix epoch.
+	#[prost(uint64, tag = "13")]
+	pub forwarded_at_timestamp: u64,
+}
+/// Forwarding statistics reported by LDK Node.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChannelForwardingStats {
+	/// The channel id these stats apply to.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The channel counterparty node id, if known.
+	#[prost(string, optional, tag = "2")]
+	pub counterparty_node_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// Number of forwarded payments where this was the incoming channel.
+	#[prost(uint64, tag = "3")]
+	pub inbound_payments_forwarded: u64,
+	/// Number of forwarded payments where this was the outgoing channel.
+	#[prost(uint64, tag = "4")]
+	pub outbound_payments_forwarded: u64,
+	/// Total inbound amount forwarded through this channel, in millisatoshis.
+	#[prost(uint64, tag = "5")]
+	pub total_inbound_amount_msat: u64,
+	/// Total outbound amount forwarded through this channel, in millisatoshis.
+	#[prost(uint64, tag = "6")]
+	pub total_outbound_amount_msat: u64,
+	/// Total forwarding fees earned through this channel, in millisatoshis, if known for every
+	/// recorded forward.
+	///
+	/// A single record covers this channel in both roles. A forward contributes its fee here when
+	/// this was the incoming channel, and contributes nothing when this was the outgoing channel,
+	/// because fees are attributed to the incoming side.
+	#[prost(uint64, optional, tag = "7")]
+	pub total_fee_earned_msat: ::core::option::Option<u64>,
+	/// Total skimmed fees earned through this channel, in millisatoshis.
+	///
+	/// This is the share of `total_fee_earned_msat` that was withheld in addition to the
+	/// forwarding fee, not an amount earned on top of it. Adding the two would double-count.
+	#[prost(uint64, tag = "8")]
+	pub total_skimmed_fee_msat: u64,
+	/// Number of forwarded HTLCs that the next hop claimed from an on-chain transaction.
+	///
+	/// A forward contributes here when this was the outgoing channel.
+	#[prost(uint64, tag = "9")]
+	pub onchain_claims_count: u64,
+	/// Timestamp of the first forward recorded for this channel, in seconds since the Unix epoch.
+	#[prost(uint64, tag = "10")]
+	pub first_forwarded_at_timestamp: u64,
+	/// Timestamp of the latest forward recorded for this channel, in seconds since the Unix epoch.
+	#[prost(uint64, tag = "11")]
+	pub last_forwarded_at_timestamp: u64,
+}
+/// Forwarding statistics reported by LDK Node.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChannelPairForwardingStats {
+	/// An opaque identifier for this channel-pair bucket.
+	#[prost(string, tag = "1")]
+	pub id: ::prost::alloc::string::String,
+	/// The incoming channel id.
+	#[prost(string, tag = "2")]
+	pub prev_channel_id: ::prost::alloc::string::String,
+	/// The outgoing channel id.
+	#[prost(string, tag = "3")]
+	pub next_channel_id: ::prost::alloc::string::String,
+	/// Start timestamp of this aggregation bucket, in seconds since the Unix epoch.
+	#[prost(uint64, tag = "4")]
+	pub bucket_start_timestamp: u64,
+	/// Width of this aggregation bucket, in seconds.
+	#[prost(uint64, tag = "5")]
+	pub bucket_size_secs: u64,
+	/// The previous node id, if available.
+	#[prost(string, optional, tag = "6")]
+	pub prev_node_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The next node id, if available.
+	#[prost(string, optional, tag = "7")]
+	pub next_node_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// Number of payments aggregated in this bucket.
+	#[prost(uint64, tag = "8")]
+	pub payment_count: u64,
+	/// Total inbound amount in this bucket, in millisatoshis.
+	#[prost(uint64, tag = "9")]
+	pub total_inbound_amount_msat: u64,
+	/// Total outbound amount in this bucket, in millisatoshis.
+	#[prost(uint64, tag = "10")]
+	pub total_outbound_amount_msat: u64,
+	/// Total forwarding fees earned in this bucket, in millisatoshis, if known for every payment.
+	#[prost(uint64, optional, tag = "11")]
+	pub total_fee_earned_msat: ::core::option::Option<u64>,
+	/// Total skimmed fees in this bucket, in millisatoshis.
+	///
+	/// This is the share of `total_fee_earned_msat` that was withheld in addition to the
+	/// forwarding fee, not an amount earned on top of it. Adding the two would double-count.
+	#[prost(uint64, tag = "12")]
+	pub total_skimmed_fee_msat: u64,
+	/// Number of forwarded HTLCs that the next hop claimed from an on-chain transaction.
+	#[prost(uint64, tag = "13")]
+	pub onchain_claims_count: u64,
+	/// Average forwarding fee per payment, in millisatoshis, if known for every payment.
+	#[prost(uint64, optional, tag = "14")]
+	pub avg_fee_msat: ::core::option::Option<u64>,
+	/// Average inbound amount per payment, in millisatoshis.
+	#[prost(uint64, tag = "15")]
+	pub avg_inbound_amount_msat: u64,
+	/// Timestamp of the first forward in this bucket, in seconds since the Unix epoch.
+	#[prost(uint64, tag = "16")]
+	pub first_forwarded_at_timestamp: u64,
+	/// Timestamp of the latest forward in this bucket, in seconds since the Unix epoch.
+	#[prost(uint64, tag = "17")]
+	pub last_forwarded_at_timestamp: u64,
+	/// Timestamp when this bucket was aggregated, in seconds since the Unix epoch.
+	#[prost(uint64, tag = "18")]
+	pub aggregated_at_timestamp: u64,
+}
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Channel {
+	/// The channel ID (prior to funding transaction generation, this is a random 32-byte
+	/// identifier, afterwards this is the transaction ID of the funding transaction XOR the
+	/// funding transaction output).
+	///
+	/// Note that this means this value is *not* persistent - it can change once during the
+	/// lifetime of the channel.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The node ID of our the channel's remote counterparty.
+	#[prost(string, tag = "2")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The channel's funding transaction output, if we've negotiated the funding transaction with
+	/// our counterparty already.
+	#[prost(message, optional, tag = "3")]
+	pub funding_txo: ::core::option::Option<OutPoint>,
+	/// The hex-encoded local `user_channel_id` of this channel.
+	#[prost(string, tag = "4")]
+	pub user_channel_id: ::prost::alloc::string::String,
+	/// The value, in satoshis, that must always be held as a reserve in the channel for us. This
+	/// value ensures that if we broadcast a revoked state, our counterparty can punish us by
+	/// claiming at least this value on chain.
+	///
+	/// This value is not included in \[`outbound_capacity_msat`\] as it can never be spent.
+	///
+	/// This value will be `None` for outbound channels until the counterparty accepts the channel.
+	#[prost(uint64, optional, tag = "5")]
+	pub unspendable_punishment_reserve: ::core::option::Option<u64>,
+	/// The value, in satoshis, of this channel as it appears in the funding output.
+	#[prost(uint64, tag = "6")]
+	pub channel_value_sats: u64,
+	/// The currently negotiated fee rate denominated in satoshi per 1000 weight units,
+	/// which is applied to commitment and HTLC transactions.
+	#[prost(uint32, tag = "7")]
+	pub feerate_sat_per_1000_weight: u32,
+	/// The available outbound capacity for sending HTLCs to the remote peer.
+	///
+	/// The amount does not include any pending HTLCs which are not yet resolved (and, thus, whose
+	/// balance is not available for inclusion in new outbound HTLCs). This further does not include
+	/// any pending outgoing HTLCs which are awaiting some other resolution to be sent.
+	#[prost(uint64, tag = "8")]
+	pub outbound_capacity_msat: u64,
+	/// The available outbound capacity for sending HTLCs to the remote peer.
+	///
+	/// The amount does not include any pending HTLCs which are not yet resolved
+	/// (and, thus, whose balance is not available for inclusion in new inbound HTLCs). This further
+	/// does not include any pending outgoing HTLCs which are awaiting some other resolution to be
+	/// sent.
+	#[prost(uint64, tag = "9")]
+	pub inbound_capacity_msat: u64,
+	/// The number of required confirmations on the funding transactions before the funding is
+	/// considered "locked". The amount is selected by the channel fundee.
+	///
+	/// The value will be `None` for outbound channels until the counterparty accepts the channel.
+	#[prost(uint32, optional, tag = "10")]
+	pub confirmations_required: ::core::option::Option<u32>,
+	/// The current number of confirmations on the funding transaction.
+	#[prost(uint32, optional, tag = "11")]
+	pub confirmations: ::core::option::Option<u32>,
+	/// Is `true` if the channel was initiated (and therefore funded) by us.
+	#[prost(bool, tag = "12")]
+	pub is_outbound: bool,
+	/// Is `true` if both parties have exchanged `channel_ready` messages, and the channel is
+	/// not currently being shut down. Both parties exchange `channel_ready` messages upon
+	/// independently verifying that the required confirmations count provided by
+	/// `confirmations_required` has been reached.
+	#[prost(bool, tag = "13")]
+	pub is_channel_ready: bool,
+	/// Is `true` if the channel (a) `channel_ready` messages have been exchanged, (b) the
+	/// peer is connected, and (c) the channel is not currently negotiating shutdown.
+	///
+	/// This is a strict superset of `is_channel_ready`.
+	#[prost(bool, tag = "14")]
+	pub is_usable: bool,
+	/// Is `true` if this channel is (or will be) publicly-announced
+	#[prost(bool, tag = "15")]
+	pub is_announced: bool,
+	/// Set of configurable parameters set by self that affect channel operation.
+	#[prost(message, optional, tag = "16")]
+	pub channel_config: ::core::option::Option<ChannelConfig>,
+	/// The available outbound capacity for sending a single HTLC to the remote peer. This is
+	/// similar to `outbound_capacity_msat` but it may be further restricted by
+	/// the current state and per-HTLC limit(s). This is intended for use when routing, allowing us
+	/// to use a limit as close as possible to the HTLC limit we can currently send.
+	#[prost(uint64, tag = "17")]
+	pub next_outbound_htlc_limit_msat: u64,
+	/// The minimum value for sending a single HTLC to the remote peer. This is the equivalent of
+	/// `next_outbound_htlc_limit_msat` but represents a lower-bound, rather than
+	/// an upper-bound. This is intended for use when routing, allowing us to ensure we pick a
+	/// route which is valid.
+	#[prost(uint64, tag = "18")]
+	pub next_outbound_htlc_minimum_msat: u64,
+	/// The number of blocks (after our commitment transaction confirms) that we will need to wait
+	/// until we can claim our funds after we force-close the channel. During this time our
+	/// counterparty is allowed to punish us if we broadcasted a stale state. If our counterparty
+	/// force-closes the channel and broadcasts a commitment transaction we do not have to wait any
+	/// time to claim our non-HTLC-encumbered funds.
+	///
+	/// This value will be `None` for outbound channels until the counterparty accepts the channel.
+	#[prost(uint32, optional, tag = "19")]
+	pub force_close_spend_delay: ::core::option::Option<u32>,
+	/// The smallest value HTLC (in msat) the remote peer will accept, for this channel.
+	///
+	/// This field is only `None` before we have received either the `OpenChannel` or
+	/// `AcceptChannel` message from the remote peer.
+	#[prost(uint64, optional, tag = "20")]
+	pub counterparty_outbound_htlc_minimum_msat: ::core::option::Option<u64>,
+	/// The largest value HTLC (in msat) the remote peer currently will accept, for this channel.
+	#[prost(uint64, optional, tag = "21")]
+	pub counterparty_outbound_htlc_maximum_msat: ::core::option::Option<u64>,
+	/// The value, in satoshis, that must always be held in the channel for our counterparty. This
+	/// value ensures that if our counterparty broadcasts a revoked state, we can punish them by
+	/// claiming at least this value on chain.
+	///
+	/// This value is not included in `inbound_capacity_msat` as it can never be spent.
+	#[prost(uint64, tag = "22")]
+	pub counterparty_unspendable_punishment_reserve: u64,
+	/// Base routing fee in millisatoshis.
+	#[prost(uint32, optional, tag = "23")]
+	pub counterparty_forwarding_info_fee_base_msat: ::core::option::Option<u32>,
+	/// Proportional fee, in millionths of a satoshi the channel will charge per transferred satoshi.
+	#[prost(uint32, optional, tag = "24")]
+	pub counterparty_forwarding_info_fee_proportional_millionths: ::core::option::Option<u32>,
+	/// The minimum difference in CLTV expiry between an ingoing HTLC and its outgoing counterpart,
+	/// such that the outgoing HTLC is forwardable to this counterparty.
+	#[prost(uint32, optional, tag = "25")]
+	pub counterparty_forwarding_info_cltv_expiry_delta: ::core::option::Option<u32>,
+	/// The channel's `short_channel_id`, if we've negotiated the funding transaction with our
+	/// counterparty already and it's reached the required number of confirmations.
+	///
+	/// Note that if an inbound SCID alias is set, that will be used for invoices and inbound
+	/// payments instead of this value.
+	#[prost(uint64, optional, tag = "26")]
+	pub short_channel_id: ::core::option::Option<u64>,
+	/// An optional `short_channel_id` alias for this channel, randomly generated by us and usable
+	/// in place of `short_channel_id` to reference the channel in outbound routes when the channel
+	/// has not yet been confirmed.
+	#[prost(uint64, optional, tag = "27")]
+	pub outbound_scid_alias: ::core::option::Option<u64>,
+	/// An optional `short_channel_id` alias for this channel, randomly generated by our
+	/// counterparty and usable in place of `short_channel_id` in invoice route hints. Our
+	/// counterparty will recognize the alias provided here in place of the `short_channel_id`
+	/// when they see a payment to be routed to us.
+	#[prost(uint64, optional, tag = "28")]
+	pub inbound_scid_alias: ::core::option::Option<u64>,
+	/// The smallest value HTLC (in msat) we will accept, for this channel.
+	#[prost(uint64, tag = "29")]
+	pub inbound_htlc_minimum_msat: u64,
+	/// The largest value HTLC (in msat) we currently will accept, for this channel.
+	#[prost(uint64, optional, tag = "30")]
+	pub inbound_htlc_maximum_msat: ::core::option::Option<u64>,
+	/// The current shutdown state of the channel, if any.
+	///
+	/// Will be unset for objects serialized with LDK Node v0.1 and earlier.
+	#[prost(enumeration = "ChannelShutdownState", optional, tag = "31")]
+	pub channel_shutdown_state: ::core::option::Option<i32>,
+	/// The type of on-chain reserve maintained for this channel.
+	///
+	/// Will be unset until channel negotiation has completed and determined whether this channel
+	/// uses anchor or legacy reserve behavior.
+	#[prost(enumeration = "ReserveType", optional, tag = "32")]
+	pub reserve_type: ::core::option::Option<i32>,
+	/// The negotiated channel-type features, keyed by the signaled BOLT feature bit.
+	/// This map is empty until channel negotiation determines the channel type.
+	#[prost(btree_map = "uint32, message", tag = "33")]
+	pub channel_type: ::prost::alloc::collections::BTreeMap<u32, Feature>,
+	/// The features our counterparty provided upon last connection, keyed by the signaled BOLT
+	/// feature bit.
+	///
+	/// Useful for routing, as it is the most up-to-date copy of the counterparty's features and
+	/// many routing-relevant features are present in the init context.
+	#[prost(btree_map = "uint32, message", tag = "34")]
+	pub counterparty_features: ::prost::alloc::collections::BTreeMap<u32, Feature>,
+}
+/// ChannelConfig represents the configuration settings for a channel in a Lightning Network node.
+/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChannelConfig {
+	/// Amount (in millionths of a satoshi) charged per satoshi for payments forwarded outbound
+	/// over the channel.
+	/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html#structfield.forwarding_fee_proportional_millionths>
+	#[prost(uint32, optional, tag = "1")]
+	pub forwarding_fee_proportional_millionths: ::core::option::Option<u32>,
+	/// Amount (in milli-satoshi) charged for payments forwarded outbound over the channel,
+	/// in excess of forwarding_fee_proportional_millionths.
+	/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html#structfield.forwarding_fee_base_msat>
+	#[prost(uint32, optional, tag = "2")]
+	pub forwarding_fee_base_msat: ::core::option::Option<u32>,
+	/// The difference in the CLTV value between incoming HTLCs and an outbound HTLC forwarded
+	/// over the channel this config applies to.
+	/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html#structfield.cltv_expiry_delta>
+	#[prost(uint32, optional, tag = "3")]
+	pub cltv_expiry_delta: ::core::option::Option<u32>,
+	/// The maximum additional fee we’re willing to pay to avoid waiting for the counterparty’s
+	/// to_self_delay to reclaim funds.
+	/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html#structfield.force_close_avoidance_max_fee_satoshis>
+	#[prost(uint64, optional, tag = "4")]
+	pub force_close_avoidance_max_fee_satoshis: ::core::option::Option<u64>,
+	/// If set, allows this channel’s counterparty to skim an additional fee off this node’s
+	/// inbound HTLCs. Useful for liquidity providers to offload on-chain channel costs to end users.
+	/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html#structfield.accept_underpaying_htlcs>
+	#[prost(bool, optional, tag = "5")]
+	pub accept_underpaying_htlcs: ::core::option::Option<bool>,
+	/// Limit our total exposure to potential loss to on-chain fees on close, including
+	/// in-flight HTLCs which are burned to fees as they are too small to claim on-chain
+	/// and fees on commitment transaction(s) broadcasted by our counterparty in excess of
+	/// our own fee estimate.
+	/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html#structfield.max_dust_htlc_exposure>
+	#[prost(oneof = "channel_config::MaxDustHtlcExposure", tags = "6, 7")]
+	pub max_dust_htlc_exposure: ::core::option::Option<channel_config::MaxDustHtlcExposure>,
+}
+/// Nested message and enum types in `ChannelConfig`.
+pub mod channel_config {
+	/// Limit our total exposure to potential loss to on-chain fees on close, including
+	/// in-flight HTLCs which are burned to fees as they are too small to claim on-chain
+	/// and fees on commitment transaction(s) broadcasted by our counterparty in excess of
+	/// our own fee estimate.
+	/// See more: <https://docs.rs/lightning/latest/lightning/util/config/struct.ChannelConfig.html#structfield.max_dust_htlc_exposure>
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum MaxDustHtlcExposure {
+		/// This sets a fixed limit on the total dust exposure in millisatoshis.
+		/// See more: <https://docs.rs/lightning/latest/lightning/util/config/enum.MaxDustHTLCExposure.html#variant.FixedLimitMsat>
+		#[prost(uint64, tag = "6")]
+		FixedLimitMsat(u64),
+		/// This sets a multiplier on the ConfirmationTarget::OnChainSweep feerate (in sats/KW) to determine the maximum allowed dust exposure.
+		/// See more: <https://docs.rs/lightning/latest/lightning/util/config/enum.MaxDustHTLCExposure.html#variant.FeeRateMultiplier>
+		#[prost(uint64, tag = "7")]
+		FeeRateMultiplier(u64),
+	}
+}
+/// Represent a transaction outpoint.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OutPoint {
+	/// The referenced transaction's txid.
+	#[prost(string, tag = "1")]
+	pub txid: ::prost::alloc::string::String,
+	/// The index of the referenced output in its transaction's vout.
+	#[prost(uint32, tag = "2")]
+	pub vout: u32,
+}
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BestBlock {
+	/// The block’s hash
+	#[prost(string, tag = "1")]
+	pub block_hash: ::prost::alloc::string::String,
+	/// The height at which the block was confirmed.
+	#[prost(uint32, tag = "2")]
+	pub height: u32,
+}
+/// Details about the status of a known Lightning balance.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LightningBalance {
+	#[prost(oneof = "lightning_balance::BalanceType", tags = "1, 2, 3, 4, 5, 6")]
+	pub balance_type: ::core::option::Option<lightning_balance::BalanceType>,
+}
+/// Nested message and enum types in `LightningBalance`.
+pub mod lightning_balance {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum BalanceType {
+		#[prost(message, tag = "1")]
+		ClaimableOnChannelClose(super::ClaimableOnChannelClose),
+		#[prost(message, tag = "2")]
+		ClaimableAwaitingConfirmations(super::ClaimableAwaitingConfirmations),
+		#[prost(message, tag = "3")]
+		ContentiousClaimable(super::ContentiousClaimable),
+		#[prost(message, tag = "4")]
+		MaybeTimeoutClaimableHtlc(super::MaybeTimeoutClaimableHtlc),
+		#[prost(message, tag = "5")]
+		MaybePreimageClaimableHtlc(super::MaybePreimageClaimableHtlc),
+		#[prost(message, tag = "6")]
+		CounterpartyRevokedOutputClaimable(super::CounterpartyRevokedOutputClaimable),
+	}
+}
+/// The channel is not yet closed (or the commitment or closing transaction has not yet appeared in a block).
+/// The given balance is claimable (less on-chain fees) if the channel is force-closed now.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.LightningBalance.html#variant.ClaimableOnChannelClose>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimableOnChannelClose {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The identifier of our channel counterparty.
+	#[prost(string, tag = "2")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The amount available to claim, in satoshis, excluding the on-chain fees which will be required to do so.
+	#[prost(uint64, tag = "3")]
+	pub amount_satoshis: u64,
+	/// The transaction fee we pay for the closing commitment transaction.
+	/// This amount is not included in the `amount_satoshis` value.
+	///
+	/// Note that if this channel is inbound (and thus our counterparty pays the commitment transaction fee) this value
+	/// will be zero.
+	#[prost(uint64, tag = "4")]
+	pub transaction_fee_satoshis: u64,
+	/// The amount of millisatoshis which has been burned to fees from HTLCs which are outbound from us and are related to
+	/// a payment which was sent by us. This is the sum of the millisatoshis part of all HTLCs which are otherwise
+	/// represented by `LightningBalance::MaybeTimeoutClaimableHTLC` with their
+	/// `LightningBalance::MaybeTimeoutClaimableHTLC::outbound_payment` flag set, as well as any dust HTLCs which would
+	/// otherwise be represented the same.
+	///
+	/// This amount (rounded up to a whole satoshi value) will not be included in `amount_satoshis`.
+	#[prost(uint64, tag = "5")]
+	pub outbound_payment_htlc_rounded_msat: u64,
+	/// The amount of millisatoshis which has been burned to fees from HTLCs which are outbound from us and are related to
+	/// a forwarded HTLC. This is the sum of the millisatoshis part of all HTLCs which are otherwise represented by
+	/// `LightningBalance::MaybeTimeoutClaimableHTLC` with their `LightningBalance::MaybeTimeoutClaimableHTLC::outbound_payment`
+	/// flag not set, as well as any dust HTLCs which would otherwise be represented the same.
+	///
+	/// This amount (rounded up to a whole satoshi value) will not be included in `amount_satoshis`.
+	#[prost(uint64, tag = "6")]
+	pub outbound_forwarded_htlc_rounded_msat: u64,
+	/// The amount of millisatoshis which has been burned to fees from HTLCs which are inbound to us and for which we know
+	/// the preimage. This is the sum of the millisatoshis part of all HTLCs which would be represented by
+	/// `LightningBalance::ContentiousClaimable` on channel close, but whose current value is included in `amount_satoshis`,
+	/// as well as any dust HTLCs which would otherwise be represented the same.
+	///
+	/// This amount (rounded up to a whole satoshi value) will not be included in `amount_satoshis`.
+	#[prost(uint64, tag = "7")]
+	pub inbound_claiming_htlc_rounded_msat: u64,
+	/// The amount of millisatoshis which has been burned to fees from HTLCs which are inbound to us and for which we do
+	/// not know the preimage. This is the sum of the millisatoshis part of all HTLCs which would be represented by
+	/// `LightningBalance::MaybePreimageClaimableHTLC` on channel close, as well as any dust HTLCs which would otherwise be
+	/// represented the same.
+	///
+	/// This amount (rounded up to a whole satoshi value) will not be included in the counterparty’s `amount_satoshis`.
+	#[prost(uint64, tag = "8")]
+	pub inbound_htlc_rounded_msat: u64,
+}
+/// The channel has been closed, and the given balance is ours but awaiting confirmations until we consider it spendable.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.LightningBalance.html#variant.ClaimableAwaitingConfirmations>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimableAwaitingConfirmations {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The identifier of our channel counterparty.
+	#[prost(string, tag = "2")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The amount available to claim, in satoshis, possibly excluding the on-chain fees which were spent in broadcasting
+	/// the transaction.
+	#[prost(uint64, tag = "3")]
+	pub amount_satoshis: u64,
+	/// The height at which we start tracking it as  `SpendableOutput`.
+	#[prost(uint32, tag = "4")]
+	pub confirmation_height: u32,
+	/// Whether this balance is a result of cooperative close, a force-close, or an HTLC.
+	#[prost(enumeration = "BalanceSource", tag = "5")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_balance_source")
+	)]
+	pub source: i32,
+}
+/// The channel has been closed, and the given balance should be ours but awaiting spending transaction confirmation.
+/// If the spending transaction does not confirm in time, it is possible our counterparty can take the funds by
+/// broadcasting an HTLC timeout on-chain.
+///
+/// Once the spending transaction confirms, before it has reached enough confirmations to be considered safe from chain
+/// reorganizations, the balance will instead be provided via `LightningBalance::ClaimableAwaitingConfirmations`.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.LightningBalance.html#variant.ContentiousClaimable>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContentiousClaimable {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The identifier of our channel counterparty.
+	#[prost(string, tag = "2")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The amount available to claim, in satoshis, excluding the on-chain fees which were spent in broadcasting
+	/// the transaction.
+	#[prost(uint64, tag = "3")]
+	pub amount_satoshis: u64,
+	/// The height at which the counterparty may be able to claim the balance if we have not done so.
+	#[prost(uint32, tag = "4")]
+	pub timeout_height: u32,
+	/// The payment hash that locks this HTLC.
+	#[prost(string, tag = "5")]
+	pub payment_hash: ::prost::alloc::string::String,
+	/// The preimage that can be used to claim this HTLC.
+	#[prost(string, tag = "6")]
+	pub payment_preimage: ::prost::alloc::string::String,
+}
+/// HTLCs which we sent to our counterparty which are claimable after a timeout (less on-chain fees) if the counterparty
+/// does not know the preimage for the HTLCs. These are somewhat likely to be claimed by our counterparty before we do.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.LightningBalance.html#variant.MaybeTimeoutClaimableHTLC>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MaybeTimeoutClaimableHtlc {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The identifier of our channel counterparty.
+	#[prost(string, tag = "2")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The amount available to claim, in satoshis, excluding the on-chain fees which were spent in broadcasting
+	/// the transaction.
+	#[prost(uint64, tag = "3")]
+	pub amount_satoshis: u64,
+	/// The height at which we will be able to claim the balance if our counterparty has not done so.
+	#[prost(uint32, tag = "4")]
+	pub claimable_height: u32,
+	/// The payment hash whose preimage our counterparty needs to claim this HTLC.
+	#[prost(string, tag = "5")]
+	pub payment_hash: ::prost::alloc::string::String,
+	/// Indicates whether this HTLC represents a payment which was sent outbound from us.
+	#[prost(bool, tag = "6")]
+	pub outbound_payment: bool,
+}
+/// HTLCs which we received from our counterparty which are claimable with a preimage which we do not currently have.
+/// This will only be claimable if we receive the preimage from the node to which we forwarded this HTLC before the
+/// timeout.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.LightningBalance.html#variant.MaybePreimageClaimableHTLC>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MaybePreimageClaimableHtlc {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The identifier of our channel counterparty.
+	#[prost(string, tag = "2")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The amount available to claim, in satoshis, excluding the on-chain fees which were spent in broadcasting
+	/// the transaction.
+	#[prost(uint64, tag = "3")]
+	pub amount_satoshis: u64,
+	/// The height at which our counterparty will be able to claim the balance if we have not yet received the preimage and
+	/// claimed it ourselves.
+	#[prost(uint32, tag = "4")]
+	pub expiry_height: u32,
+	/// The payment hash whose preimage we need to claim this HTLC.
+	#[prost(string, tag = "5")]
+	pub payment_hash: ::prost::alloc::string::String,
+}
+/// The channel has been closed, and our counterparty broadcasted a revoked commitment transaction.
+///
+/// Thus, we’re able to claim all outputs in the commitment transaction, one of which has the following amount.
+///
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.LightningBalance.html#variant.CounterpartyRevokedOutputClaimable>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CounterpartyRevokedOutputClaimable {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, tag = "1")]
+	pub channel_id: ::prost::alloc::string::String,
+	/// The identifier of our channel counterparty.
+	#[prost(string, tag = "2")]
+	pub counterparty_node_id: ::prost::alloc::string::String,
+	/// The amount, in satoshis, of the output which we can claim.
+	#[prost(uint64, tag = "3")]
+	pub amount_satoshis: u64,
+}
+/// Details about the status of a known balance currently being swept to our on-chain wallet.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PendingSweepBalance {
+	#[prost(oneof = "pending_sweep_balance::BalanceType", tags = "1, 2, 3")]
+	pub balance_type: ::core::option::Option<pending_sweep_balance::BalanceType>,
+}
+/// Nested message and enum types in `PendingSweepBalance`.
+pub mod pending_sweep_balance {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum BalanceType {
+		#[prost(message, tag = "1")]
+		PendingBroadcast(super::PendingBroadcast),
+		#[prost(message, tag = "2")]
+		BroadcastAwaitingConfirmation(super::BroadcastAwaitingConfirmation),
+		#[prost(message, tag = "3")]
+		AwaitingThresholdConfirmations(super::AwaitingThresholdConfirmations),
+	}
+}
+/// The spendable output is about to be swept, but a spending transaction has yet to be generated and broadcast.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.PendingSweepBalance.html#variant.PendingBroadcast>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PendingBroadcast {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, optional, tag = "1")]
+	pub channel_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The amount, in satoshis, of the output being swept.
+	#[prost(uint64, tag = "2")]
+	pub amount_satoshis: u64,
+}
+/// A spending transaction has been generated and broadcast and is awaiting confirmation on-chain.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.PendingSweepBalance.html#variant.BroadcastAwaitingConfirmation>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BroadcastAwaitingConfirmation {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, optional, tag = "1")]
+	pub channel_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The best height when we last broadcast a transaction spending the output being swept.
+	#[prost(uint32, tag = "2")]
+	pub latest_broadcast_height: u32,
+	/// The identifier of the transaction spending the swept output we last broadcast.
+	#[prost(string, tag = "3")]
+	pub latest_spending_txid: ::prost::alloc::string::String,
+	/// The amount, in satoshis, of the output being swept.
+	#[prost(uint64, tag = "4")]
+	pub amount_satoshis: u64,
+}
+/// A spending transaction has been confirmed on-chain and is awaiting threshold confirmations.
+///
+/// It will be considered irrevocably confirmed after reaching `ANTI_REORG_DELAY`.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/enum.PendingSweepBalance.html#variant.AwaitingThresholdConfirmations>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AwaitingThresholdConfirmations {
+	/// The identifier of the channel this balance belongs to.
+	#[prost(string, optional, tag = "1")]
+	pub channel_id: ::core::option::Option<::prost::alloc::string::String>,
+	/// The identifier of the confirmed transaction spending the swept output.
+	#[prost(string, tag = "2")]
+	pub latest_spending_txid: ::prost::alloc::string::String,
+	/// The hash of the block in which the spending transaction was confirmed.
+	#[prost(string, tag = "3")]
+	pub confirmation_hash: ::prost::alloc::string::String,
+	/// The height at which the spending transaction was confirmed.
+	#[prost(uint32, tag = "4")]
+	pub confirmation_height: u32,
+	/// The amount, in satoshis, of the output being swept.
+	#[prost(uint64, tag = "5")]
+	pub amount_satoshis: u64,
+}
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11InvoiceDescription {
+	#[prost(oneof = "bolt11_invoice_description::Kind", tags = "1, 2")]
+	pub kind: ::core::option::Option<bolt11_invoice_description::Kind>,
+}
+/// Nested message and enum types in `Bolt11InvoiceDescription`.
+pub mod bolt11_invoice_description {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum Kind {
+		#[prost(string, tag = "1")]
+		Direct(::prost::alloc::string::String),
+		#[prost(string, tag = "2")]
+		Hash(::prost::alloc::string::String),
+	}
+}
+/// Configuration options for payment routing and pathfinding.
+/// See <https://docs.rs/lightning/0.2.0/lightning/routing/router/struct.RouteParametersConfig.html> for more details on each field.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RouteParametersConfig {
+	/// The maximum total fees, in millisatoshi, that may accrue during route finding.
+	/// Defaults to 1% of the payment amount + 50 sats
+	#[prost(uint64, optional, tag = "1")]
+	pub max_total_routing_fee_msat: ::core::option::Option<u64>,
+	/// The maximum total CLTV delta we accept for the route.
+	/// Defaults to 1008.
+	#[prost(uint32, tag = "2")]
+	pub max_total_cltv_expiry_delta: u32,
+	/// The maximum number of paths that may be used by (MPP) payments.
+	/// Defaults to 10.
+	#[prost(uint32, tag = "3")]
+	pub max_path_count: u32,
+	/// Selects the maximum share of a channel's total capacity which will be
+	/// sent over a channel, as a power of 1/2.
+	/// Default value: 2
+	#[prost(uint32, tag = "4")]
+	pub max_channel_saturation_power_of_half: u32,
+}
+/// Routing fees for a channel as part of the network graph.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphRoutingFees {
+	/// Flat routing fee in millisatoshis.
+	#[prost(uint32, tag = "1")]
+	pub base_msat: u32,
+	/// Liquidity-based routing fee in millionths of a routed amount.
+	#[prost(uint32, tag = "2")]
+	pub proportional_millionths: u32,
+}
+/// Details about one direction of a channel in the network graph,
+/// as received within a `ChannelUpdate`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphChannelUpdate {
+	/// When the last update to the channel direction was issued.
+	/// Value is opaque, as set in the announcement.
+	#[prost(uint32, tag = "1")]
+	pub last_update: u32,
+	/// Whether the channel can be currently used for payments (in this one direction).
+	#[prost(bool, tag = "2")]
+	pub enabled: bool,
+	/// The difference in CLTV values that you must have when routing through this channel.
+	#[prost(uint32, tag = "3")]
+	pub cltv_expiry_delta: u32,
+	/// The minimum value, which must be relayed to the next hop via the channel.
+	#[prost(uint64, tag = "4")]
+	pub htlc_minimum_msat: u64,
+	/// The maximum value which may be relayed to the next hop via the channel.
+	#[prost(uint64, tag = "5")]
+	pub htlc_maximum_msat: u64,
+	/// Fees charged when the channel is used for routing.
+	#[prost(message, optional, tag = "6")]
+	pub fees: ::core::option::Option<GraphRoutingFees>,
+}
+/// Details about a channel in the network graph (both directions).
+/// Received within a channel announcement.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphChannel {
+	/// Source node of the first direction of the channel (hex-encoded public key).
+	#[prost(string, tag = "1")]
+	pub node_one: ::prost::alloc::string::String,
+	/// Source node of the second direction of the channel (hex-encoded public key).
+	#[prost(string, tag = "2")]
+	pub node_two: ::prost::alloc::string::String,
+	/// The channel capacity as seen on-chain, if chain lookup is available.
+	#[prost(uint64, optional, tag = "3")]
+	pub capacity_sats: ::core::option::Option<u64>,
+	/// Details about the first direction of a channel.
+	#[prost(message, optional, tag = "4")]
+	pub one_to_two: ::core::option::Option<GraphChannelUpdate>,
+	/// Details about the second direction of a channel.
+	#[prost(message, optional, tag = "5")]
+	pub two_to_one: ::core::option::Option<GraphChannelUpdate>,
+}
+/// Information received in the latest node_announcement from this node.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphNodeAnnouncement {
+	/// When the last known update to the node state was issued.
+	/// Value is opaque, as set in the announcement.
+	#[prost(uint32, tag = "1")]
+	pub last_update: u32,
+	/// Moniker assigned to the node.
+	/// May be invalid or malicious (eg control chars), should not be exposed to the user.
+	#[prost(string, tag = "2")]
+	pub alias: ::prost::alloc::string::String,
+	/// Color assigned to the node as a hex-encoded RGB string, e.g. "ff0000".
+	#[prost(string, tag = "3")]
+	pub rgb: ::prost::alloc::string::String,
+	/// List of addresses on which this node is reachable.
+	#[prost(string, repeated, tag = "4")]
+	pub addresses: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+	/// Features signaled in this node announcement, keyed by feature bit.
+	#[prost(btree_map = "uint32, message", tag = "5")]
+	pub features: ::prost::alloc::collections::BTreeMap<u32, Feature>,
+}
+/// Details of a known Lightning peer.
+/// See more: <https://docs.rs/ldk-node/latest/ldk_node/struct.Node.html#method.list_peers>
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Peer {
+	/// The hex-encoded node ID of the peer.
+	#[prost(string, tag = "1")]
+	pub node_id: ::prost::alloc::string::String,
+	/// The network address of the peer.
+	#[prost(string, tag = "2")]
+	pub address: ::prost::alloc::string::String,
+	/// Indicates whether we'll try to reconnect to this peer after restarts.
+	#[prost(bool, tag = "3")]
+	pub is_persisted: bool,
+	/// Indicates whether we currently have an active connection with the peer.
+	#[prost(bool, tag = "4")]
+	pub is_connected: bool,
+}
+/// Details about a node in the network graph, known from the network announcement.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GraphNode {
+	/// All valid channels a node has announced.
+	#[prost(uint64, repeated, tag = "1")]
+	pub channels: ::prost::alloc::vec::Vec<u64>,
+	/// More information about a node from node_announcement.
+	/// Optional because we store a node entry after learning about it from
+	/// a channel announcement, but before receiving a node announcement.
+	#[prost(message, optional, tag = "2")]
+	pub announcement_info: ::core::option::Option<GraphNodeAnnouncement>,
+}
+/// Route hint for finding a path to the payee in a BOLT11 invoice.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11RouteHint {
+	/// The hops in this route hint.
+	#[prost(message, repeated, tag = "1")]
+	pub hop_hints: ::prost::alloc::vec::Vec<Bolt11HopHint>,
+}
+/// A hop in a BOLT11 route hint.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Bolt11HopHint {
+	/// The hex-encoded public key of the node at this hop.
+	#[prost(string, tag = "1")]
+	pub node_id: ::prost::alloc::string::String,
+	/// The short channel ID.
+	#[prost(uint64, tag = "2")]
+	pub short_channel_id: u64,
+	/// The base fee in millisatoshis charged for routing through this hop.
+	#[prost(uint32, tag = "3")]
+	pub fee_base_msat: u32,
+	/// Fee proportional millionths charged for routing through this hop.
+	#[prost(uint32, tag = "4")]
+	pub fee_proportional_millionths: u32,
+	/// The CLTV expiry delta for this hop.
+	#[prost(uint32, tag = "5")]
+	pub cltv_expiry_delta: u32,
+}
+/// The amount specified in a BOLT12 offer.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OfferAmount {
+	#[prost(oneof = "offer_amount::Amount", tags = "1, 2")]
+	pub amount: ::core::option::Option<offer_amount::Amount>,
+}
+/// Nested message and enum types in `OfferAmount`.
+pub mod offer_amount {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum Amount {
+		/// Amount in millisatoshis for Bitcoin payments.
+		#[prost(uint64, tag = "1")]
+		BitcoinAmountMsats(u64),
+		/// Amount in a non-Bitcoin currency.
+		#[prost(message, tag = "2")]
+		CurrencyAmount(super::CurrencyAmount),
+	}
+}
+/// A non-Bitcoin currency amount.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CurrencyAmount {
+	/// ISO 4217 currency code (e.g., "USD", "EUR").
+	#[prost(string, tag = "1")]
+	pub iso4217_code: ::prost::alloc::string::String,
+	/// The amount in the specified currency's minor unit.
+	#[prost(uint64, tag = "2")]
+	pub amount: u64,
+}
+/// The quantity of items supported by a BOLT12 offer.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OfferQuantity {
+	#[prost(oneof = "offer_quantity::Quantity", tags = "1, 2, 3")]
+	pub quantity: ::core::option::Option<offer_quantity::Quantity>,
+}
+/// Nested message and enum types in `OfferQuantity`.
+pub mod offer_quantity {
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum Quantity {
+		/// Only one item may be requested.
+		#[prost(bool, tag = "1")]
+		One(bool),
+		/// Up to this many items may be requested.
+		#[prost(uint64, tag = "2")]
+		Bounded(u64),
+		/// Any number of items may be requested.
+		#[prost(bool, tag = "3")]
+		Unbounded(bool),
+	}
+}
+/// A blinded path to the offer recipient.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BlindedPath {
+	/// The hex-encoded blinding point.
+	#[prost(string, tag = "3")]
+	pub blinding_point: ::prost::alloc::string::String,
+	/// The number of blinded hops in the path.
+	#[prost(uint32, tag = "4")]
+	pub num_hops: u32,
+	/// Identifies the introduction node of the blinded path, either directly by
+	/// node id or indirectly via a directed short channel ID.
+	#[prost(oneof = "blinded_path::IntroductionNode", tags = "1, 2")]
+	pub introduction_node: ::core::option::Option<blinded_path::IntroductionNode>,
+}
+/// Nested message and enum types in `BlindedPath`.
+pub mod blinded_path {
+	/// Identifies the introduction node of the blinded path, either directly by
+	/// node id or indirectly via a directed short channel ID.
+	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+	#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+	#[allow(clippy::derive_partial_eq_without_eq)]
+	#[derive(Clone, PartialEq, ::prost::Oneof)]
+	pub enum IntroductionNode {
+		/// The hex-encoded public key of the introduction node.
+		#[prost(string, tag = "1")]
+		NodeId(::prost::alloc::string::String),
+		/// The directed short channel ID identifying the introduction node.
+		#[prost(message, tag = "2")]
+		DirectedScid(super::DirectedShortChannelId),
+	}
+}
+/// A short channel ID together with a direction byte identifying one of the
+/// channel's two endpoints.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DirectedShortChannelId {
+	/// The short channel ID.
+	#[prost(uint64, tag = "1")]
+	pub scid: u64,
+	/// Which endpoint of the channel is being referred to.
+	#[prost(enumeration = "ChannelDirection", tag = "2")]
+	#[cfg_attr(
+		feature = "serde",
+		serde(serialize_with = "crate::serde_utils::serialize_channel_direction")
+	)]
+	pub direction: i32,
+}
+/// A feature advertised in a BOLT feature context.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Feature {
+	/// Human-readable feature name.
+	#[prost(string, tag = "1")]
+	pub name: ::prost::alloc::string::String,
+	/// Whether the signaled feature bit is required.
+	#[prost(bool, tag = "2")]
+	pub is_required: bool,
+}
+/// Custom TLV record attached to a payment.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(default))]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CustomTlvRecord {
+	/// TLV type number.
+	#[prost(uint64, tag = "1")]
+	pub type_num: u64,
+	/// Raw TLV value.
+	#[prost(bytes = "bytes", tag = "2")]
+	pub value: ::prost::bytes::Bytes,
+}
+/// Represents the direction of a payment.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PaymentDirection {
+	/// The payment is inbound.
+	Inbound = 0,
+	/// The payment is outbound.
+	Outbound = 1,
+}
+impl PaymentDirection {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			PaymentDirection::Inbound => "INBOUND",
+			PaymentDirection::Outbound => "OUTBOUND",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"INBOUND" => Some(Self::Inbound),
+			"OUTBOUND" => Some(Self::Outbound),
+			_ => None,
+		}
+	}
+}
+/// Represents the current status of a payment.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PaymentStatus {
+	/// The payment is still pending.
+	Pending = 0,
+	/// The payment succeeded.
+	Succeeded = 1,
+	/// The payment failed.
+	Failed = 2,
+}
+impl PaymentStatus {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			PaymentStatus::Pending => "PENDING",
+			PaymentStatus::Succeeded => "SUCCEEDED",
+			PaymentStatus::Failed => "FAILED",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"PENDING" => Some(Self::Pending),
+			"SUCCEEDED" => Some(Self::Succeeded),
+			"FAILED" => Some(Self::Failed),
+			_ => None,
+		}
+	}
+}
+/// The Bitcoin network the node is running on.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Network {
+	/// Mainnet Bitcoin.
+	Bitcoin = 0,
+	/// Bitcoin's testnet (testnet3) network.
+	Testnet = 1,
+	/// Bitcoin's testnet4 network.
+	Testnet4 = 2,
+	/// Bitcoin's signet network.
+	Signet = 3,
+	/// Bitcoin's regtest network.
+	Regtest = 4,
+}
+impl Network {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			Network::Bitcoin => "BITCOIN",
+			Network::Testnet => "TESTNET",
+			Network::Testnet4 => "TESTNET4",
+			Network::Signet => "SIGNET",
+			Network::Regtest => "REGTEST",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"BITCOIN" => Some(Self::Bitcoin),
+			"TESTNET" => Some(Self::Testnet),
+			"TESTNET4" => Some(Self::Testnet4),
+			"SIGNET" => Some(Self::Signet),
+			"REGTEST" => Some(Self::Regtest),
+			_ => None,
+		}
+	}
+}
+/// The forwarding history stored by LDK Node.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ForwardedPaymentTrackingMode {
+	Unspecified = 0,
+	/// Update per-channel totals without storing individual forwards.
+	Stats = 1,
+	/// Also store individual forwards, which are later aggregated into channel-pair buckets.
+	Detailed = 2,
+}
+impl ForwardedPaymentTrackingMode {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			ForwardedPaymentTrackingMode::Unspecified => {
+				"FORWARDED_PAYMENT_TRACKING_MODE_UNSPECIFIED"
+			},
+			ForwardedPaymentTrackingMode::Stats => "FORWARDED_PAYMENT_TRACKING_MODE_STATS",
+			ForwardedPaymentTrackingMode::Detailed => "FORWARDED_PAYMENT_TRACKING_MODE_DETAILED",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"FORWARDED_PAYMENT_TRACKING_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+			"FORWARDED_PAYMENT_TRACKING_MODE_STATS" => Some(Self::Stats),
+			"FORWARDED_PAYMENT_TRACKING_MODE_DETAILED" => Some(Self::Detailed),
+			_ => None,
+		}
+	}
+}
+/// ChannelShutdownState mirrors LDK's `lightning::ln::channel_state::ChannelShutdownState`,
+/// indicating how far along a channel is in the cooperative close process.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ChannelShutdownState {
+	Unspecified = 0,
+	/// Channel has not sent or received a shutdown message.
+	NotShuttingDown = 1,
+	/// Local node has sent a shutdown message for this channel.
+	ShutdownInitiated = 2,
+	/// Shutdown message exchanges have concluded and the channels are in the midst of
+	/// resolving all existing open HTLCs before closing can continue.
+	ResolvingHtlcs = 3,
+	/// All HTLCs have been resolved, nodes are currently negotiating channel close onchain fee
+	/// rates.
+	NegotiatingClosingFee = 4,
+	/// We've successfully negotiated a closing_signed dance. At this point the channel is about
+	/// to be dropped.
+	ShutdownComplete = 5,
+}
+impl ChannelShutdownState {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			ChannelShutdownState::Unspecified => "CHANNEL_SHUTDOWN_STATE_UNSPECIFIED",
+			ChannelShutdownState::NotShuttingDown => "CHANNEL_SHUTDOWN_STATE_NOT_SHUTTING_DOWN",
+			ChannelShutdownState::ShutdownInitiated => "CHANNEL_SHUTDOWN_STATE_SHUTDOWN_INITIATED",
+			ChannelShutdownState::ResolvingHtlcs => "CHANNEL_SHUTDOWN_STATE_RESOLVING_HTLCS",
+			ChannelShutdownState::NegotiatingClosingFee => {
+				"CHANNEL_SHUTDOWN_STATE_NEGOTIATING_CLOSING_FEE"
+			},
+			ChannelShutdownState::ShutdownComplete => "CHANNEL_SHUTDOWN_STATE_SHUTDOWN_COMPLETE",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"CHANNEL_SHUTDOWN_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+			"CHANNEL_SHUTDOWN_STATE_NOT_SHUTTING_DOWN" => Some(Self::NotShuttingDown),
+			"CHANNEL_SHUTDOWN_STATE_SHUTDOWN_INITIATED" => Some(Self::ShutdownInitiated),
+			"CHANNEL_SHUTDOWN_STATE_RESOLVING_HTLCS" => Some(Self::ResolvingHtlcs),
+			"CHANNEL_SHUTDOWN_STATE_NEGOTIATING_CLOSING_FEE" => Some(Self::NegotiatingClosingFee),
+			"CHANNEL_SHUTDOWN_STATE_SHUTDOWN_COMPLETE" => Some(Self::ShutdownComplete),
+			_ => None,
+		}
+	}
+}
+/// ReserveType mirrors LDK Node's `ReserveType`, indicating the kind of on-chain reserve
+/// maintained for a channel, if any has been determined yet.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReserveType {
+	Unspecified = 0,
+	/// An anchor outputs channel where we maintain a per-channel on-chain reserve for fee
+	/// bumping force-close transactions.
+	Adaptive = 1,
+	/// An anchor outputs channel where we do not maintain any reserve, because the counterparty
+	/// is in our trusted_peers_no_reserve list.
+	TrustedPeersNoReserve = 2,
+	/// A legacy (pre-anchor) channel using only option_static_remotekey.
+	Legacy = 3,
+}
+impl ReserveType {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			ReserveType::Unspecified => "RESERVE_TYPE_UNSPECIFIED",
+			ReserveType::Adaptive => "RESERVE_TYPE_ADAPTIVE",
+			ReserveType::TrustedPeersNoReserve => "RESERVE_TYPE_TRUSTED_PEERS_NO_RESERVE",
+			ReserveType::Legacy => "RESERVE_TYPE_LEGACY",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"RESERVE_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+			"RESERVE_TYPE_ADAPTIVE" => Some(Self::Adaptive),
+			"RESERVE_TYPE_TRUSTED_PEERS_NO_RESERVE" => Some(Self::TrustedPeersNoReserve),
+			"RESERVE_TYPE_LEGACY" => Some(Self::Legacy),
+			_ => None,
+		}
+	}
+}
+/// Indicates whether the balance is derived from a cooperative close, a force-close (for holder or counterparty),
+/// or whether it is for an HTLC.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BalanceSource {
+	/// The channel was force closed by the holder.
+	HolderForceClosed = 0,
+	/// The channel was force closed by the counterparty.
+	CounterpartyForceClosed = 1,
+	/// The channel was cooperatively closed.
+	CoopClose = 2,
+	/// This balance is the result of an HTLC.
+	Htlc = 3,
+}
+impl BalanceSource {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			BalanceSource::HolderForceClosed => "HOLDER_FORCE_CLOSED",
+			BalanceSource::CounterpartyForceClosed => "COUNTERPARTY_FORCE_CLOSED",
+			BalanceSource::CoopClose => "COOP_CLOSE",
+			BalanceSource::Htlc => "HTLC",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"HOLDER_FORCE_CLOSED" => Some(Self::HolderForceClosed),
+			"COUNTERPARTY_FORCE_CLOSED" => Some(Self::CounterpartyForceClosed),
+			"COOP_CLOSE" => Some(Self::CoopClose),
+			"HTLC" => Some(Self::Htlc),
+			_ => None,
+		}
+	}
+}
+/// Identifies one of the two endpoints of a channel, by lexicographic order of
+/// node ids.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ChannelDirection {
+	/// The endpoint whose node id is lexicographically smaller.
+	NodeOne = 0,
+	/// The endpoint whose node id is lexicographically greater.
+	NodeTwo = 1,
+}
+impl ChannelDirection {
+	/// String value of the enum field names used in the ProtoBuf definition.
+	///
+	/// The values are not transformed in any way and thus are considered stable
+	/// (if the ProtoBuf definition does not change) and safe for programmatic use.
+	pub fn as_str_name(&self) -> &'static str {
+		match self {
+			ChannelDirection::NodeOne => "NODE_ONE",
+			ChannelDirection::NodeTwo => "NODE_TWO",
+		}
+	}
+	/// Creates an enum from field names used in the ProtoBuf definition.
+	pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+		match value {
+			"NODE_ONE" => Some(Self::NodeOne),
+			"NODE_TWO" => Some(Self::NodeTwo),
+			_ => None,
+		}
+	}
+}

@@ -7,16 +7,18 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+use std::sync::Arc;
+
 use ldk_node::lightning::routing::gossip::NodeId;
-use ldk_server_protos::api::{GraphGetNodeRequest, GraphGetNodeResponse};
+use ldk_server_grpc::api::{GraphGetNodeRequest, GraphGetNodeResponse};
 
 use crate::api::error::LdkServerError;
 use crate::api::error::LdkServerErrorCode::InvalidRequestError;
 use crate::service::Context;
 use crate::util::proto_adapter::graph_node_to_proto;
 
-pub(crate) fn handle_graph_get_node_request(
-	context: Context, request: GraphGetNodeRequest,
+pub(crate) async fn handle_graph_get_node_request(
+	context: Arc<Context>, request: GraphGetNodeRequest,
 ) -> Result<GraphGetNodeResponse, LdkServerError> {
 	let node_id: NodeId = request.node_id.parse().map_err(|_| {
 		LdkServerError::new(

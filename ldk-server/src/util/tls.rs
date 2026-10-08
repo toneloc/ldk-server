@@ -9,17 +9,21 @@
 
 use std::fs;
 use std::net::IpAddr;
+use std::path::Path;
 
 use base64::Engine;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use tokio_rustls::rustls::crypto::ring::default_provider;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 
 use crate::util::config::TlsConfig;
+use crate::util::{read_to_string_with_limit, write_new};
 
 // Issuer and Subject common name
 const ISSUER_NAME: &str = "localhost";
+const TLS_FILE_SIZE_LIMIT: usize = 1024 * 1024;
 
 // PEM markers
 const PEM_CERT_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
@@ -132,7 +136,7 @@ fn generate_self_signed_cert(
 	let cert_pem = der_to_pem(&cert_der, PEM_CERT_BEGIN, PEM_CERT_END);
 	let key_pem = der_to_pem(pkcs8_doc.as_ref(), PEM_KEY_BEGIN, PEM_KEY_END);
 
-	fs::write(key_path, &key_pem)
+	write_new(Path::new(key_path), key_pem.as_bytes(), 0o400)
 		.map_err(|e| format!("Failed to write TLS key to '{key_path}': {e}"))?;
 	fs::write(cert_path, &cert_pem)
 		.map_err(|e| format!("Failed to write TLS certificate to '{cert_path}': {e}"))?;
@@ -394,9 +398,9 @@ fn der_context_implicit(tag_num: u8, content: &[u8]) -> Vec<u8> {
 
 /// Loads TLS configuration from provided paths.
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, String> {
-	let cert_pem = fs::read_to_string(cert_path)
+	let cert_pem = read_to_string_with_limit(Path::new(cert_path), TLS_FILE_SIZE_LIMIT)
 		.map_err(|e| format!("Failed to read TLS certificate file '{cert_path}': {e}"))?;
-	let key_pem = fs::read_to_string(key_path)
+	let key_pem = read_to_string_with_limit(Path::new(key_path), TLS_FILE_SIZE_LIMIT)
 		.map_err(|e| format!("Failed to read TLS key file '{key_path}': {e}"))?;
 
 	let certs = parse_pem_certs(&cert_pem)?;
@@ -407,10 +411,14 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, Stri
 
 	let key = parse_pem_private_key(&key_pem)?;
 
-	ServerConfig::builder()
+	let mut config = ServerConfig::builder_with_provider(default_provider().into())
+		.with_safe_default_protocol_versions()
+		.map_err(|e| format!("Failed to set TLS protocol versions: {e}"))?
 		.with_no_client_auth()
 		.with_single_cert(certs, key)
-		.map_err(|e| format!("Failed to build TLS server config: {e}"))
+		.map_err(|e| format!("Failed to build TLS server config: {e}"))?;
+	config.alpn_protocols = vec![b"h2".to_vec()];
+	Ok(config)
 }
 
 #[cfg(test)]
@@ -486,6 +494,35 @@ mod tests {
 		assert!(res.is_ok());
 
 		// Clean up
+		let _ = fs::remove_file(&cert_path);
+		let _ = fs::remove_file(&key_path);
+	}
+
+	#[test]
+	fn test_load_rejects_oversized_tls_files() {
+		let temp_dir = std::env::temp_dir();
+		let mut suffix_bytes = [0u8; 8];
+		getrandom::getrandom(&mut suffix_bytes).unwrap();
+		let suffix = u64::from_ne_bytes(suffix_bytes);
+		let cert_path = temp_dir.join(format!("oversized_tls_cert_{suffix}.pem"));
+		let key_path = temp_dir.join(format!("oversized_tls_key_{suffix}.pem"));
+
+		generate_self_signed_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap(), &[])
+			.unwrap();
+		let valid_cert = fs::read(&cert_path).unwrap();
+
+		fs::write(&cert_path, vec![b'a'; TLS_FILE_SIZE_LIMIT + 1]).unwrap();
+		let error =
+			load_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap_err();
+		assert!(error.contains("exceeds"));
+
+		fs::write(&cert_path, valid_cert).unwrap();
+		fs::remove_file(&key_path).unwrap();
+		fs::write(&key_path, vec![b'a'; TLS_FILE_SIZE_LIMIT + 1]).unwrap();
+		let error =
+			load_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap_err();
+		assert!(error.contains("exceeds"));
+
 		let _ = fs::remove_file(&cert_path);
 		let _ = fs::remove_file(&key_path);
 	}

@@ -7,44 +7,94 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+use hex::FromHex;
+use ldk_node::bitcoin::FeeRate;
 use ldk_node::config::{ChannelConfig, MaxDustHTLCExposure};
+use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::routing::router::RouteParametersConfig;
-use ldk_server_protos::types::channel_config::MaxDustHtlcExposure;
+use ldk_node::CustomTlvRecord as NodeCustomTlvRecord;
+use ldk_server_grpc::types::channel_config::MaxDustHtlcExposure;
+use ldk_server_grpc::types::CustomTlvRecord as ProtoCustomTlvRecord;
 
 use crate::api::error::LdkServerError;
 use crate::api::error::LdkServerErrorCode::InvalidRequestError;
 
+pub(crate) mod bolt11_claim_for_id;
+pub(crate) mod bolt11_fail_for_id;
 pub(crate) mod bolt11_receive;
+pub(crate) mod bolt11_receive_for_hash;
+pub(crate) mod bolt11_receive_via_jit_channel;
 pub(crate) mod bolt11_send;
+pub(crate) mod bolt12_create_payer_proof;
 pub(crate) mod bolt12_receive;
+pub(crate) mod bolt12_refund;
 pub(crate) mod bolt12_send;
 pub(crate) mod close_channel;
 pub(crate) mod connect_peer;
+pub(crate) mod decode_invoice;
+pub(crate) mod decode_offer;
 pub(crate) mod disconnect_peer;
 pub(crate) mod error;
 pub(crate) mod export_pathfinding_scores;
 pub(crate) mod get_balances;
+pub(crate) mod get_channel_forwarding_stats;
+pub(crate) mod get_forwarded_payment_details;
+pub(crate) mod get_forwarded_payment_tracking_mode;
 pub(crate) mod get_node_info;
 pub(crate) mod get_payment_details;
 pub(crate) mod graph_get_channel;
 pub(crate) mod graph_get_node;
 pub(crate) mod graph_list_channels;
 pub(crate) mod graph_list_nodes;
+pub(crate) mod list_channel_forwarding_stats;
+pub(crate) mod list_channel_pair_forwarding_stats;
 pub(crate) mod list_channels;
 pub(crate) mod list_forwarded_payments;
 pub(crate) mod list_payments;
 pub(crate) mod list_peers;
+pub(crate) mod macaroons;
+pub(crate) mod onchain_bump_fee;
 pub(crate) mod onchain_receive;
 pub(crate) mod onchain_send;
 pub(crate) mod open_channel;
 pub(crate) mod sign_message;
 pub(crate) mod splice_channel;
 pub(crate) mod spontaneous_send;
+pub(crate) mod unified_send;
 pub(crate) mod update_channel_config;
 pub(crate) mod verify_signature;
 
+pub(crate) fn require_amount<T>(amount: Option<T>) -> Result<T, LdkServerError> {
+	amount.ok_or_else(|| {
+		LdkServerError::new(
+			InvalidRequestError,
+			"Must specify either an exact amount or all available funds",
+		)
+	})
+}
+
+pub(crate) fn parse_fee_rate(rate: Option<u64>) -> Result<Option<FeeRate>, LdkServerError> {
+	rate.map(|rate| {
+		if rate == 0 {
+			return Err(ldk_node::NodeError::InvalidFeeRate.into());
+		}
+		FeeRate::from_sat_per_vb(rate).ok_or_else(|| ldk_node::NodeError::InvalidFeeRate.into())
+	})
+	.transpose()
+}
+
+pub(crate) fn parse_payment_id(payment_id: &str) -> Result<PaymentId, LdkServerError> {
+	let bytes = <[u8; PaymentId::LENGTH]>::from_hex(payment_id).map_err(|_| {
+		LdkServerError::new(
+			InvalidRequestError,
+			format!("Invalid payment_id, must be a {}-byte hex string.", PaymentId::LENGTH),
+		)
+	})?;
+	Ok(PaymentId(bytes))
+}
+
 pub(crate) fn build_channel_config_from_proto(
-	default_config: ChannelConfig, proto_channel_config: ldk_server_protos::types::ChannelConfig,
+	default_config: ChannelConfig, proto_channel_config: ldk_server_grpc::types::ChannelConfig,
 ) -> Result<ChannelConfig, LdkServerError> {
 	let max_dust_htlc_exposure = proto_channel_config
 		.max_dust_htlc_exposure
@@ -88,7 +138,7 @@ pub(crate) fn build_channel_config_from_proto(
 }
 
 pub(crate) fn build_route_parameters_config_from_proto(
-	proto_route_params: Option<ldk_server_protos::types::RouteParametersConfig>,
+	proto_route_params: Option<ldk_server_grpc::types::RouteParametersConfig>,
 ) -> Result<Option<RouteParametersConfig>, LdkServerError> {
 	match proto_route_params {
 		Some(params) => {
@@ -116,5 +166,76 @@ pub(crate) fn build_route_parameters_config_from_proto(
 			}))
 		},
 		None => Ok(None),
+	}
+}
+
+pub(crate) fn proto_to_node_custom_tlv(proto: &ProtoCustomTlvRecord) -> NodeCustomTlvRecord {
+	NodeCustomTlvRecord { type_num: proto.type_num, value: proto.value.to_vec() }
+}
+
+pub(crate) fn node_to_proto_custom_tlv(node: &NodeCustomTlvRecord) -> ProtoCustomTlvRecord {
+	ProtoCustomTlvRecord { type_num: node.type_num, value: node.value.clone().into() }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn amount_is_required() {
+		assert_eq!(require_amount(Some(42)).unwrap(), 42);
+		assert!(require_amount::<u64>(None).is_err());
+	}
+
+	#[test]
+	fn fee_rate_is_optional_and_checked() {
+		assert_eq!(parse_fee_rate(None).unwrap(), None);
+		assert_eq!(parse_fee_rate(Some(2)).unwrap().unwrap().to_sat_per_kwu(), 500);
+		assert!(parse_fee_rate(Some(u64::MAX / 250)).is_ok());
+		for rate in [0, u64::MAX / 250 + 1, u64::MAX] {
+			assert_eq!(parse_fee_rate(Some(rate)).unwrap_err().error_code, InvalidRequestError);
+		}
+	}
+
+	#[test]
+	fn payment_id_is_parsed() {
+		let payment_id = "01".repeat(PaymentId::LENGTH);
+		assert_eq!(parse_payment_id(&payment_id).unwrap(), PaymentId([1; PaymentId::LENGTH]));
+		assert!(parse_payment_id("invalid").is_err());
+	}
+
+	#[test]
+	fn proto_to_node_custom_tlv_preserves_fields() {
+		let proto =
+			ProtoCustomTlvRecord { type_num: 65537, value: vec![0xde, 0xad, 0xbe, 0xef].into() };
+		let node = proto_to_node_custom_tlv(&proto);
+		assert_eq!(node.type_num, 65537);
+		assert_eq!(node.value, vec![0xde, 0xad, 0xbe, 0xef]);
+	}
+
+	#[test]
+	fn node_to_proto_custom_tlv_preserves_fields() {
+		let node = NodeCustomTlvRecord { type_num: 65537, value: vec![0xde, 0xad, 0xbe, 0xef] };
+		let proto = node_to_proto_custom_tlv(&node);
+		assert_eq!(proto.type_num, 65537);
+		assert_eq!(proto.value.to_vec(), vec![0xde, 0xad, 0xbe, 0xef]);
+	}
+
+	#[test]
+	fn empty_custom_tlv_value_round_trips() {
+		let proto = ProtoCustomTlvRecord { type_num: 70000, value: Vec::new().into() };
+		let node = proto_to_node_custom_tlv(&proto);
+		let back = node_to_proto_custom_tlv(&node);
+		assert_eq!(back.type_num, 70000);
+		assert!(back.value.is_empty());
+	}
+
+	#[test]
+	fn non_empty_custom_tlv_value_round_trips() {
+		let proto = ProtoCustomTlvRecord { type_num: 70001, value: vec![1, 2, 3, 4].into() };
+		let node = proto_to_node_custom_tlv(&proto);
+		let back = node_to_proto_custom_tlv(&node);
+		assert_eq!(back.type_num, 70001);
+		assert_eq!(back.value.to_vec(), vec![1, 2, 3, 4]);
 	}
 }

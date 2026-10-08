@@ -1,0 +1,230 @@
+# Operations Guide
+
+This guide covers running LDK Server in production: process management, backups, security,
+monitoring, and remote access.
+
+## Process Management
+
+### systemd
+
+LDK Server integrates with systemd via `sd_notify`. It sends `READY=1` after the gRPC listener
+is bound and `STOPPING=1` when shutting down. A sample unit file can be found in [
+`contrib/ldk-server.service`](../contrib/ldk-server.service).
+
+### Graceful Shutdown
+
+The server handles `SIGTERM` and `CTRL-C` (SIGINT). On receipt, it:
+
+1. Signals all active streaming clients (SubscribeEvents) to disconnect
+2. Stops the LDK Node (persists channel state)
+3. Exits cleanly
+
+### Log Rotation
+
+By default, LDK Server logs to `stdout`/`stderr` and also to file. When running under `systemd` or Docker, 
+this allows the environment (e.g., `journald`) to handle persistence, rotation, and 
+compression automatically.
+
+If you enable `log_to_file` in the configuration, LDK Server writes logs to the configured file while still 
+keeping the `stdout`/`stderr` logs available too. Logs files are automatically rotated at `max_size_mb` or `rotation_interval_hours`, and the last `max_files` uncompressed log files are retained. But you can disable 
+the internal rotation and keep logging to file by setting the `max_size_mb` and `rotation_interval_hours` 
+params to `0`.
+
+If you prefer to use system `logrotate` for file logs, the server still reopens its log file on `SIGHUP`. Save 
+the following config to `/etc/logrotate.d/ldk-server` (adjust the log path to match your setup):
+
+```
+/var/lib/ldk-server/regtest/ldk-server.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    postrotate
+        systemctl kill --signal=HUP ldk-server.service
+    endscript
+}
+```
+
+## Backups
+
+### What to Back Up
+
+| File                                   | Priority     | Description                                                                |
+| -------------------------------------- | ------------ | -------------------------------------------------------------------------- |
+| `<storage_dir>/keys_mnemonic`          | **Critical** | BIP39 mnemonic. Required to recover on-chain funds. Default for new installs. |
+| `<network_dir>/ldk_node_data.sqlite` or configured PostgreSQL database   | **Critical** | Channel state, on-chain wallet data, payment and forwarding history. Required to recover channel funds. |
+
+### What is Reconstructable
+
+- Network graph data (re-synced from gossip or RGS)
+- Fee rate cache (re-fetched from the chain backend)
+- Macaroon credentials (can be replaced, but clients will need new tokens)
+- The TLS certificate (can be regenerated, but clients will need the new one)
+
+> **Warning:** Do not restore a backup onto two running nodes simultaneously. Running the
+> same node identity on two instances will cause channel state conflicts and potential fund
+> loss.
+
+## Security
+
+### Macaroons
+
+Keep `<network_dir>/macaroons/` private. It contains the default admin token in `admin.macaroon`
+and the server's root keys in `roots/`. Give clients tokens, never root keys.
+
+Use `create-macaroon` to give each client a token you can revoke separately. Use `derive-macaroon`
+to make a restricted copy. Give each client only the permissions it needs.
+See the [API guide](api-guide.md#authentication) for restrictions and request binding.
+
+To replace an admin token, create and save a new admin token, then revoke the old ID.
+Replace `admin.macaroon` with the new token or pass it with `--macaroon`.
+The API prevents revocation of the last unrestricted admin token.
+
+#### Recovery
+
+Back up `roots/` and `admin.macaroon` together. Old root files can restore revoked access.
+Deleting all roots invalidates every token; the server creates a new admin token on restart.
+
+At startup, the server repairs a missing or invalid `admin.macaroon` from `roots/admin.toml`
+and logs the change. It keeps valid tokens, even if restricted or expired. It warns if the
+file holds a request token; replace that file with a reusable token.
+
+If the original admin root is gone but other roots remain, the server warns instead of replacing
+it. Use another admin token to create a replacement and save it as `admin.macaroon`.
+
+Duplicate root names or IDs stop startup. Move conflicting files out of `roots/` and restart.
+Files ending in `.tmp` are ignored.
+
+Root-file caveat edits take effect after restart. `GetPermissions` shows them, and newly issued
+tokens inherit them. Tokens issued earlier have separate roots and do not change.
+
+The server logs successful token creation and revocation, including who made the change and
+which token it affects. Logs contain no tokens or root secrets.
+
+### TLS
+
+- Self-signed ECDSA P-256 certificate generated automatically
+- Private key stored at `<storage_dir>/tls.key` with `0400` permissions
+- Certificate includes `localhost` and `127.0.0.1` in SANs by default
+- Add your server's hostname/IP to `[tls] hosts` for remote access
+
+### CA-Signed Certificates (Let's Encrypt / ACME)
+
+For production deployments, many operators prefer a publicly trusted certificate. The
+recommended approach is to provision the certificate outside of LDK Server (via an ACME
+client) and point `[tls] cert_path` and `key_path` to the resulting files.
+
+High-level flow:
+
+1. Choose a public hostname for the gRPC endpoint (e.g., `ldk.example.com`).
+2. Set `grpc_service_address` to bind on the public interface.
+3. Add the hostname to `[tls] hosts` so SANs match what clients connect to.
+4. Use an ACME client (certbot, lego, acme.sh) to obtain a certificate for the hostname.
+5. Configure `[tls] cert_path` and `key_path` to the ACME output files.
+6. Restart the server after renewals (LDK Server reads TLS files at startup).
+
+Example (certbot with a pre-provisioned DNS or HTTP-01 flow):
+
+```toml
+[node]
+grpc_service_address = "0.0.0.0:3536"
+
+[tls]
+cert_path = "/etc/letsencrypt/live/ldk.example.com/fullchain.pem"
+key_path = "/etc/letsencrypt/live/ldk.example.com/privkey.pem"
+hosts = ["ldk.example.com"]
+```
+
+Notes:
+
+- Ensure the `ldk-server` process can read the cert and key files.
+- After a renewal, restart the service to pick up the new certificate.
+- If you want zero-downtime renewals, place a reverse proxy in front and terminate TLS there.
+
+### Network Exposure
+
+The gRPC service binds to `127.0.0.1:3536` by default. For remote access, either:
+
+1. Change `grpc_service_address` to bind to `0.0.0.0:3536` and add the server's hostname to
+   `[tls] hosts`, or
+2. Use a reverse proxy (e.g., nginx, Caddy) that terminates TLS and forwards to the loopback
+   address
+
+## Monitoring
+
+### Prometheus Metrics
+
+LDK Server can expose metrics in [Prometheus](https://prometheus.io/) text format.
+Prometheus is an open-source monitoring toolkit that scrapes HTTP endpoints and stores
+time-series data for alerting and dashboards.
+
+Enable metrics in the config:
+
+```toml
+[metrics]
+enabled = true
+poll_metrics_interval = 60
+```
+
+Metrics are served at `GET /metrics` on the same port as the gRPC service (default 3536).
+This is a plain HTTP endpoint (not gRPC), returning Prometheus text format.
+
+Basic Auth is recommended to prevent unauthorized access to node metrics:
+
+```toml
+[metrics]
+enabled = true
+username = "prometheus"
+password = "secret"
+```
+
+The Prometheus scrape config would then use:
+
+```yaml
+scrape_configs:
+  - job_name: ldk-server
+    scheme: https
+    tls_config:
+      ca_file: /path/to/tls.crt
+    basic_auth:
+      username: prometheus
+      password: secret
+    static_configs:
+      - targets: ["localhost:3536"]
+```
+
+### Available Metrics
+
+Metrics cover:
+
+- On-chain and Lightning balances
+- Public and Private Channel counts
+- Payment counts (successful, failed, pending)
+- Peer count
+
+## Remote Access
+
+To allow clients to connect from other machines:
+
+1. **Update TLS hosts:** Add the server's hostname or IP to `[tls] hosts` in the config so
+   the certificate's SANs cover the address clients will use.
+2. **Update bind address:** Set `grpc_service_address` to bind on the appropriate interface
+   (e.g., `0.0.0.0:3536`).
+3. **Distribute the TLS certificate:** Copy `<storage_dir>/tls.crt` to each client machine.
+   Clients must pin this certificate since it is self-signed.
+4. **Share the macaroon:** Provide the hex-encoded macaroon to authorized clients.
+
+If you regenerate the TLS certificate (by deleting `tls.crt` and `tls.key` and restarting),
+all clients will need the new certificate.
+
+## Network-Specific Notes
+
+Local data is stored in per-network subdirectories (`bitcoin/`, `testnet/`, `signet/`,
+`regtest/`, etc.) under the storage root. This means you can run multiple networks from one
+local storage directory without conflicts. PostgreSQL storage is not automatically isolated
+by network; configure a distinct database or table for each network.
+
+The `keys_mnemonic` file is shared across networks (stored at the storage root, not per-network).
+Keys are split by network at the derivation path level, so the same mnemonic will produce
+different keys.

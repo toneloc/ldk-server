@@ -1,0 +1,70 @@
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+/// gRPC path prefix for the LightningNode service.
+pub const GRPC_SERVICE_PREFIX: &str = "/api.LightningNode/";
+
+pub const GET_NODE_INFO_PATH: &str = "GetNodeInfo";
+pub const GET_BALANCES_PATH: &str = "GetBalances";
+pub const ONCHAIN_RECEIVE_PATH: &str = "OnchainReceive";
+pub const ONCHAIN_BUMP_FEE_PATH: &str = "OnchainBumpFee";
+pub const ONCHAIN_SEND_PATH: &str = "OnchainSend";
+pub const BOLT11_RECEIVE_PATH: &str = "Bolt11Receive";
+pub const BOLT11_RECEIVE_FOR_HASH_PATH: &str = "Bolt11ReceiveForHash";
+pub const BOLT11_CLAIM_FOR_ID_PATH: &str = "Bolt11ClaimForId";
+pub const BOLT11_FAIL_FOR_ID_PATH: &str = "Bolt11FailForId";
+pub const BOLT11_RECEIVE_VIA_JIT_CHANNEL_PATH: &str = "Bolt11ReceiveViaJitChannel";
+pub const BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_PATH: &str =
+	"Bolt11ReceiveVariableAmountViaJitChannel";
+pub const BOLT11_RECEIVE_VIA_JIT_CHANNEL_FOR_HASH_PATH: &str = "Bolt11ReceiveViaJitChannelForHash";
+pub const BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_FOR_HASH_PATH: &str =
+	"Bolt11ReceiveVariableAmountViaJitChannelForHash";
+pub const BOLT11_SEND_PATH: &str = "Bolt11Send";
+pub const BOLT11_SEND_UNDERPAYING_PATH: &str = "Bolt11SendUnderpaying";
+pub const BOLT12_RECEIVE_PATH: &str = "Bolt12Receive";
+pub const BOLT12_SEND_PATH: &str = "Bolt12Send";
+pub const BOLT12_SEND_REFUND_PATH: &str = "Bolt12SendRefund";
+pub const BOLT12_RECEIVE_REFUND_PATH: &str = "Bolt12ReceiveRefund";
+pub const BOLT12_CREATE_PAYER_PROOF_PATH: &str = "Bolt12CreatePayerProof";
+pub const OPEN_CHANNEL_PATH: &str = "OpenChannel";
+pub const SPLICE_IN_PATH: &str = "SpliceIn";
+pub const SPLICE_OUT_PATH: &str = "SpliceOut";
+pub const BUMP_CHANNEL_FUNDING_FEE_PATH: &str = "BumpChannelFundingFee";
+pub const CLOSE_CHANNEL_PATH: &str = "CloseChannel";
+pub const FORCE_CLOSE_CHANNEL_PATH: &str = "ForceCloseChannel";
+pub const LIST_CHANNELS_PATH: &str = "ListChannels";
+pub const LIST_PAYMENTS_PATH: &str = "ListPayments";
+pub const LIST_FORWARDED_PAYMENTS_PATH: &str = "ListForwardedPayments";
+pub const UPDATE_CHANNEL_CONFIG_PATH: &str = "UpdateChannelConfig";
+pub const GET_PAYMENT_DETAILS_PATH: &str = "GetPaymentDetails";
+pub const LIST_PEERS_PATH: &str = "ListPeers";
+pub const CONNECT_PEER_PATH: &str = "ConnectPeer";
+pub const DISCONNECT_PEER_PATH: &str = "DisconnectPeer";
+pub const SPONTANEOUS_SEND_PATH: &str = "SpontaneousSend";
+pub const SIGN_MESSAGE_PATH: &str = "SignMessage";
+pub const VERIFY_SIGNATURE_PATH: &str = "VerifySignature";
+pub const EXPORT_PATHFINDING_SCORES_PATH: &str = "ExportPathfindingScores";
+pub const UNIFIED_SEND_PATH: &str = "UnifiedSend";
+pub const GRAPH_LIST_CHANNELS_PATH: &str = "GraphListChannels";
+pub const GRAPH_GET_CHANNEL_PATH: &str = "GraphGetChannel";
+pub const GRAPH_LIST_NODES_PATH: &str = "GraphListNodes";
+pub const GRAPH_GET_NODE_PATH: &str = "GraphGetNode";
+pub const DECODE_INVOICE_PATH: &str = "DecodeInvoice";
+pub const DECODE_OFFER_PATH: &str = "DecodeOffer";
+pub const GET_METRICS_PATH: &str = "metrics";
+pub const SUBSCRIBE_EVENTS_PATH: &str = "SubscribeEvents";
+pub const GET_FORWARDED_PAYMENT_DETAILS_PATH: &str = "GetForwardedPaymentDetails";
+pub const GET_FORWARDED_PAYMENT_TRACKING_MODE_PATH: &str = "GetForwardedPaymentTrackingMode";
+pub const GET_CHANNEL_FORWARDING_STATS_PATH: &str = "GetChannelForwardingStats";
+pub const LIST_CHANNEL_FORWARDING_STATS_PATH: &str = "ListChannelForwardingStats";
+pub const LIST_CHANNEL_PAIR_FORWARDING_STATS_PATH: &str = "ListChannelPairForwardingStats";
+pub const CREATE_MACAROON_PATH: &str = "CreateMacaroon";
+pub const LIST_MACAROONS_PATH: &str = "ListMacaroons";
+pub const REVOKE_MACAROON_PATH: &str = "RevokeMacaroon";
+pub const GET_PERMISSIONS_PATH: &str = "GetPermissions";

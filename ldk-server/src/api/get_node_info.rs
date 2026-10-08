@@ -7,14 +7,18 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-use ldk_server_protos::api::{GetNodeInfoRequest, GetNodeInfoResponse};
-use ldk_server_protos::types::BestBlock;
+use std::sync::Arc;
+
+use ldk_node::lightning_types::features::NodeFeatures;
+use ldk_server_grpc::api::{GetNodeInfoRequest, GetNodeInfoResponse};
+use ldk_server_grpc::types::BestBlock;
 
 use crate::api::error::LdkServerError;
 use crate::service::Context;
+use crate::util::proto_adapter::{features_to_proto, network_to_proto};
 
-pub(crate) fn handle_get_node_info_request(
-	context: Context, _request: GetNodeInfoRequest,
+pub(crate) async fn handle_get_node_info_request(
+	context: Arc<Context>, _request: GetNodeInfoRequest,
 ) -> Result<GetNodeInfoResponse, LdkServerError> {
 	let node_status = context.node.status();
 
@@ -22,6 +26,10 @@ pub(crate) fn handle_get_node_info_request(
 		block_hash: node_status.current_best_block.block_hash.to_string(),
 		height: node_status.current_best_block.height,
 	};
+
+	let features = features_to_proto(node_status.node_features.le_flags(), |bytes| {
+		NodeFeatures::from_le_bytes(bytes).to_string()
+	});
 
 	let listening_addresses: Vec<String> = context
 		.node
@@ -47,8 +55,11 @@ pub(crate) fn handle_get_node_info_request(
 		};
 		addrs.into_iter().map(|a| format!("{node_id}@{a}")).collect()
 	};
+	let network = network_to_proto(node_status.network) as i32;
+
 	let response = GetNodeInfoResponse {
 		node_id,
+		version: crate::FULL_VERSION.to_string(),
 		current_best_block: Some(best_block),
 		latest_lightning_wallet_sync_timestamp: node_status.latest_lightning_wallet_sync_timestamp,
 		latest_onchain_wallet_sync_timestamp: node_status.latest_onchain_wallet_sync_timestamp,
@@ -60,6 +71,10 @@ pub(crate) fn handle_get_node_info_request(
 		announcement_addresses,
 		node_alias,
 		node_uris,
+		network,
+		features,
+		latest_pathfinding_scores_sync_timestamp: node_status
+			.latest_pathfinding_scores_sync_timestamp,
 	};
 	Ok(response)
 }

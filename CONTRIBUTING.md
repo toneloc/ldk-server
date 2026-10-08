@@ -13,14 +13,20 @@ cargo build --release          # Production build (LTO enabled)
 ## Running
 
 ```bash
-cargo run --bin ldk-server ./ldk-server/ldk-server-config.toml
+cargo run --bin ldk-server ./contrib/ldk-server-config.toml
 ```
 
 ## Testing
 
 ```bash
-cargo test                     # Run all tests
-cargo test --all-features      # Run tests with all features
+cargo test                     # Run workspace tests
+cargo test --all-features      # Run workspace tests with all features
+```
+
+Run the end-to-end tests from their separate workspace:
+
+```bash
+cargo test --manifest-path e2e-tests/Cargo.toml -- --test-threads=4
 ```
 
 ## Code Quality
@@ -40,21 +46,29 @@ cargo clippy --all-features -- -D warnings -A clippy::drop_non_drop  # Lint (CI 
 ## Protocol Buffer Generation
 
 ```bash
-RUSTFLAGS="--cfg genproto" cargo build -p ldk-server-protos
+RUSTFLAGS="--cfg genproto" cargo build -p ldk-server-grpc
 cargo fmt --all
 ```
 
 ## Adding a New API Endpoint
 
-1. Define request/response messages in `ldk-server-protos/src/proto/api.proto`
+1. Define request/response messages in `ldk-server-grpc/src/proto/api.proto`
 2. Regenerate protos (see above)
 3. Create handler in `ldk-server/src/api/` (follow existing patterns)
 4. Add route in `ldk-server/src/service.rs`
-5. Add CLI command in `ldk-server-cli/src/main.rs`
+5. Map the RPC to its required permission in `method_authorization` in `ldk-server/src/macaroons/authorization.rs`.
+   Unmapped methods return `UNIMPLEMENTED`, even for admin tokens.
+6. Add CLI command in `ldk-server-cli/src/main.rs`
+7. For a unary RPC, add the MCP tool in `ldk-server-mcp/src/tools/` and update the tool list test
+   in `ldk-server-mcp/tests/integration.rs`. Add a live test in `e2e-tests/tests/mcp.rs` if applicable.
+8. Test allowed and denied requests, including admin access.
+
+If the RPC needs a new permission, add it to `ldk-server-grpc/src/permissions.rs` and
+`ALL_PERMISSIONS`. Update the presets that need it and add it to `docs/api-guide.md`.
 
 ## Configuration
 
-- Config template with all options: `ldk-server/ldk-server-config.toml`
+- Config template with all options: `contrib/ldk-server-config.toml`
 - When updating config options, also update the tests in `ldk-server/src/util/config.rs`
 
 ## Before Submitting

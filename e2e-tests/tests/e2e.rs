@@ -7,21 +7,44 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use e2e_tests::{
-	find_available_port, mine_and_sync, run_cli, run_cli_raw, setup_funded_channel,
-	wait_for_onchain_balance, LdkServerHandle, RabbitMqEventConsumer, TestBitcoind,
+	assert_replacement, close_channel, find_available_port, list_payments, mine_and_sync,
+	payment_for_tx, run_cli, run_cli_raw, run_cli_with_config, send_bolt11_payment,
+	setup_funded_channel, splice_txid, wait_for_channels, wait_for_event, wait_for_gossip,
+	wait_for_onchain_balance, wait_for_settled_balance, wait_for_transaction,
+	wait_for_usable_channel, wait_for_wallet_sync, LdkServerConfig, LdkServerHandle, TestBitcoind,
+	TestConfigBuilder,
 };
+use hex_conservative::{DisplayHex, FromHex};
+use ldk_node::bitcoin::hashes::{sha256, Hash};
+use ldk_node::bitcoin::Amount;
 use ldk_node::lightning::ln::msgs::SocketAddress;
-use ldk_server_client::ldk_server_protos::api::{
-	Bolt11ReceiveRequest, Bolt12ReceiveRequest, OnchainReceiveRequest,
+use ldk_node::lightning::offers::offer::Offer;
+use ldk_node::lightning::offers::refund::Refund;
+use ldk_node::lightning_invoice::Bolt11Invoice;
+use ldk_server_client::error::LdkServerErrorCode::{InvalidRequestError, LightningError};
+use ldk_server_client::ldk_server_grpc::api::{
+	onchain_send_request, open_channel_request, Bolt11ClaimForIdRequest, Bolt11FailForIdRequest,
+	Bolt11ReceiveRequest, Bolt11SendRequest, Bolt12ReceiveRequest, BumpChannelFundingFeeRequest,
+	GetChannelForwardingStatsRequest, GetForwardedPaymentDetailsRequest, GetPaymentDetailsRequest,
+	ListChannelForwardingStatsRequest, ListChannelPairForwardingStatsRequest, ListChannelsRequest,
+	ListForwardedPaymentsRequest, OnchainBumpFeeRequest, OnchainReceiveRequest, OnchainSendRequest,
+	OpenChannelRequest,
 };
-use ldk_server_client::ldk_server_protos::types::{
-	bolt11_invoice_description, Bolt11InvoiceDescription,
+use ldk_server_client::ldk_server_grpc::events::event_envelope::Event;
+use ldk_server_client::ldk_server_grpc::events::{
+	ChannelClosureInitiator, ChannelState, ChannelStateChangeReasonKind, PaymentFailureReason,
 };
-use ldk_server_protos::events::event_envelope::Event;
+use ldk_server_client::ldk_server_grpc::types::{
+	bolt11_invoice_description, Bolt11InvoiceDescription, ChannelShutdownState, PaymentDirection,
+	ReserveType,
+};
+use ldk_server_grpc::types::payment_kind;
+use serde_json::json;
 
 #[tokio::test]
 async fn test_cli_get_node_info() {
@@ -30,6 +53,25 @@ async fn test_cli_get_node_info() {
 
 	let output = run_cli(&server, &["get-node-info"]);
 	assert!(output.get("node_id").is_some());
+	assert_eq!(output["node_id"], server.node_id());
+	let version = output["version"].as_str().expect("version");
+	assert!(
+		version.contains('(') && version.contains(')'),
+		"version should match `ldk-server --version` (`<cargo version> (<git commit>)`), got {version}"
+	);
+
+	// Ensure clients can inspect advertised node capabilities from get-node-info.
+	let keysend = &output["features"]["55"];
+	assert_eq!(keysend["name"], "Keysend");
+	assert_eq!(keysend["is_required"], false);
+}
+
+#[tokio::test]
+async fn test_cli_get_node_info_with_server_config() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+
+	let output = run_cli_with_config(&server, &["get-node-info"]);
 	assert_eq!(output["node_id"], server.node_id());
 }
 
@@ -79,6 +121,65 @@ async fn test_cli_list_forwarded_payments_empty() {
 
 	let output = run_cli(&server, &["list-forwarded-payments"]);
 	assert!(output["list"].as_array().unwrap().is_empty());
+	let error = server
+		.client()
+		.list_forwarded_payments(ListForwardedPaymentsRequest {
+			page_token: Some("invalid-token".to_string()),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
+}
+
+#[tokio::test]
+async fn test_forwarding_analytics_empty_and_invalid_requests() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+	let mode = run_cli(&server, &["get-forwarded-payment-tracking-mode"]);
+	assert_eq!(mode["mode"], "FORWARDED_PAYMENT_TRACKING_MODE_STATS");
+	for command in ["list-channel-forwarding-stats", "list-channel-pair-forwarding-stats"] {
+		let output = run_cli(&server, &[command, "--number-of-records", "1"]);
+		assert!(output["list"].as_array().unwrap().is_empty());
+	}
+	let unknown_id = "00".repeat(32);
+	let payment = run_cli(&server, &["get-forwarded-payment-details", &unknown_id]);
+	assert!(payment["payment"].is_null());
+	let stats = run_cli(&server, &["get-channel-forwarding-stats", &unknown_id]);
+	assert!(stats["stats"].is_null());
+	for invalid_id in ["", "01", &"zz".repeat(32)] {
+		let error = server
+			.client()
+			.get_forwarded_payment_details(GetForwardedPaymentDetailsRequest {
+				forwarded_payment_id: invalid_id.to_string(),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(error.error_code, InvalidRequestError);
+		let error = server
+			.client()
+			.get_channel_forwarding_stats(GetChannelForwardingStatsRequest {
+				channel_id: invalid_id.to_string(),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(error.error_code, InvalidRequestError);
+	}
+	let error = server
+		.client()
+		.list_channel_forwarding_stats(ListChannelForwardingStatsRequest {
+			page_token: Some("invalid-token".to_string()),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
+	let error = server
+		.client()
+		.list_channel_pair_forwarding_stats(ListChannelPairForwardingStatsRequest {
+			page_token: Some("invalid-token".to_string()),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
 }
 
 #[tokio::test]
@@ -134,8 +235,90 @@ async fn test_cli_bolt11_receive() {
 	let server = LdkServerHandle::start(&bitcoind).await;
 
 	let output = run_cli(&server, &["bolt11-receive", "50000sat", "-d", "test"]);
-	let invoice = output["invoice"].as_str().unwrap();
-	assert!(invoice.starts_with("lnbcrt"), "Expected lnbcrt prefix, got: {}", invoice);
+	let invoice_str = output["invoice"].as_str().unwrap();
+	assert!(invoice_str.starts_with("lnbcrt"), "Expected lnbcrt prefix, got: {}", invoice_str);
+
+	let invoice: Bolt11Invoice = invoice_str.parse().unwrap();
+	let payment_hash = sha256::Hash::from_str(output["payment_hash"].as_str().unwrap()).unwrap();
+	assert_eq!(invoice.payment_hash().0, payment_hash.to_byte_array());
+	let payment_secret = <[u8; 32]>::from_hex(output["payment_secret"].as_str().unwrap()).unwrap();
+	assert_eq!(invoice.payment_secret().0, payment_secret);
+}
+
+#[tokio::test]
+async fn test_cli_decode_invoice() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+
+	// Create a BOLT11 invoice with known parameters
+	let output =
+		run_cli(&server, &["bolt11-receive", "50000sat", "-d", "decode test", "-e", "3600"]);
+	let invoice_str = output["invoice"].as_str().unwrap();
+
+	// Decode it
+	let decoded = run_cli(&server, &["decode-invoice", invoice_str]);
+
+	// Verify fields match
+	assert_eq!(decoded["destination"], server.node_id());
+	assert_eq!(decoded["payment_hash"], output["payment_hash"]);
+	assert_eq!(decoded["amount_msat"], 50_000_000);
+	assert_eq!(decoded["description"], "decode test");
+	assert!(decoded.get("description_hash").is_none() || decoded["description_hash"].is_null());
+	assert_eq!(decoded["expiry"], 3600);
+	assert_eq!(decoded["currency"], "regtest");
+	assert_eq!(decoded["payment_secret"], output["payment_secret"]);
+	assert!(decoded["timestamp"].as_u64().unwrap() > 0);
+	assert!(decoded["min_final_cltv_expiry_delta"].as_u64().unwrap() > 0);
+	assert_eq!(decoded["is_expired"], false);
+
+	// Verify features — LDK BOLT11 invoices always set VariableLengthOnion, PaymentSecret,
+	// and BasicMPP.
+	let features = decoded["features"].as_object().unwrap();
+
+	// Every entry should be keyed by the signaled bit and expose the decoded name
+	// plus whether that bit is required.
+	for (bit, feature) in features {
+		assert!(bit.parse::<u32>().is_ok(), "Feature key is not a bit number: {bit}");
+		assert!(feature.get("name").is_some(), "Feature missing name field");
+		assert!(feature.get("is_required").is_some(), "Feature missing is_required field");
+	}
+
+	let variable_length_onion = &features["8"];
+	assert_eq!(variable_length_onion["name"], "VariableLengthOnion");
+	assert_eq!(variable_length_onion["is_required"], true);
+
+	let payment_secret = &features["14"];
+	assert_eq!(payment_secret["name"], "PaymentSecret");
+	assert_eq!(payment_secret["is_required"], true);
+
+	let basic_mpp = &features["17"];
+	assert_eq!(basic_mpp["name"], "BasicMPP");
+	assert_eq!(basic_mpp["is_required"], false);
+
+	// Also test a variable-amount invoice
+	let output_var = run_cli(&server, &["bolt11-receive", "-d", "no amount"]);
+	let decoded_var =
+		run_cli(&server, &["decode-invoice", output_var["invoice"].as_str().unwrap()]);
+	assert!(decoded_var.get("amount_msat").is_none() || decoded_var["amount_msat"].is_null());
+	assert_eq!(decoded_var["description"], "no amount");
+
+	// Test that ANSI escape sequences cannot reach the terminal via CLI output.
+	let desc_with_ansi = "pay me\x1b[31m RED \x1b[0m";
+	let output_ansi = run_cli(&server, &["bolt11-receive", "-d", desc_with_ansi]);
+	let raw_decoded =
+		run_cli_raw(&server, &["decode-invoice", output_ansi["invoice"].as_str().unwrap()]);
+	assert!(!raw_decoded.contains('\x1b'), "Raw CLI output must not contain ANSI escape bytes");
+
+	// LDK exposes invoice descriptions through UntrustedString, which may replace
+	// bidi controls before the CLI sanitizer sees them.
+	let desc_with_bidi = "pay me\u{202E}evil";
+	let output_bidi = run_cli(&server, &["bolt11-receive", "-d", desc_with_bidi]);
+	let raw_bidi =
+		run_cli_raw(&server, &["decode-invoice", output_bidi["invoice"].as_str().unwrap()]);
+	assert!(
+		!raw_bidi.contains('\u{202E}'),
+		"Raw CLI output must not contain bidi override characters"
+	);
 }
 
 #[tokio::test]
@@ -147,8 +330,77 @@ async fn test_cli_bolt12_receive() {
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
 	let output = run_cli(&server_a, &["bolt12-receive", "test offer"]);
-	let offer = output["offer"].as_str().unwrap();
-	assert!(offer.starts_with("lno"), "Expected lno prefix, got: {}", offer);
+	let offer_str = output["offer"].as_str().unwrap();
+	assert!(offer_str.starts_with("lno"), "Expected lno prefix, got: {}", offer_str);
+
+	let offer: Offer = offer_str.parse().unwrap();
+	let offer_id = <[u8; 32]>::from_hex(output["offer_id"].as_str().unwrap()).unwrap();
+	assert_eq!(offer.id().0, offer_id);
+}
+
+#[tokio::test]
+async fn test_cli_decode_offer() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+	// BOLT12 offers need announced channels for blinded reply paths
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Create a BOLT12 offer with known parameters
+	let output = run_cli(&server_a, &["bolt12-receive", "decode offer test"]);
+	let offer_str = output["offer"].as_str().unwrap();
+
+	// Decode it
+	let decoded = run_cli(&server_a, &["decode-offer", offer_str]);
+
+	// Verify fields match
+	assert_eq!(decoded["offer_id"], output["offer_id"]);
+	assert_eq!(decoded["description"], "decode offer test");
+	assert_eq!(decoded["is_expired"], false);
+
+	// Chains should include regtest
+	let chains = decoded["chains"].as_array().unwrap();
+	assert!(chains.iter().any(|c| c == "regtest"), "Expected regtest in chains: {:?}", chains);
+
+	// Paths should be present (BOLT12 offers with blinded paths)
+	let paths = decoded["paths"].as_array().unwrap();
+	assert!(!paths.is_empty(), "Expected at least one blinded path");
+	for path in paths {
+		assert!(path["num_hops"].as_u64().unwrap() > 0);
+		assert!(!path["blinding_point"].as_str().unwrap().is_empty());
+	}
+
+	// Features — OfferContext has no known features in LDK, so this should be empty
+	let features = decoded["features"].as_object().unwrap();
+	assert!(features.is_empty(), "Expected empty offer features, got: {:?}", features);
+
+	// Variable-amount offer should have no amount
+	assert!(decoded.get("amount").is_none() || decoded["amount"].is_null());
+
+	// Test a fixed-amount offer
+	let output_fixed = run_cli(&server_a, &["bolt12-receive", "fixed amount", "50000sat"]);
+	let decoded_fixed =
+		run_cli(&server_a, &["decode-offer", output_fixed["offer"].as_str().unwrap()]);
+	assert_eq!(decoded_fixed["amount"]["amount"]["bitcoin_amount_msats"], 50_000_000);
+
+	// Test that ANSI escape sequences cannot reach the terminal via CLI output.
+	let desc_with_ansi = "offer\x1b[31m RED \x1b[0m";
+	let output_ansi = run_cli(&server_a, &["bolt12-receive", desc_with_ansi]);
+	let raw_decoded =
+		run_cli_raw(&server_a, &["decode-offer", output_ansi["offer"].as_str().unwrap()]);
+	assert!(!raw_decoded.contains('\x1b'), "Raw CLI output must not contain ANSI escape bytes");
+
+	// Test that Unicode bidi override characters in the description are escaped
+	let desc_with_bidi = "offer\u{202E}evil";
+	let output_bidi = run_cli(&server_a, &["bolt12-receive", desc_with_bidi]);
+	let raw_bidi =
+		run_cli_raw(&server_a, &["decode-offer", output_bidi["offer"].as_str().unwrap()]);
+	// LDK exposes offer descriptions through PrintableString, which may replace
+	// control characters before the CLI sanitizer sees them.
+	assert!(
+		!raw_bidi.contains('\u{202E}'),
+		"Raw CLI output must not contain bidi override characters"
+	);
 }
 
 #[tokio::test]
@@ -166,8 +418,212 @@ async fn test_cli_onchain_send() {
 	let recv_output = run_cli(&server, &["onchain-receive"]);
 	let dest_addr = recv_output["address"].as_str().unwrap();
 
+	for rate in [0, u64::MAX / 250 + 1, u64::MAX] {
+		let error = server
+			.client()
+			.onchain_send(OnchainSendRequest {
+				address: dest_addr.into(),
+				amount: Some(onchain_send_request::Amount::AmountSats(50_000)),
+				fee_rate_sat_per_vb: Some(rate),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(error.error_code, InvalidRequestError);
+		assert_eq!(error.message, ldk_node::NodeError::InvalidFeeRate.to_string());
+	}
+
 	let output = run_cli(&server, &["onchain-send", dest_addr, "50000sat"]);
 	assert!(!output["txid"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_cli_onchain_send_all() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+
+	let funding_address =
+		server.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	bitcoind.fund_address(&funding_address, 1.0);
+	mine_and_sync(&bitcoind, &[&server], 6).await;
+	wait_for_onchain_balance(server.client(), Duration::from_secs(30)).await;
+
+	let address = bitcoind.bitcoind.client.new_address().unwrap().to_string();
+	let output = run_cli(&server, &["onchain-send", &address, "all"]);
+	assert!(!output["txid"].as_str().unwrap().is_empty());
+
+	mine_and_sync(&bitcoind, &[&server], 6).await;
+
+	wait_for_settled_balance(&server, 0, Duration::from_secs(30)).await;
+}
+
+#[tokio::test]
+async fn test_onchain_fee_bump_client_cli() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+	let address = server.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	bitcoind.fund_address(&address, 1.0);
+	mine_and_sync(&bitcoind, &[&server], 6).await;
+	wait_for_onchain_balance(server.client(), Duration::from_secs(30)).await;
+	let destination = bitcoind.bitcoind.client.new_address().unwrap().to_string();
+	let amount = Amount::from_sat(50_000);
+	let original = server
+		.client()
+		.onchain_send(OnchainSendRequest {
+			address: destination.clone(),
+			amount: Some(onchain_send_request::Amount::AmountSats(amount.to_sat())),
+			fee_rate_sat_per_vb: Some(2),
+		})
+		.await
+		.unwrap()
+		.txid;
+	wait_for_transaction(&bitcoind, &original).await;
+	let payment = payment_for_tx(&server, &original).await;
+	assert_ne!(payment.payment_id, original, "payment IDs use a different byte order");
+
+	// A rate below the original must fail instead of selecting an automatic rate.
+	let error = server
+		.client()
+		.onchain_bump_fee(OnchainBumpFeeRequest {
+			payment_id: payment.payment_id.clone(),
+			fee_rate_sat_per_vb: Some(1),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
+
+	let replacement = server
+		.client()
+		.onchain_bump_fee(OnchainBumpFeeRequest {
+			payment_id: payment.payment_id.clone(),
+			fee_rate_sat_per_vb: Some(5),
+		})
+		.await
+		.unwrap()
+		.txid;
+	assert_replacement(&bitcoind, &original, &replacement, &destination, amount).await;
+	wait_for_wallet_sync(&server).await;
+	let cli =
+		run_cli(&server, &["onchain-bump-fee", &payment.payment_id, "--fee-rate-sat-per-vb", "10"]);
+	let cli_txid = cli["txid"].as_str().unwrap();
+	assert_replacement(&bitcoind, &replacement, cli_txid, &destination, amount).await;
+	let updated = payment_for_tx(&server, cli_txid).await;
+	assert_eq!(updated.payment_id, payment.payment_id);
+	assert_eq!(updated.amount_msat, Some(amount.to_sat() * 1000));
+	assert!(updated.fee_paid_msat > payment.fee_paid_msat);
+
+	mine_and_sync(&bitcoind, &[&server], 6).await;
+	// Wait for wallet confirmation, which can follow the Lightning tip update.
+	tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			let details = server
+				.client()
+				.get_payment_details(GetPaymentDetailsRequest {
+					payment_id: payment.payment_id.clone(),
+				})
+				.await
+				.unwrap()
+				.payment
+				.unwrap();
+			if let Some(payment_kind::Kind::Onchain(onchain)) =
+				details.kind.and_then(|kind| kind.kind)
+			{
+				if matches!(
+					onchain.status.and_then(|status| status.status),
+					Some(ldk_server_grpc::types::confirmation_status::Status::Confirmed(_))
+				) {
+					break;
+				}
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	})
+	.await
+	.unwrap();
+	let error = server
+		.client()
+		.onchain_bump_fee(OnchainBumpFeeRequest {
+			payment_id: payment.payment_id,
+			fee_rate_sat_per_vb: Some(20),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
+}
+
+#[tokio::test]
+async fn test_onchain_fee_bump_invalid_requests_and_ineligible_payments() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+	for id in [String::new(), "ab".repeat(31), "ab".repeat(33), "zz".repeat(32), "00".repeat(32)] {
+		let error = server
+			.client()
+			.onchain_bump_fee(OnchainBumpFeeRequest { payment_id: id, fee_rate_sat_per_vb: None })
+			.await
+			.unwrap_err();
+		assert_eq!(error.error_code, InvalidRequestError);
+	}
+	for rate in [0, u64::MAX / 250 + 1, u64::MAX] {
+		let error = server
+			.client()
+			.onchain_bump_fee(OnchainBumpFeeRequest {
+				payment_id: "00".repeat(32),
+				fee_rate_sat_per_vb: Some(rate),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(error.error_code, InvalidRequestError);
+		assert_eq!(error.message, ldk_node::NodeError::InvalidFeeRate.to_string());
+	}
+
+	let peer = LdkServerHandle::start(&bitcoind).await;
+	let invoice = peer
+		.client()
+		.bolt11_receive(Bolt11ReceiveRequest {
+			amount_msat: Some(100_000),
+			expiry_secs: 3600,
+			..Default::default()
+		})
+		.await
+		.unwrap()
+		.invoice;
+	// A failed send with no route still records an outbound Lightning payment.
+	let _ = server.client().bolt11_send(Bolt11SendRequest { invoice, ..Default::default() }).await;
+
+	let payments = list_payments(&server).await;
+	let lightning = payments
+		.iter()
+		.find(|p| {
+			matches!(
+				p.kind.as_ref().and_then(|k| k.kind.as_ref()),
+				Some(payment_kind::Kind::Bolt11(_))
+			)
+		})
+		.unwrap();
+	let error = server
+		.client()
+		.onchain_bump_fee(OnchainBumpFeeRequest {
+			payment_id: lightning.payment_id.clone(),
+			fee_rate_sat_per_vb: None,
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
+
+	let address = server.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	// Leave the incoming payment unconfirmed to exercise the direction guard.
+	let txid: String =
+		bitcoind.bitcoind.client.call("sendtoaddress", &[json!(address), json!(0.1)]).unwrap();
+	let incoming = payment_for_tx(&server, &txid).await;
+	assert_eq!(incoming.direction, PaymentDirection::Inbound as i32);
+	let error = server
+		.client()
+		.onchain_bump_fee(OnchainBumpFeeRequest {
+			payment_id: incoming.payment_id,
+			fee_rate_sat_per_vb: None,
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
 }
 
 #[tokio::test]
@@ -182,10 +638,32 @@ async fn test_cli_connect_peer() {
 	assert!(output.is_object());
 }
 
+#[tokio::test]
+async fn test_cli_list_peers() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let output = run_cli(&server_a, &["list-peers"]);
+	assert!(output["peers"].as_array().unwrap().is_empty());
+	let output = run_cli(&server_b, &["list-peers"]);
+	assert!(output["peers"].as_array().unwrap().is_empty());
+
+	let addr = format!("127.0.0.1:{}", server_b.p2p_port);
+	run_cli(&server_a, &["connect-peer", server_b.node_id(), &addr]);
+
+	let output = run_cli(&server_a, &["list-peers"]);
+	let peers = output["peers"].as_array().unwrap();
+	assert_eq!(peers.len(), 1);
+	assert_eq!(peers[0]["node_id"], server_b.node_id());
+	assert_eq!(peers[0]["address"], addr);
+	assert_eq!(peers[0]["is_persisted"], false);
+	assert_eq!(peers[0]["is_connected"], true);
+}
+
 // === CLI tests: Group 4 — Two-node with channel ===
 
-#[tokio::test]
-async fn test_cli_open_channel() {
+async fn open_channel_via_cli(channel_amount: &str) {
 	let bitcoind = TestBitcoind::new();
 	let server_a = LdkServerHandle::start(&bitcoind).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
@@ -203,9 +681,355 @@ async fn test_cli_open_channel() {
 	let addr = format!("127.0.0.1:{}", server_b.p2p_port);
 	let output = run_cli(
 		&server_a,
-		&["open-channel", server_b.node_id(), &addr, "100000sat", "--announce-channel"],
+		&["open-channel", server_b.node_id(), &addr, channel_amount, "--announce-channel"],
 	);
 	assert!(!output["user_channel_id"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_cli_open_channel() {
+	open_channel_via_cli("100000sat").await;
+}
+
+#[tokio::test]
+async fn test_cli_open_channel_with_all() {
+	open_channel_via_cli("all").await;
+}
+
+#[tokio::test]
+async fn test_subscribe_events_channel_state_lifecycle_pending_ready_closed() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let addr_a = server_a.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	let addr_b = server_b.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	bitcoind.fund_address(&addr_a, 1.0);
+	bitcoind.fund_address(&addr_b, 0.1);
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+	wait_for_onchain_balance(server_a.client(), Duration::from_secs(30)).await;
+	wait_for_onchain_balance(server_b.client(), Duration::from_secs(30)).await;
+
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+
+	let open_resp = server_a
+		.client()
+		.open_channel(OpenChannelRequest {
+			node_pubkey: server_b.node_id().to_string(),
+			address: format!("127.0.0.1:{}", server_b.p2p_port),
+			amount: Some(open_channel_request::Amount::ChannelAmountSats(100_000)),
+			push_to_counterparty_msat: None,
+			channel_config: None,
+			announce_channel: true,
+			disable_counterparty_reserve: false,
+		})
+		.await
+		.unwrap();
+
+	let pending_a = wait_for_event(&mut events_a, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.user_channel_id == open_resp.user_channel_id
+					&& channel_event.state == ChannelState::Pending as i32
+		)
+	})
+	.await;
+	let pending_a = match pending_a.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(pending_a.user_channel_id, open_resp.user_channel_id);
+	assert_eq!(pending_a.counterparty_node_id.as_deref(), Some(server_b.node_id()));
+	assert!(pending_a.funding_txo.is_some());
+	assert!(pending_a.reason.is_none());
+	assert_eq!(pending_a.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+	assert!(pending_a.former_temporary_channel_id.as_deref().is_some_and(|id| !id.is_empty()));
+	assert_ne!(
+		pending_a.former_temporary_channel_id.as_deref(),
+		Some(pending_a.channel_id.as_str())
+	);
+
+	let pending_b = wait_for_event(&mut events_b, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Pending as i32
+		)
+	})
+	.await;
+	let pending_b = match pending_b.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(pending_b.channel_id, pending_a.channel_id);
+	assert_eq!(pending_b.counterparty_node_id.as_deref(), Some(server_a.node_id()));
+	assert!(pending_b.funding_txo.is_some());
+	assert!(pending_b.reason.is_none());
+	assert_eq!(pending_b.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+	wait_for_usable_channel(server_a.client(), &bitcoind, Duration::from_secs(60)).await;
+
+	let ready_a = wait_for_event(&mut events_a, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Ready as i32
+		)
+	})
+	.await;
+	let ready_a = match ready_a.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(ready_a.channel_id, pending_a.channel_id);
+	assert_eq!(ready_a.user_channel_id, open_resp.user_channel_id);
+	assert_eq!(ready_a.counterparty_node_id.as_deref(), Some(server_b.node_id()));
+	assert!(ready_a.funding_txo.is_some());
+	assert!(ready_a.reason.is_none());
+	assert_eq!(ready_a.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+
+	let ready_b = wait_for_event(&mut events_b, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Ready as i32
+		)
+	})
+	.await;
+	let ready_b = match ready_b.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(ready_b.channel_id, pending_a.channel_id);
+	assert_eq!(ready_b.counterparty_node_id.as_deref(), Some(server_a.node_id()));
+	assert!(ready_b.funding_txo.is_some());
+	assert!(ready_b.reason.is_none());
+	assert_eq!(ready_b.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+
+	close_channel(&server_a, &server_b, &open_resp.user_channel_id).await;
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+
+	let closed_a = wait_for_event(&mut events_a, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Closed as i32
+		)
+	})
+	.await;
+	let closed_a = match closed_a.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(closed_a.user_channel_id, open_resp.user_channel_id);
+	assert_eq!(closed_a.state, ChannelState::Closed as i32);
+	assert_eq!(closed_a.counterparty_node_id.as_deref(), Some(server_b.node_id()));
+	assert!(closed_a.funding_txo.is_none());
+	let reason_a = closed_a.reason.expect("closed event must include closure reason");
+	assert!(matches!(
+		ChannelStateChangeReasonKind::from_i32(reason_a.kind),
+		Some(ChannelStateChangeReasonKind::LocallyInitiatedCooperativeClosure)
+			| Some(ChannelStateChangeReasonKind::LegacyCooperativeClosure)
+	));
+	assert_eq!(closed_a.closure_initiator, ChannelClosureInitiator::Local as i32);
+
+	let closed_b = wait_for_event(&mut events_b, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Closed as i32
+		)
+	})
+	.await;
+	let closed_b = match closed_b.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(closed_b.channel_id, pending_a.channel_id);
+	assert_eq!(closed_b.counterparty_node_id.as_deref(), Some(server_a.node_id()));
+	assert!(closed_b.funding_txo.is_none());
+	let reason_b = closed_b.reason.expect("closed event must include closure reason");
+	assert!(matches!(
+		ChannelStateChangeReasonKind::from_i32(reason_b.kind),
+		Some(ChannelStateChangeReasonKind::CounterpartyInitiatedCooperativeClosure)
+			| Some(ChannelStateChangeReasonKind::LegacyCooperativeClosure)
+	));
+	assert_eq!(closed_b.closure_initiator, ChannelClosureInitiator::Remote as i32);
+}
+
+#[tokio::test]
+async fn test_subscribe_events_channel_state_lifecycle_pending_ready_force_closed() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let addr_a = server_a.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	let addr_b = server_b.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	bitcoind.fund_address(&addr_a, 1.0);
+	bitcoind.fund_address(&addr_b, 0.1);
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+	wait_for_onchain_balance(server_a.client(), Duration::from_secs(30)).await;
+	wait_for_onchain_balance(server_b.client(), Duration::from_secs(30)).await;
+
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+
+	let open_resp = server_a
+		.client()
+		.open_channel(OpenChannelRequest {
+			node_pubkey: server_b.node_id().to_string(),
+			address: format!("127.0.0.1:{}", server_b.p2p_port),
+			amount: Some(open_channel_request::Amount::ChannelAmountSats(100_000)),
+			push_to_counterparty_msat: None,
+			channel_config: None,
+			announce_channel: true,
+			disable_counterparty_reserve: false,
+		})
+		.await
+		.unwrap();
+
+	let pending_a = wait_for_event(&mut events_a, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.user_channel_id == open_resp.user_channel_id
+					&& channel_event.state == ChannelState::Pending as i32
+		)
+	})
+	.await;
+	let pending_a = match pending_a.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(pending_a.user_channel_id, open_resp.user_channel_id);
+	assert_eq!(pending_a.counterparty_node_id.as_deref(), Some(server_b.node_id()));
+	assert!(pending_a.funding_txo.is_some());
+	assert!(pending_a.reason.is_none());
+	assert_eq!(pending_a.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+	assert!(pending_a.former_temporary_channel_id.as_deref().is_some_and(|id| !id.is_empty()));
+	assert_ne!(
+		pending_a.former_temporary_channel_id.as_deref(),
+		Some(pending_a.channel_id.as_str())
+	);
+
+	let pending_b = wait_for_event(&mut events_b, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Pending as i32
+		)
+	})
+	.await;
+	let pending_b = match pending_b.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(pending_b.channel_id, pending_a.channel_id);
+	assert_eq!(pending_b.counterparty_node_id.as_deref(), Some(server_a.node_id()));
+	assert!(pending_b.funding_txo.is_some());
+	assert!(pending_b.reason.is_none());
+	assert_eq!(pending_b.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+	wait_for_usable_channel(server_a.client(), &bitcoind, Duration::from_secs(60)).await;
+
+	let ready_a = wait_for_event(&mut events_a, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Ready as i32
+		)
+	})
+	.await;
+	let ready_a = match ready_a.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(ready_a.channel_id, pending_a.channel_id);
+	assert_eq!(ready_a.user_channel_id, open_resp.user_channel_id);
+	assert_eq!(ready_a.counterparty_node_id.as_deref(), Some(server_b.node_id()));
+	assert!(ready_a.funding_txo.is_some());
+	assert!(ready_a.reason.is_none());
+	assert_eq!(ready_a.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+
+	let ready_b = wait_for_event(&mut events_b, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Ready as i32
+		)
+	})
+	.await;
+	let ready_b = match ready_b.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(ready_b.channel_id, pending_a.channel_id);
+	assert_eq!(ready_b.counterparty_node_id.as_deref(), Some(server_a.node_id()));
+	assert!(ready_b.funding_txo.is_some());
+	assert!(ready_b.reason.is_none());
+	assert_eq!(ready_b.closure_initiator, ChannelClosureInitiator::Unspecified as i32);
+
+	run_cli(&server_a, &["force-close-channel", &open_resp.user_channel_id, server_b.node_id()]);
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+
+	let closed_a = wait_for_event(&mut events_a, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Closed as i32
+		)
+	})
+	.await;
+	let closed_a = match closed_a.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(closed_a.user_channel_id, open_resp.user_channel_id);
+	assert_eq!(closed_a.state, ChannelState::Closed as i32);
+	assert_eq!(closed_a.counterparty_node_id.as_deref(), Some(server_b.node_id()));
+	assert!(closed_a.funding_txo.is_none());
+	let reason_a = closed_a.reason.expect("closed event must include closure reason");
+	assert_eq!(
+		ChannelStateChangeReasonKind::from_i32(reason_a.kind),
+		Some(ChannelStateChangeReasonKind::HolderForceClosed)
+	);
+	assert_eq!(closed_a.closure_initiator, ChannelClosureInitiator::Local as i32);
+
+	let closed_b = wait_for_event(&mut events_b, |e| {
+		matches!(
+			e,
+			Event::ChannelStateChanged(channel_event)
+				if channel_event.channel_id == pending_a.channel_id
+					&& channel_event.state == ChannelState::Closed as i32
+		)
+	})
+	.await;
+	let closed_b = match closed_b.event {
+		Some(Event::ChannelStateChanged(channel_event)) => channel_event,
+		other => panic!("expected ChannelStateChanged event, got {other:?}"),
+	};
+	assert_eq!(closed_b.channel_id, pending_a.channel_id);
+	assert_eq!(closed_b.counterparty_node_id.as_deref(), Some(server_a.node_id()));
+	assert!(closed_b.funding_txo.is_none());
+	let reason_b = closed_b.reason.expect("closed event must include closure reason");
+	assert_eq!(
+		ChannelStateChangeReasonKind::from_i32(reason_b.kind),
+		Some(ChannelStateChangeReasonKind::CounterpartyForceClosed)
+	);
+	assert_eq!(closed_b.closure_initiator, ChannelClosureInitiator::Remote as i32);
 }
 
 #[tokio::test]
@@ -218,7 +1042,31 @@ async fn test_cli_list_channels() {
 	let output = run_cli(&server_a, &["list-channels"]);
 	let channels = output["channels"].as_array().unwrap();
 	assert!(!channels.is_empty());
-	assert_eq!(channels[0]["counterparty_node_id"], server_b.node_id());
+	let channel = &channels[0];
+	assert_eq!(channel["counterparty_node_id"], server_b.node_id());
+
+	// A funded, usable channel has a real short_channel_id and both SCID aliases set.
+	assert!(channel["short_channel_id"].is_u64());
+	assert!(channel["outbound_scid_alias"].is_u64());
+	assert!(channel["inbound_scid_alias"].is_u64());
+
+	// HTLC bounds: the minimum is a non-optional field, and the maximum is always known
+	// once the counterparty's reserve has been negotiated (true by the time a channel
+	// is usable).
+	assert!(channel["inbound_htlc_minimum_msat"].is_u64());
+	assert!(channel["inbound_htlc_maximum_msat"].is_u64());
+
+	// A freshly opened, still-open channel is always NotShuttingDown.
+	assert_eq!(
+		channel["channel_shutdown_state"].as_i64(),
+		Some(ChannelShutdownState::NotShuttingDown as i64)
+	);
+
+	// This test opens a default (anchor) channel with no trusted_peers_no_reserve
+	// configured, so the reserve type is deterministically Adaptive.
+	assert_eq!(channel["reserve_type"].as_i64(), Some(ReserveType::Adaptive as i64));
+	assert!(!channel["channel_type"].as_object().unwrap().is_empty());
+	assert!(!channel["counterparty_features"].as_object().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -241,15 +1089,15 @@ async fn test_cli_update_channel_config() {
 	assert!(output.is_object());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_cli_bolt11_send() {
 	let bitcoind = TestBitcoind::new();
 	let server_a = LdkServerHandle::start(&bitcoind).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
-	// Set up event consumers before any payments
-	let consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
-	let consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+	// Subscribe to events before the payment
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
 
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
@@ -268,22 +1116,110 @@ async fn test_cli_bolt11_send() {
 
 	// Pay via CLI from A
 	let output = run_cli(&server_a, &["bolt11-send", &invoice_resp.invoice]);
-	assert!(!output["payment_id"].as_str().unwrap().is_empty());
+	let send_payment_id = output["payment_id"].as_str().unwrap();
+	assert!(!send_payment_id.is_empty());
 
 	// Verify events
-	tokio::time::sleep(Duration::from_secs(5)).await;
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+	let Some(Event::PaymentSuccessful(successful)) = &event_a.event else {
+		panic!("expected PaymentSuccessful");
+	};
+	assert_eq!(successful.payment.as_ref().unwrap().payment_id, send_payment_id);
 
-	let events_a = consumer_a.consume_events(5, Duration::from_secs(10)).await;
-	assert!(
-		events_a.iter().any(|e| matches!(&e.event, Some(Event::PaymentSuccessful(_)))),
-		"Expected PaymentSuccessful on sender"
-	);
+	let event_b = wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentReceived(_))).await;
+	let Some(Event::PaymentReceived(received)) = &event_b.event else {
+		panic!("expected PaymentReceived");
+	};
+	assert!(!received.payment.as_ref().unwrap().payment_id.is_empty());
+}
 
-	let events_b = consumer_b.consume_events(5, Duration::from_secs(10)).await;
-	assert!(
-		events_b.iter().any(|e| matches!(&e.event, Some(Event::PaymentReceived(_)))),
-		"Expected PaymentReceived on receiver"
-	);
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_cli_bolt11_send_underpaying_split_payment() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+	let server_c = LdkServerHandle::start(&bitcoind).await;
+
+	// Subscribe to events on all three nodes before any payment is sent.
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+	let mut events_c = server_c.client().subscribe_events().await.unwrap();
+
+	// Each payer gets its own direct channel into the receiver. The channels are sized well
+	// above the 50,000 sat HTLCs because LDK limits a channel's maximum HTLC size to a fraction
+	// of its capacity.
+	setup_funded_channel(&bitcoind, &server_a, &server_c, 300_000).await;
+	setup_funded_channel(&bitcoind, &server_b, &server_c, 300_000).await;
+
+	// Create one invoice for the full amount that the two payers will jointly cover.
+	let invoice_resp = server_c
+		.client()
+		.bolt11_receive(Bolt11ReceiveRequest {
+			amount_msat: Some(100_000_000),
+			description: Some(Bolt11InvoiceDescription {
+				kind: Some(bolt11_invoice_description::Kind::Direct(
+					"split payment test".to_string(),
+				)),
+			}),
+			expiry_secs: 3600,
+		})
+		.await
+		.unwrap();
+
+	// Both payers independently send half of the invoice amount.
+	let output_a =
+		run_cli(&server_a, &["bolt11-send-underpaying", &invoice_resp.invoice, "50000sat"]);
+	let output_b =
+		run_cli(&server_b, &["bolt11-send-underpaying", &invoice_resp.invoice, "50000sat"]);
+	assert!(!output_a["payment_id"].as_str().unwrap().is_empty());
+	assert!(!output_b["payment_id"].as_str().unwrap().is_empty());
+
+	// The receiver completes the payment only after both partial HTLCs arrive.
+	let event_c = wait_for_event(&mut events_c, |e| matches!(e, Event::PaymentReceived(_))).await;
+	assert!(matches!(&event_c.event, Some(Event::PaymentReceived(_))));
+
+	// Both payers complete their part of the payment successfully.
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+	assert!(matches!(&event_a.event, Some(Event::PaymentSuccessful(_))));
+	let event_b = wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+	assert!(matches!(&event_b.event, Some(Event::PaymentSuccessful(_))));
+}
+
+#[tokio::test]
+async fn test_cli_pay() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Pay a BOLT11 invoice via unified `pay` command
+	let invoice_resp = server_b
+		.client()
+		.bolt11_receive(Bolt11ReceiveRequest {
+			amount_msat: Some(10_000_000),
+			description: Some(Bolt11InvoiceDescription {
+				kind: Some(bolt11_invoice_description::Kind::Direct("test".to_string())),
+			}),
+			expiry_secs: 3600,
+		})
+		.await
+		.unwrap();
+	let output = run_cli(&server_a, &["pay", &invoice_resp.invoice]);
+	assert!(output.get("bolt11_payment_id").is_some());
+
+	// Pay a BOLT12 offer via unified `pay` command
+	let offer_resp = server_b
+		.client()
+		.bolt12_receive(Bolt12ReceiveRequest {
+			description: "test offer".to_string(),
+			amount_msat: None,
+			expiry_secs: None,
+			quantity: None,
+		})
+		.await
+		.unwrap();
+	let output = run_cli(&server_a, &["pay", &offer_resp.offer, "10000sat"]);
+	assert!(output.get("bolt12_payment_id").is_some());
 }
 
 #[tokio::test]
@@ -311,33 +1247,168 @@ async fn test_cli_bolt12_send() {
 }
 
 #[tokio::test]
+async fn test_cli_bolt12_refund() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Give B outbound liquidity for the refund payment.
+	let offer = server_b
+		.client()
+		.bolt12_receive(Bolt12ReceiveRequest {
+			description: "refund funding payment".to_string(),
+			amount_msat: Some(10_000_000),
+			expiry_secs: None,
+			quantity: None,
+		})
+		.await
+		.unwrap();
+	run_cli(&server_a, &["bolt12-send", &offer.offer]);
+	wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+	wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentReceived(_))).await;
+
+	let output = run_cli(
+		&server_b,
+		&["bolt12-send-refund", "5000sat", "--quantity", "1", "--payer-note", "test refund"],
+	);
+	let refund_str = output["refund"].as_str().unwrap();
+	assert!(refund_str.starts_with("lnr"), "Expected lnr prefix, got: {refund_str}");
+	let refund = Refund::from_str(refund_str).unwrap();
+	assert_eq!(refund.amount_msats(), 5_000_000);
+	assert_eq!(refund.quantity(), Some(1));
+	assert_eq!(refund.payer_note().unwrap().to_string(), "test refund");
+
+	let output = run_cli(&server_a, &["bolt12-receive-refund", refund_str]);
+	let payment_hash = output["payment_hash"].as_str().unwrap();
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentReceived(_))).await;
+	let Some(Event::PaymentReceived(payment_received)) = event_a.event else {
+		panic!("expected PaymentReceived");
+	};
+	let payment = payment_received.payment.unwrap();
+	let Some(payment_kind::Kind::Bolt12Refund(refund)) = payment.kind.unwrap().kind else {
+		panic!("expected BOLT12 refund kind");
+	};
+	assert_eq!(refund.hash.as_deref(), Some(payment_hash));
+	wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_cli_bolt12_create_payer_proof() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	let offer_resp = server_b
+		.client()
+		.bolt12_receive(Bolt12ReceiveRequest {
+			description: "payer proof offer".to_string(),
+			amount_msat: Some(10_000_000),
+			expiry_secs: None,
+			quantity: None,
+		})
+		.await
+		.unwrap();
+
+	let send_output = run_cli(&server_a, &["bolt12-send", &offer_resp.offer]);
+	let send_payment_id = send_output["payment_id"].as_str().unwrap();
+	assert!(!send_payment_id.is_empty());
+
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+	let Some(Event::PaymentSuccessful(successful)) = &event_a.event else {
+		panic!("expected PaymentSuccessful");
+	};
+	assert_eq!(successful.payment_id, send_payment_id);
+	let payment_preimage = successful.payment_preimage.as_ref().expect("preimage");
+	let invoice = successful.bolt12_invoice.as_ref().expect("bolt12 invoice");
+
+	let proof_output = run_cli(
+		&server_a,
+		&[
+			"bolt12-create-payer-proof",
+			send_payment_id,
+			payment_preimage,
+			invoice,
+			"--include-offer-description",
+			"--include-invoice-amount",
+			"--note",
+			"Paid in full",
+		],
+	);
+	assert!(!proof_output["payer_proof"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_cli_spontaneous_send() {
 	let bitcoind = TestBitcoind::new();
 	let server_a = LdkServerHandle::start(&bitcoind).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 
-	let consumer_a = RabbitMqEventConsumer::new(&server_a.exchange_name).await;
-	let consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
 
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
 	let output = run_cli(&server_a, &["spontaneous-send", server_b.node_id(), "10000sat"]);
-	assert!(!output["payment_id"].as_str().unwrap().is_empty());
+	let send_payment_id = output["payment_id"].as_str().unwrap();
+	assert!(!send_payment_id.is_empty());
 
 	// Verify events
-	tokio::time::sleep(Duration::from_secs(5)).await;
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+	let Some(Event::PaymentSuccessful(successful)) = &event_a.event else {
+		panic!("expected PaymentSuccessful");
+	};
+	assert_eq!(successful.payment.as_ref().unwrap().payment_id, send_payment_id);
 
-	let events_a = consumer_a.consume_events(5, Duration::from_secs(10)).await;
-	assert!(
-		events_a.iter().any(|e| matches!(&e.event, Some(Event::PaymentSuccessful(_)))),
-		"Expected PaymentSuccessful on sender"
-	);
+	let event_b = wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentReceived(_))).await;
+	let Some(Event::PaymentReceived(received)) = &event_b.event else {
+		panic!("expected PaymentReceived");
+	};
+	assert!(!received.payment.as_ref().unwrap().payment_id.is_empty());
+}
 
-	let events_b = consumer_b.consume_events(5, Duration::from_secs(10)).await;
-	assert!(
-		events_b.iter().any(|e| matches!(&e.event, Some(Event::PaymentReceived(_)))),
-		"Expected PaymentReceived on receiver"
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_cli_spontaneous_send_with_custom_tlvs() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Two odd-type custom TLVs (even types are rejected at the receiver).
+	let output = run_cli(
+		&server_a,
+		&[
+			"spontaneous-send",
+			server_b.node_id(),
+			"10000sat",
+			"--custom-tlv",
+			"65537:deadbeef",
+			"--custom-tlv",
+			"65539:cafe",
+		],
 	);
+	assert!(!output["payment_id"].as_str().unwrap().is_empty());
+
+	// The receiver must observe both TLVs in PaymentReceived.
+	let event_b = wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentReceived(_))).await;
+	let Some(Event::PaymentReceived(pr)) = event_b.event else {
+		panic!("expected PaymentReceived");
+	};
+	assert!(!pr.payment.as_ref().unwrap().payment_id.is_empty());
+	assert_eq!(pr.custom_records.len(), 2);
+	let by_type: HashMap<u64, Vec<u8>> =
+		pr.custom_records.into_iter().map(|r| (r.type_num, r.value.to_vec())).collect();
+	assert_eq!(by_type.get(&65537).cloned(), Some(vec![0xde, 0xad, 0xbe, 0xef]));
+	assert_eq!(by_type.get(&65539).cloned(), Some(vec![0xca, 0xfe]));
 }
 
 #[tokio::test]
@@ -347,28 +1418,11 @@ async fn test_cli_get_payment_details() {
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
-	// Make a bolt11 payment via CLI
-	let invoice_resp = server_b
-		.client()
-		.bolt11_receive(Bolt11ReceiveRequest {
-			amount_msat: Some(10_000_000),
-			description: Some(Bolt11InvoiceDescription {
-				kind: Some(bolt11_invoice_description::Kind::Direct("test".to_string())),
-			}),
-			expiry_secs: 3600,
-		})
-		.await
-		.unwrap();
+	let payment_id = send_bolt11_payment(&server_a, &server_b, 10_000_000).await;
 
-	let send_output = run_cli(&server_a, &["bolt11-send", &invoice_resp.invoice]);
-	let payment_id = send_output["payment_id"].as_str().unwrap();
-
-	// Wait for payment to be recorded
-	tokio::time::sleep(Duration::from_secs(3)).await;
-
-	let output = run_cli(&server_a, &["get-payment-details", payment_id]);
+	let output = run_cli(&server_a, &["get-payment-details", &payment_id]);
 	assert!(output.get("payment").is_some());
-	assert_eq!(output["payment"]["id"], payment_id);
+	assert_eq!(output["payment"]["payment_id"], payment_id);
 }
 
 #[tokio::test]
@@ -378,24 +1432,14 @@ async fn test_cli_list_payments() {
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
-	// Make a bolt11 payment via CLI
-	let invoice_resp = server_b
-		.client()
-		.bolt11_receive(Bolt11ReceiveRequest {
-			amount_msat: Some(10_000_000),
-			description: Some(Bolt11InvoiceDescription {
-				kind: Some(bolt11_invoice_description::Kind::Direct("test".to_string())),
-			}),
-			expiry_secs: 3600,
-		})
-		.await
-		.unwrap();
-
-	run_cli(&server_a, &["bolt11-send", &invoice_resp.invoice]);
-	tokio::time::sleep(Duration::from_secs(3)).await;
+	let payment_id = send_bolt11_payment(&server_a, &server_b, 10_000_000).await;
+	let payments = list_payments(&server_a).await;
+	let expected_payment = payments.iter().find(|p| p.payment_id == payment_id).unwrap();
 
 	let output = run_cli(&server_a, &["list-payments"]);
-	assert!(!output["list"].as_array().unwrap().is_empty());
+	let payment =
+		output["list"].as_array().unwrap().iter().find(|p| p["payment_id"] == payment_id).unwrap();
+	assert_eq!(*payment, serde_json::to_value(expected_payment).unwrap());
 }
 
 #[tokio::test]
@@ -409,7 +1453,7 @@ async fn test_cli_close_channel() {
 	assert!(output.is_object());
 
 	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
-	tokio::time::sleep(Duration::from_secs(2)).await;
+	wait_for_channels(&server_a, 0, Duration::from_secs(30)).await;
 
 	let channels_output = run_cli(&server_a, &["list-channels"]);
 	assert!(channels_output["channels"].as_array().unwrap().is_empty());
@@ -426,22 +1470,43 @@ async fn test_cli_force_close_channel() {
 	assert!(output.is_object());
 
 	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
-	tokio::time::sleep(Duration::from_secs(2)).await;
+	wait_for_channels(&server_a, 0, Duration::from_secs(30)).await;
 
 	let channels_output = run_cli(&server_a, &["list-channels"]);
 	assert!(channels_output["channels"].as_array().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn test_cli_splice_in() {
+async fn splice_in_via_cli(splice_amount: &str) {
 	let bitcoind = TestBitcoind::new();
 	let server_a = LdkServerHandle::start(&bitcoind).await;
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 	let user_channel_id = setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+
 	let output =
-		run_cli(&server_a, &["splice-in", &user_channel_id, server_b.node_id(), "50000sat"]);
+		run_cli(&server_a, &["splice-in", &user_channel_id, server_b.node_id(), splice_amount]);
 	assert!(output.is_object());
+
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::SpliceNegotiated(_))).await;
+	match &event_a.event {
+		Some(Event::SpliceNegotiated(splice_negotiated)) => {
+			assert_eq!(splice_negotiated.user_channel_id, user_channel_id);
+			assert_eq!(splice_negotiated.counterparty_node_id, server_b.node_id());
+			assert!(!splice_negotiated.new_funding_txo.is_empty());
+		},
+		other => panic!("expected SpliceNegotiated event, got {other:?}"),
+	}
+}
+
+#[tokio::test]
+async fn test_cli_splice_in() {
+	splice_in_via_cli("50000sat").await;
+}
+
+#[tokio::test]
+async fn test_cli_splice_in_with_all() {
+	splice_in_via_cli("all").await;
 }
 
 #[tokio::test]
@@ -455,6 +1520,132 @@ async fn test_cli_splice_out() {
 		run_cli(&server_a, &["splice-out", &user_channel_id, server_b.node_id(), "10000sat"]);
 	let address = output["address"].as_str().unwrap();
 	assert!(address.starts_with("bcrt1"), "Expected regtest address, got: {}", address);
+}
+
+#[tokio::test]
+async fn test_pending_splice_fee_bump_client_cli() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+	let peer = LdkServerHandle::start(&bitcoind).await;
+	let channel = setup_funded_channel(&bitcoind, &server, &peer, 100_000).await;
+	let request = BumpChannelFundingFeeRequest {
+		user_channel_id: channel.clone(),
+		counterparty_node_id: peer.node_id().into(),
+	};
+	let error = server.client().bump_channel_funding_fee(request.clone()).await.unwrap_err();
+	assert_eq!(error.error_code, LightningError);
+	let mut wrong_peer = request.clone();
+	wrong_peer.counterparty_node_id = server.node_id().into();
+	assert_eq!(
+		server.client().bump_channel_funding_fee(wrong_peer).await.unwrap_err().error_code,
+		LightningError
+	);
+
+	let mut events = server.client().subscribe_events().await.unwrap();
+	// Use the same funded channel and splice-in operation as the existing splice fixtures.
+	run_cli(&server, &["splice-in", &channel, peer.node_id(), "50000sat"]);
+	let original = splice_txid(&mut events).await;
+	let original_tx = wait_for_transaction(&bitcoind, &original).await;
+	let funding_output = original_tx["vout"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|output| output["scriptPubKey"]["type"] == "witness_v0_scripthash")
+		.unwrap();
+	let expected_channel_value =
+		ldk_node::bitcoin::Amount::from_btc(funding_output["value"].as_f64().unwrap())
+			.unwrap()
+			.to_sat();
+	assert!(expected_channel_value >= 150_000);
+
+	let funding = payment_for_tx(&server, &original).await;
+	let error = server
+		.client()
+		.onchain_bump_fee(OnchainBumpFeeRequest {
+			payment_id: funding.payment_id,
+			fee_rate_sat_per_vb: Some(10),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
+
+	server.client().bump_channel_funding_fee(request.clone()).await.unwrap();
+	let replacement = splice_txid(&mut events).await;
+	assert_ne!(original, replacement);
+	wait_for_transaction(&bitcoind, &replacement).await;
+	let cli = run_cli(&server, &["bump-channel-funding-fee", &channel, peer.node_id()]);
+	assert_eq!(cli, json!({}));
+	let cli_txid = splice_txid(&mut events).await;
+	assert_ne!(replacement, cli_txid);
+	let replacement_tx = wait_for_transaction(&bitcoind, &cli_txid).await;
+	let replacement_output = replacement_tx["vout"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|output| output["scriptPubKey"] == funding_output["scriptPubKey"])
+		.unwrap();
+	assert_eq!(replacement_output["value"], funding_output["value"]);
+	let mempool: Vec<String> = bitcoind.bitcoind.client.call("getrawmempool", &[]).unwrap();
+	for old in [&original, &replacement] {
+		assert!(!mempool.contains(old));
+	}
+	mine_and_sync(&bitcoind, &[&server, &peer], 6).await;
+	tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			let channels = server.client().list_channels(ListChannelsRequest {}).await.unwrap();
+			if channels.channels.iter().any(|c| {
+				c.user_channel_id == channel
+					&& c.channel_value_sats == expected_channel_value
+					&& c.is_usable
+			}) {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	})
+	.await
+	.expect("replacement splice did not confirm with the original amount");
+	assert_eq!(
+		server.client().bump_channel_funding_fee(request).await.unwrap_err().error_code,
+		LightningError
+	);
+}
+
+#[tokio::test]
+async fn test_pending_splice_fee_bump_invalid_requests() {
+	let bitcoind = TestBitcoind::new();
+	let server = LdkServerHandle::start(&bitcoind).await;
+	for id in ["", "-1", "xyz", "340282366920938463463374607431768211456"] {
+		let error = server
+			.client()
+			.bump_channel_funding_fee(BumpChannelFundingFeeRequest {
+				user_channel_id: id.into(),
+				counterparty_node_id: server.node_id().into(),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(error.error_code, InvalidRequestError);
+	}
+	for peer in ["", "invalid", &"00".repeat(33)] {
+		let error = server
+			.client()
+			.bump_channel_funding_fee(BumpChannelFundingFeeRequest {
+				user_channel_id: "1".into(),
+				counterparty_node_id: peer.into(),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(error.error_code, InvalidRequestError);
+	}
+	let error = server
+		.client()
+		.bump_channel_funding_fee(BumpChannelFundingFeeRequest {
+			user_channel_id: u128::MAX.to_string(),
+			counterparty_node_id: server.node_id().into(),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, LightningError);
 }
 
 #[tokio::test]
@@ -482,21 +1673,11 @@ async fn test_cli_graph_with_channel() {
 	let server_b = LdkServerHandle::start(&bitcoind).await;
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
-	// Wait for the channel announcement to appear in the network graph.
-	let scid = {
-		let start = std::time::Instant::now();
-		loop {
-			let output = run_cli(&server_a, &["graph-list-channels"]);
-			let scids = output["short_channel_ids"].as_array().unwrap();
-			if !scids.is_empty() {
-				break scids[0].as_u64().unwrap().to_string();
-			}
-			if start.elapsed() > Duration::from_secs(30) {
-				panic!("Timed out waiting for channel to appear in network graph");
-			}
-			tokio::time::sleep(Duration::from_secs(1)).await;
-		}
-	};
+	wait_for_gossip(&server_a, 1, Duration::from_secs(30)).await;
+	let output = run_cli(&server_a, &["graph-list-channels"]);
+	let scids = output["short_channel_ids"].as_array().unwrap();
+	assert_eq!(scids.len(), 1);
+	let scid = scids[0].as_u64().unwrap().to_string();
 
 	// Test GraphGetChannel: should return channel info with both our nodes.
 	let output = run_cli(&server_a, &["graph-get-channel", &scid]);
@@ -514,11 +1695,47 @@ async fn test_cli_graph_with_channel() {
 	assert!(node_ids.contains(&server_a.node_id()), "Expected server_a in graph nodes");
 	assert!(node_ids.contains(&server_b.node_id()), "Expected server_b in graph nodes");
 
-	// Test GraphGetNode: should return node info with at least one channel.
-	let output = run_cli(&server_a, &["graph-get-node", server_b.node_id()]);
+	// Test GraphGetNode: should return node info with at least one channel and
+	// node announcement features once the node announcement reaches the graph.
+	let output = {
+		let start = std::time::Instant::now();
+		loop {
+			let output = run_cli(&server_a, &["graph-get-node", server_b.node_id()]);
+			let node = &output["node"];
+			let has_channel =
+				node["channels"].as_array().is_some_and(|channels| !channels.is_empty());
+			let has_announcement_features = node["announcement_info"]["features"]
+				.as_object()
+				.is_some_and(|features| !features.is_empty());
+
+			if has_channel && has_announcement_features {
+				break output;
+			}
+			if start.elapsed() > Duration::from_secs(30) {
+				panic!("Timed out waiting for node announcement features in network graph");
+			}
+			tokio::time::sleep(Duration::from_secs(1)).await;
+		}
+	};
 	let node = &output["node"];
 	let channels = node["channels"].as_array().unwrap();
 	assert!(!channels.is_empty(), "Expected node to have at least one channel");
+
+	let announcement_info = &node["announcement_info"];
+	let features = announcement_info["features"].as_object().unwrap();
+	assert!(!features.is_empty(), "Expected node announcement features");
+
+	// Every entry should be keyed by the signaled bit and expose the decoded name
+	// plus whether that bit is required.
+	for (bit, feature) in features {
+		assert!(bit.parse::<u32>().is_ok(), "Feature key is not a bit number: {bit}");
+		assert!(feature.get("name").is_some(), "Feature missing name field");
+		assert!(feature.get("is_required").is_some(), "Feature missing is_required field");
+	}
+
+	let keysend = &features["55"];
+	assert_eq!(keysend["name"], "Keysend");
+	assert_eq!(keysend["is_required"], false);
 }
 
 #[tokio::test]
@@ -531,17 +1748,29 @@ async fn test_cli_completions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_forwarded_payment_event() {
+async fn test_forwarded_payment_event_and_history() {
+	forwarded_payment_event_and_history("detailed").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_forwarded_payment_stats_mode() {
+	forwarded_payment_event_and_history("stats").await;
+}
+
+async fn forwarded_payment_event_and_history(tracking_mode: &str) {
 	let bitcoind = TestBitcoind::new();
 
 	// A: normal payer node
 	let server_a = LdkServerHandle::start(&bitcoind).await;
 
 	// B: LSP node (all e2e servers include LSPS2 service config)
-	let server_b = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start_with_config(&bitcoind, |params| {
+		TestConfigBuilder::new(params).forwarded_payment_tracking_mode(tracking_mode).build()
+	})
+	.await;
 
-	// Set up RabbitMQ consumer on B before any payments
-	let consumer_b = RabbitMqEventConsumer::new(&server_b.exchange_name).await;
+	// Subscribe to events on B before any payments
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
 
 	// Open channel A -> B (1M sats, larger for JIT forwarding)
 	setup_funded_channel(&bitcoind, &server_a, &server_b, 1_000_000).await;
@@ -567,19 +1796,18 @@ async fn test_forwarded_payment_event() {
 
 	let mut builder_c = ldk_node::Builder::from_config(config_c);
 	let (rpc_host, rpc_port, rpc_user, rpc_password) = bitcoind.rpc_details();
-	builder_c.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
+	builder_c.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password, None);
 
 	// Set B as LSPS2 LSP for C
 	let b_node_id = ldk_node::bitcoin::secp256k1::PublicKey::from_str(server_b.node_id()).unwrap();
 	let b_addr = SocketAddress::from_str(&format!("127.0.0.1:{}", server_b.p2p_port)).unwrap();
-	builder_c.set_liquidity_source_lsps2(b_node_id, b_addr, None);
+	builder_c.add_liquidity_source(b_node_id, b_addr, None, true);
 
-	let seed_path_c = storage_dir_c.join("keys_seed").to_str().unwrap().to_string();
-	let node_entropy_c = ldk_node::entropy::NodeEntropy::from_seed_path(seed_path_c).unwrap();
+	let mnemonic_c = ldk_node::bip39::Mnemonic::generate(24).unwrap();
+	let node_entropy_c = ldk_node::entropy::NodeEntropy::from_bip39_mnemonic(mnemonic_c, None);
 	let node_c = builder_c.build(node_entropy_c).unwrap();
 
 	node_c.start().unwrap();
-
 	node_c.sync_wallets().unwrap();
 
 	// C generates JIT invoice via LSPS2
@@ -591,23 +1819,669 @@ async fn test_forwarded_payment_event() {
 		.receive_via_jit_channel(100_000_000, &description, 3600, None)
 		.unwrap();
 
+	let sent_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 	// A pays the JIT invoice (routes through B)
 	run_cli(&server_a, &["bolt11-send", &jit_invoice.to_string()]);
 
 	// Wait for payment processing and JIT channel open
-	tokio::time::sleep(Duration::from_secs(15)).await;
+	tokio::time::sleep(Duration::from_secs(10)).await;
 
 	// Mine blocks to confirm JIT channel
 	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
-	tokio::time::sleep(Duration::from_secs(5)).await;
+	tokio::time::sleep(Duration::from_secs(10)).await;
 
-	// Verify PaymentForwarded event on B
-	let events_b = consumer_b.consume_events(10, Duration::from_secs(15)).await;
-	assert!(
-		events_b.iter().any(|e| matches!(&e.event, Some(Event::PaymentForwarded(_)))),
-		"Expected PaymentForwarded event on LSP node B, got events: {:?}",
-		events_b.iter().map(|e| &e.event).collect::<Vec<_>>()
+	// Verify PaymentForwarded event on B (drain other events)
+	let forwarded = tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			match events_b.next_message().await {
+				Some(Ok(ev)) if matches!(&ev.event, Some(Event::PaymentForwarded(_))) => {
+					return ev;
+				},
+				Some(Ok(_)) => continue, // drain non-matching events
+				Some(Err(e)) => panic!("Error reading event stream: {e}"),
+				None => panic!("Event stream ended without PaymentForwarded"),
+			}
+		}
+	})
+	.await
+	.expect("Timed out waiting for PaymentForwarded event on LSP node B");
+	let Some(Event::PaymentForwarded(event)) = forwarded.event else {
+		panic!("Expected a forwarded payment event");
+	};
+	let event_payment = event;
+	let received_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+	let event_timestamp = event_payment.observed_at_timestamp;
+	assert!(event_timestamp >= sent_at);
+	assert!(event_timestamp <= received_at);
+	assert_eq!(event_payment.prev_htlcs.len(), 1);
+	assert_eq!(event_payment.next_htlcs.len(), 1);
+	assert!(event_payment.total_fee_earned_msat.is_some());
+
+	// LDK Node persists the forward before emitting the event in detailed mode.
+	// Query once without polling to check that ordering; stats mode omits individual records.
+	let history = server_b
+		.client()
+		.list_forwarded_payments(ListForwardedPaymentsRequest { page_token: None })
+		.await
+		.unwrap();
+	assert_eq!(history.forwarded_payments.len(), usize::from(tracking_mode == "detailed"));
+	assert!(history.next_page_token.is_none());
+
+	// Both tracking modes expose per-channel totals after forwarding.
+	let mode = run_cli(&server_b, &["get-forwarded-payment-tracking-mode"]);
+	assert_eq!(
+		mode["mode"],
+		format!("FORWARDED_PAYMENT_TRACKING_MODE_{}", tracking_mode.to_uppercase())
 	);
+	let stats = server_b
+		.client()
+		.list_channel_forwarding_stats(ListChannelForwardingStatsRequest { page_token: None })
+		.await
+		.unwrap();
+	assert_eq!(stats.stats.len(), 2);
+	assert!(stats.next_page_token.is_none());
+	let prev = stats
+		.stats
+		.iter()
+		.find(|s| s.channel_id == event_payment.prev_htlcs[0].channel_id)
+		.unwrap();
+	let next = stats
+		.stats
+		.iter()
+		.find(|s| s.channel_id == event_payment.next_htlcs[0].channel_id)
+		.unwrap();
+	assert_eq!(prev.counterparty_node_id.as_deref(), Some(server_a.node_id()));
+	assert_eq!(prev.inbound_payments_forwarded, 1);
+	assert_eq!(prev.outbound_payments_forwarded, 0);
+	assert_eq!(Some(prev.total_inbound_amount_msat), event_payment.prev_htlcs[0].amount_msat);
+	assert_eq!(prev.total_outbound_amount_msat, 0);
+	assert_eq!(prev.total_fee_earned_msat, event_payment.total_fee_earned_msat);
+	assert_eq!(prev.total_skimmed_fee_msat, event_payment.skimmed_fee_msat.unwrap_or(0));
+	assert_eq!(next.inbound_payments_forwarded, 0);
+	assert_eq!(next.outbound_payments_forwarded, 1);
+	assert_eq!(next.total_inbound_amount_msat, 0);
+	assert_eq!(next.total_outbound_amount_msat, event_payment.outbound_amount_forwarded_msat);
+	assert_eq!(next.total_fee_earned_msat, Some(0));
+	assert_eq!(next.onchain_claims_count, 0);
+	assert!(prev.first_forwarded_at_timestamp >= sent_at);
+	assert!(prev.last_forwarded_at_timestamp <= event_timestamp);
+	for stat in &stats.stats {
+		let by_id = server_b
+			.client()
+			.get_channel_forwarding_stats(GetChannelForwardingStatsRequest {
+				channel_id: stat.channel_id.clone(),
+			})
+			.await
+			.unwrap();
+		assert_eq!(by_id.stats.as_ref(), Some(stat));
+	}
+	let cli_stats =
+		run_cli(&server_b, &["list-channel-forwarding-stats", "--number-of-records", "2"]);
+	assert_eq!(cli_stats["list"], serde_json::to_value(&stats.stats).unwrap());
+	let cli_stat = run_cli(&server_b, &["get-channel-forwarding-stats", &prev.channel_id]);
+	assert_eq!(cli_stat["stats"], serde_json::to_value(prev).unwrap());
+	// New forwards have not yet been aggregated into hourly channel-pair buckets.
+	let pairs = run_cli(&server_b, &["list-channel-pair-forwarding-stats"]);
+	assert!(pairs["list"].as_array().unwrap().is_empty());
+
+	if tracking_mode == "stats" {
+		node_c.stop().unwrap();
+		return;
+	}
+	let record = &history.forwarded_payments[0];
+	let timestamp = record.forwarded_at_timestamp;
+	assert!(timestamp > 0);
+	assert!(timestamp >= sent_at);
+	assert!(timestamp <= event_timestamp);
+	let by_id = server_b
+		.client()
+		.get_forwarded_payment_details(GetForwardedPaymentDetailsRequest {
+			forwarded_payment_id: record.id.clone(),
+		})
+		.await
+		.unwrap();
+	assert_eq!(by_id.payment.as_ref(), Some(record));
+	let cli_payment = run_cli(&server_b, &["get-forwarded-payment-details", &record.id]);
+	assert_eq!(cli_payment["payment"], serde_json::to_value(record).unwrap());
+	assert_eq!(record.id.len(), 64);
+	assert!(ldk_node::payment::ForwardedPaymentId::from_str(&record.id).is_ok());
+	assert_eq!(record.prev_channel_id, event_payment.prev_htlcs[0].channel_id);
+	assert_eq!(record.next_channel_id, event_payment.next_htlcs[0].channel_id);
+	assert_eq!(record.prev_user_channel_id, event_payment.prev_htlcs[0].user_channel_id);
+	assert_eq!(record.next_user_channel_id, event_payment.next_htlcs[0].user_channel_id);
+	assert_eq!(record.prev_node_id, event_payment.prev_htlcs[0].node_id);
+	assert_eq!(record.next_node_id, event_payment.next_htlcs[0].node_id);
+	assert_eq!(record.inbound_amount_forwarded_msat, event_payment.prev_htlcs[0].amount_msat);
+	assert_eq!(record.outbound_amount_forwarded_msat, event_payment.next_htlcs[0].amount_msat);
+	assert_eq!(
+		record.outbound_amount_forwarded_msat,
+		Some(event_payment.outbound_amount_forwarded_msat)
+	);
+	assert_eq!(record.total_fee_earned_msat, event_payment.total_fee_earned_msat);
+	assert_eq!(record.skimmed_fee_msat, event_payment.skimmed_fee_msat);
+	assert_eq!(record.claim_from_onchain_tx, event_payment.claim_from_onchain_tx);
 
 	node_c.stop().unwrap();
+
+	// Reopen the same database through LDK Node after stopping the server.
+	let storage_dir_b = server_b.storage_dir.clone();
+	drop(events_b);
+	drop(server_b);
+	let mnemonic_b = std::fs::read_to_string(storage_dir_b.join("keys_mnemonic")).unwrap();
+	let entropy_b = ldk_node::entropy::NodeEntropy::from_bip39_mnemonic(
+		ldk_node::bip39::Mnemonic::from_str(mnemonic_b.trim()).unwrap(),
+		None,
+	);
+	let mut builder_b = ldk_node::Builder::from_config(ldk_node::config::Config {
+		network: ldk_node::bitcoin::Network::Regtest,
+		storage_dir_path: storage_dir_b.join("regtest").to_str().unwrap().to_string(),
+		forwarded_payment_tracking_mode: ldk_node::config::ForwardedPaymentTrackingMode::Detailed,
+		..Default::default()
+	});
+	let (host, port, user, password) = bitcoind.rpc_details();
+	builder_b.set_chain_source_bitcoind_rpc(host, port, user, password, None);
+	let node_b = builder_b.build(entropy_b).unwrap();
+	let persisted = node_b.forwarding_analytics().list_payments(None).unwrap();
+	assert_eq!(persisted.payments.len(), 1);
+	let payment = &persisted.payments[0];
+	let expected = &history.forwarded_payments[0];
+	assert_eq!(payment.id.to_string(), expected.id);
+	assert_eq!(timestamp, payment.forwarded_at_timestamp);
+	assert_eq!(payment.prev_channel_id.to_string(), expected.prev_channel_id);
+	assert_eq!(payment.next_channel_id.to_string(), expected.next_channel_id);
+	assert_eq!(payment.inbound_amount_forwarded_msat, expected.inbound_amount_forwarded_msat);
+	assert_eq!(payment.outbound_amount_forwarded_msat, expected.outbound_amount_forwarded_msat);
+	assert_eq!(payment.total_fee_earned_msat, expected.total_fee_earned_msat);
+	assert_eq!(payment.skimmed_fee_msat, expected.skimmed_fee_msat);
+	assert_eq!(payment.claim_from_onchain_tx, expected.claim_from_onchain_tx);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_hodl_invoice_claim() {
+	enum InvalidClaim {
+		WrongPreimage,
+		InsufficientAmount,
+	}
+
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Test optional amount verification and rejected claim inputs.
+	let test_cases = [
+		([42u8; 32], Some("10000000msat"), None),
+		([44u8; 32], None, None),
+		([45u8; 32], Some("10000000msat"), Some(InvalidClaim::WrongPreimage)),
+		([46u8; 32], Some("10000000msat"), Some(InvalidClaim::InsufficientAmount)),
+	];
+
+	for (preimage_bytes, amount, invalid_claim) in &test_cases {
+		let preimage_hex = preimage_bytes.to_lower_hex_string();
+		let payment_hash_hex =
+			sha256::Hash::hash(preimage_bytes).to_byte_array().to_lower_hex_string();
+
+		// Create hodl invoice on B
+		let invoice_resp = run_cli(
+			&server_b,
+			&[
+				"bolt11-receive-for-hash",
+				&payment_hash_hex,
+				"10000000msat",
+				"-d",
+				"hodl test",
+				"-e",
+				"3600",
+			],
+		);
+		let invoice = invoice_resp["invoice"].as_str().unwrap();
+
+		// Pay the hodl invoice from A
+		run_cli(&server_a, &["bolt11-send", invoice]);
+
+		// Wait for PaymentClaimable event on B (drain other events)
+		let claimable =
+			wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentClaimable(_))).await;
+		let Some(Event::PaymentClaimable(claimable_event)) = &claimable.event else {
+			panic!("expected PaymentClaimable");
+		};
+		assert!(claimable_event.claim_deadline.is_some());
+		assert!(!claimable_event.payment_id.is_empty());
+
+		if let Some(invalid_claim) = invalid_claim {
+			let invalid_preimage = [99u8; 32].to_lower_hex_string();
+			let (attempted_preimage, attempted_amount) = match invalid_claim {
+				InvalidClaim::WrongPreimage => (&invalid_preimage, Some(10_000_000)),
+				InvalidClaim::InsufficientAmount => (&preimage_hex, Some(9_999_999)),
+			};
+			let error = server_b
+				.client()
+				.bolt11_claim_for_id(Bolt11ClaimForIdRequest {
+					payment_id: claimable_event.payment_id.clone(),
+					claimable_amount_msat: attempted_amount,
+					preimage: attempted_preimage.clone(),
+				})
+				.await
+				.unwrap_err();
+			assert_eq!(error.error_code, InvalidRequestError);
+		}
+
+		// Claim the payment on B
+		let mut args: Vec<&str> =
+			vec!["bolt11-claim-for-id", &claimable_event.payment_id, &preimage_hex];
+		if let Some(amt) = amount {
+			args.extend(["-c", amt]);
+		}
+		run_cli(&server_b, &args);
+
+		// Wait for PaymentSuccessful on A after claim (drain other events)
+		let successful =
+			wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+		let Some(Event::PaymentSuccessful(event)) = &successful.event else {
+			panic!("expected PaymentSuccessful");
+		};
+		assert!(!event.payment.as_ref().unwrap().payment_id.is_empty());
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_hodl_invoice_fail() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Generate a known preimage and compute its payment hash
+	let preimage_bytes = [43u8; 32];
+	let payment_hash = sha256::Hash::hash(&preimage_bytes);
+	let payment_hash_hex = payment_hash.to_byte_array().to_lower_hex_string();
+
+	// Create hodl invoice on B
+	let invoice_resp = run_cli(
+		&server_b,
+		&[
+			"bolt11-receive-for-hash",
+			&payment_hash_hex,
+			"10000000msat",
+			"-d",
+			"hodl fail test",
+			"-e",
+			"3600",
+		],
+	);
+	let invoice = invoice_resp["invoice"].as_str().unwrap();
+
+	// Pay the hodl invoice from A
+	run_cli(&server_a, &["bolt11-send", invoice]);
+
+	// Verify PaymentClaimable event on B
+	let event_b = wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentClaimable(_))).await;
+	let Some(Event::PaymentClaimable(claimable)) = &event_b.event else {
+		panic!("expected PaymentClaimable");
+	};
+	assert!(!claimable.payment_id.is_empty());
+	let unknown_payment_id = "00".repeat(32);
+	assert_ne!(claimable.payment_id, unknown_payment_id);
+	let error = server_b
+		.client()
+		.bolt11_fail_for_id(Bolt11FailForIdRequest { payment_id: unknown_payment_id })
+		.await
+		.unwrap_err();
+	assert_eq!(error.error_code, InvalidRequestError);
+
+	// Fail the payment on B using CLI
+	run_cli(&server_b, &["bolt11-fail-for-id", &claimable.payment_id]);
+
+	// Verify PaymentFailed on A and its failure reason.
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentFailed(_))).await;
+	let Some(Event::PaymentFailed(failed)) = &event_a.event else {
+		panic!("expected PaymentFailed");
+	};
+	assert!(!failed.payment.as_ref().unwrap().payment_id.is_empty());
+	assert_eq!(failed.reason, Some(PaymentFailureReason::RecipientRejected as i32));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_jit_hodl_invoice_claim() {
+	let bitcoind = TestBitcoind::new();
+
+	// A: normal payer node
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+
+	// Subscribe to events on A before any payments
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+
+	// B: LSP node (all e2e servers include LSPS2 service config)
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	// Open channel A -> B (1M sats, larger for JIT forwarding)
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 1_000_000).await;
+
+	// Fund B additionally so it can open JIT channel to C
+	let addr_b = server_b.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	bitcoind.fund_address(&addr_b, 1.0);
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+
+	// C: JIT client
+	let lsp_pubkey = server_b.node_id().to_string();
+	let lsp_addr = format!("127.0.0.1:{}", server_b.p2p_port);
+	let server_c = LdkServerHandle::start_with_config(&bitcoind, |params| {
+		TestConfigBuilder::new(params).lsps_client(&lsp_pubkey, &lsp_addr, true).build()
+	})
+	.await;
+	let mut events_c = server_c.client().subscribe_events().await.unwrap();
+
+	let preimage_bytes_1 = [43u8; 32];
+	let preimage_hex_1 = preimage_bytes_1.to_lower_hex_string();
+	let payment_hash_1 = sha256::Hash::hash(&preimage_bytes_1);
+	let payment_hash_hex_1 = payment_hash_1.to_byte_array().to_lower_hex_string();
+
+	let preimage_bytes_2 = [44u8; 32];
+	let payment_hash_2 = sha256::Hash::hash(&preimage_bytes_2);
+	let payment_hash_hex_2 = payment_hash_2.to_byte_array().to_lower_hex_string();
+
+	// Create fixed amount hodl invoice on c
+	let invoice_resp_1 = run_cli(
+		&server_c,
+		&[
+			"bolt11-receive-via-jit-channel-for-hash",
+			&payment_hash_hex_1,
+			"100000000msat",
+			"-d",
+			"jit hodl test",
+			"-e",
+			"3600",
+		],
+	);
+	let invoice_1 = invoice_resp_1["invoice"].as_str().unwrap();
+	assert!(!invoice_1.is_empty());
+
+	// Create variable amount hodl invoice on c
+	let invoice_resp_2 = run_cli(
+		&server_c,
+		&[
+			"bolt11-receive-variable-amount-via-jit-channel-for-hash",
+			&payment_hash_hex_2,
+			"-d",
+			"jit variable hodl test",
+			"-e",
+			"3600",
+		],
+	);
+	let invoice_2 = invoice_resp_2["invoice"].as_str().unwrap();
+	assert!(!invoice_2.is_empty());
+
+	// Pay the hodl invoice from A
+	run_cli(&server_a, &["bolt11-send", invoice_1]);
+
+	// Wait for PaymentClaimable event on C (drain other events)
+	let claimable =
+		wait_for_event(&mut events_c, |e| matches!(e, Event::PaymentClaimable(_))).await;
+	let Some(Event::PaymentClaimable(claimable_event)) = &claimable.event else {
+		panic!("expected PaymentClaimable");
+	};
+	assert!(claimable_event.claim_deadline.is_some());
+	assert!(!claimable_event.payment_id.is_empty());
+
+	// Claim the payment on C
+	let claimable_amount = format!("{}msat", claimable_event.claimable_amount_msat);
+	let args: Vec<&str> = vec![
+		"bolt11-claim-for-id",
+		&claimable_event.payment_id,
+		&preimage_hex_1,
+		"-c",
+		&claimable_amount,
+	];
+
+	run_cli(&server_c, &args);
+
+	// Wait for PaymentSuccessful on A after claim (drain other events)
+	let successful =
+		wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentSuccessful(_))).await;
+	let Some(Event::PaymentSuccessful(event)) = &successful.event else {
+		panic!("expected PaymentSuccessful");
+	};
+	assert!(!event.payment.as_ref().unwrap().payment_id.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_jit_hodl_invoice_fail() {
+	let bitcoind = TestBitcoind::new();
+
+	// A: normal payer node
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+
+	// Subscribe to events on A before any payments
+	let mut events_a = server_a.client().subscribe_events().await.unwrap();
+
+	// B: LSP node (all e2e servers include LSPS2 service config)
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	// Open channel A -> B (1M sats, larger for JIT forwarding)
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 1_000_000).await;
+
+	// Fund B additionally so it can open JIT channel to C
+	let addr_b = server_b.client().onchain_receive(OnchainReceiveRequest {}).await.unwrap().address;
+	bitcoind.fund_address(&addr_b, 1.0);
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+
+	// C: JIT client
+	let lsp_pubkey = server_b.node_id().to_string();
+	let lsp_addr = format!("127.0.0.1:{}", server_b.p2p_port);
+	let server_c = LdkServerHandle::start_with_config(&bitcoind, |params| {
+		TestConfigBuilder::new(params).lsps_client(&lsp_pubkey, &lsp_addr, true).build()
+	})
+	.await;
+	let mut events_c = server_c.client().subscribe_events().await.unwrap();
+
+	let preimage_bytes = [43u8; 32];
+	let payment_hash = sha256::Hash::hash(&preimage_bytes);
+	let payment_hash_hex = payment_hash.to_byte_array().to_lower_hex_string();
+
+	// Create fixed amount hodl invoice on c
+	let invoice_resp = run_cli(
+		&server_c,
+		&[
+			"bolt11-receive-via-jit-channel-for-hash",
+			&payment_hash_hex,
+			"100000000msat",
+			"-d",
+			"jit hodl test",
+			"-e",
+			"3600",
+		],
+	);
+	let invoice = invoice_resp["invoice"].as_str().unwrap();
+	assert!(!invoice.is_empty());
+
+	// Pay the hodl invoice from A
+	run_cli(&server_a, &["bolt11-send", invoice]);
+
+	// Wait for PaymentClaimable event on C (drain other events)
+	let claimable =
+		wait_for_event(&mut events_c, |e| matches!(e, Event::PaymentClaimable(_))).await;
+	let Some(Event::PaymentClaimable(claimable_event)) = &claimable.event else {
+		panic!("expected PaymentClaimable");
+	};
+	assert!(claimable_event.claim_deadline.is_some());
+	assert!(!claimable_event.payment_id.is_empty());
+
+	run_cli(&server_c, &["bolt11-fail-for-id", &claimable_event.payment_id]);
+
+	// Verify PaymentFailed on A and its failure reason.
+	let event_a = wait_for_event(&mut events_a, |e| matches!(e, Event::PaymentFailed(_))).await;
+	let Some(Event::PaymentFailed(failed)) = &event_a.event else {
+		panic!("expected PaymentFailed");
+	};
+	assert!(!failed.payment.as_ref().unwrap().payment_id.is_empty());
+	assert_eq!(failed.reason, Some(PaymentFailureReason::RecipientRejected as i32));
+}
+
+#[tokio::test]
+async fn test_metrics_endpoint() {
+	let bitcoind = TestBitcoind::new();
+
+	// Test with metrics enabled
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let client = server_a.client();
+	let metrics_result = client.get_metrics().await;
+
+	assert!(metrics_result.is_ok(), "Expected metrics to succeed when enabled");
+	let metrics = metrics_result.unwrap();
+
+	// Verify initial state
+	assert!(metrics.contains("ldk_server_total_peers_count 0"));
+	assert!(metrics.contains("ldk_server_total_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_successful_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_pending_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_failed_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_channels_count 0"));
+	assert!(metrics.contains("ldk_server_total_public_channels_count 0"));
+	assert!(metrics.contains("ldk_server_total_private_channels_count 0"));
+	assert!(metrics.contains("ldk_server_total_onchain_balance_sats 0"));
+	assert!(metrics.contains("ldk_server_spendable_onchain_balance_sats 0"));
+	assert!(metrics.contains("ldk_server_total_anchor_channels_reserve_sats 0"));
+	assert!(metrics.contains("ldk_server_total_lightning_balance_sats 0"));
+
+	// Set up the channel and confirm the wallet deposit and channel funding transaction.
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+	mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+
+	// Wait for both onchain payments and the channel, peer and balance metrics.
+	let timeout = Duration::from_secs(10);
+	let start = std::time::Instant::now();
+	loop {
+		let metrics = client.get_metrics().await.unwrap();
+		if metrics.contains("ldk_server_total_peers_count 1")
+			&& metrics.contains("ldk_server_total_channels_count 1")
+			&& metrics.contains("ldk_server_total_public_channels_count 1")
+			&& metrics.contains("ldk_server_total_payments_count 2\n")
+			&& metrics.contains("ldk_server_total_successful_payments_count 2\n")
+			&& metrics.contains("ldk_server_total_pending_payments_count 0\n")
+			&& metrics.contains("ldk_server_total_failed_payments_count 0\n")
+			&& !metrics.contains("ldk_server_total_lightning_balance_sats 0")
+			&& !metrics.contains("ldk_server_total_onchain_balance_sats 0")
+			&& !metrics.contains("ldk_server_spendable_onchain_balance_sats 0")
+			&& !metrics.contains("ldk_server_total_anchor_channels_reserve_sats 0")
+		{
+			break;
+		}
+
+		if start.elapsed() > timeout {
+			let current_metrics = client.get_metrics().await.unwrap();
+			panic!(
+				"Timed out waiting for channel, peer and balance metrics to update. Current metrics:\n{}",
+				current_metrics
+			);
+		}
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	}
+
+	send_bolt11_payment(&server_a, &server_b, 10_000_000).await;
+
+	// The deposit, channel funding and BOLT11 payment must all be counted as successful.
+	let timeout = Duration::from_secs(30);
+	let start = std::time::Instant::now();
+	loop {
+		let metrics = client.get_metrics().await.unwrap();
+		if metrics.contains("ldk_server_total_payments_count 3\n")
+			&& metrics.contains("ldk_server_total_successful_payments_count 3\n")
+			&& metrics.contains("ldk_server_total_pending_payments_count 0\n")
+			&& metrics.contains("ldk_server_total_failed_payments_count 0\n")
+			&& !metrics.contains("ldk_server_total_lightning_balance_sats 0")
+			&& !metrics.contains("ldk_server_total_onchain_balance_sats 0")
+			&& !metrics.contains("ldk_server_spendable_onchain_balance_sats 0")
+			&& !metrics.contains("ldk_server_total_anchor_channels_reserve_sats 0")
+		{
+			break;
+		}
+		if start.elapsed() > timeout {
+			panic!("Timed out waiting for payment metrics to update. Current metrics:\n{metrics}");
+		}
+		tokio::time::sleep(Duration::from_millis(500)).await;
+	}
+}
+
+#[tokio::test]
+async fn test_metrics_endpoint_with_auth() {
+	let bitcoind = TestBitcoind::new();
+
+	let username = "admin";
+	let password = "password123";
+
+	let config =
+		LdkServerConfig { metrics_auth: Some((username.to_string(), password.to_string())) };
+
+	let server = LdkServerHandle::start_with_options(&bitcoind, config).await;
+	let client = server.client();
+
+	// Should fail because auth is provided in the config
+	let result = client.get_metrics().await;
+	assert!(result.is_err(), "Expected failure without credentials");
+
+	// Request has the correct auth, so it should succeed
+	let result = client.get_metrics_with_auth(Some(username), Some(password)).await;
+
+	assert!(result.is_ok(), "Expected success with correct credentials");
+	let metrics = result.unwrap();
+
+	assert!(metrics.contains("ldk_server_total_peers_count 0"));
+	assert!(metrics.contains("ldk_server_total_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_successful_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_pending_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_failed_payments_count 0"));
+	assert!(metrics.contains("ldk_server_total_channels_count 0"));
+	assert!(metrics.contains("ldk_server_total_public_channels_count 0"));
+	assert!(metrics.contains("ldk_server_total_private_channels_count 0"));
+	assert!(metrics.contains("ldk_server_total_onchain_balance_sats 0"));
+	assert!(metrics.contains("ldk_server_spendable_onchain_balance_sats 0"));
+	assert!(metrics.contains("ldk_server_total_anchor_channels_reserve_sats 0"));
+	assert!(metrics.contains("ldk_server_total_lightning_balance_sats 0"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_cli_spontaneous_send_with_preimage() {
+	let bitcoind = TestBitcoind::new();
+	let server_a = LdkServerHandle::start(&bitcoind).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// Generate a known preimage and compute its payment hash
+	let preimage_bytes = [43u8; 32];
+	let preimage_hex = preimage_bytes.to_lower_hex_string();
+	let payment_hash = sha256::Hash::hash(&preimage_bytes);
+	let payment_hash_hex = payment_hash.to_byte_array().to_lower_hex_string();
+
+	let output = run_cli(
+		&server_a,
+		&["spontaneous-send", server_b.node_id(), "10000sat", "--preimage", &preimage_hex],
+	);
+
+	assert!(!output["payment_id"].as_str().unwrap().is_empty());
+
+	// The receiver must observe in PaymentReceived for checking on Spontaneous payment.
+	let event_b = wait_for_event(&mut events_b, |e| matches!(e, Event::PaymentReceived(_))).await;
+	let Some(Event::PaymentReceived(pr)) = event_b.event else {
+		panic!("expected PaymentReceived");
+	};
+	let payment = pr.payment.unwrap();
+	assert!(!payment.payment_id.is_empty());
+
+	let Some(payment_kind::Kind::Spontaneous(spont)) = payment.kind.unwrap().kind else {
+		panic!("expected spontaneous kind");
+	};
+	assert_eq!(spont.hash, payment_hash_hex);
 }

@@ -7,14 +7,17 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-use ldk_server_protos::api::{Bolt11ReceiveRequest, Bolt11ReceiveResponse};
+use std::sync::Arc;
+
+use hex::DisplayHex;
+use ldk_server_grpc::api::{Bolt11ReceiveRequest, Bolt11ReceiveResponse};
 
 use crate::api::error::LdkServerError;
 use crate::service::Context;
 use crate::util::proto_adapter::proto_to_bolt11_description;
 
-pub(crate) fn handle_bolt11_receive_request(
-	context: Context, request: Bolt11ReceiveRequest,
+pub(crate) async fn handle_bolt11_receive_request(
+	context: Arc<Context>, request: Bolt11ReceiveRequest,
 ) -> Result<Bolt11ReceiveResponse, LdkServerError> {
 	let description = proto_to_bolt11_description(request.description)?;
 	let invoice = match request.amount_msat {
@@ -27,6 +30,9 @@ pub(crate) fn handle_bolt11_receive_request(
 			.receive_variable_amount(&description, request.expiry_secs)?,
 	};
 
-	let response = Bolt11ReceiveResponse { invoice: invoice.to_string() };
+	let payment_hash = invoice.payment_hash().0.to_lower_hex_string();
+	let payment_secret = invoice.payment_secret().0.to_lower_hex_string();
+	let response =
+		Bolt11ReceiveResponse { invoice: invoice.to_string(), payment_hash, payment_secret };
 	Ok(response)
 }

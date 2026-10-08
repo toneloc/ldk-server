@@ -1,0 +1,169 @@
+# Lightning node settings
+[node]
+network = "regtest"                           # Bitcoin network to use
+listening_addresses = ["localhost:9735"]      # Lightning node listening addresses
+#announcement_addresses = ["54.3.7.81:9735"]  # Lightning node announcement addresses
+#grpc_service_address = "127.0.0.1:3536"      # LDK Server gRPC address (optional, defaults to 127.0.0.1:3536)
+alias = "ldk_server"                          # Lightning node alias
+#pathfinding_scores_source_url = "https://rapidsync.lightningdevkit.org/scoring/scorer.bin"  # External pathfinding scores source (optional, defaults to this URL on mainnet; set to "" to disable)
+#rgs_server_url = "https://rapidsync.lightningdevkit.org/snapshot/v2/"  # Optional: RGS URL for rapid gossip sync
+#async_payments_role = "client"               # Optional async payments role: "client" or "server"
+#enable_zero_fee_commitments = false          # Enable zero-fee commitment channels (default: false)
+
+# Forwarding history: "detailed" retains individual records for the current and previous hour,
+# then aggregates them into hourly channel-pair statistics and removes the individual records.
+# "stats" updates per-channel totals directly without storing individual forwards.
+#forwarded_payment_tracking_mode = "stats"    # Default: "stats"
+
+# Background probing service (optional)
+# CAUTION: Probes send real HTLCs and can lock outbound liquidity until they time out.
+# See docs/configuration.md for complete field descriptions.
+# Set only the field required by the selected strategy.
+# "high_degree" requires top_node_count. "random_walk" requires max_hops.
+#[probing]
+#strategy = "high_degree"                     # Required. No default. See the strategy recommendations in the documentation.
+#top_node_count = 100                          # Required for "high_degree". No default. Start with 100.
+# max_hops must be at least 2. LDK Node changes values greater than 19 to 19.
+#max_hops = 5                                  # Required for "random_walk". No default. Start with 5.
+#interval_secs = 10                            # Time between probe attempts (default: 10 seconds)
+# Built-in probes use at least 1000000 msat before routing fees. Lower limits prevent all probes.
+#max_locked_msat = 100000000                   # Maximum total in-flight probe liquidity (default: 100k sats)
+# This virtual scorer cost is not paid. It decreases to zero over 24 hours.
+#diversity_penalty_msat = 250                  # Optional. Only affects "high_degree".
+#cooldown_secs = 3600                          # Node re-probe cooldown for "high_degree" (default: 1 hour)
+
+# Storage settings
+[storage.disk]
+dir_path = "/tmp/ldk-server/"                 # Path for local ldk-server data, optional, defaults to ~/Library/Application Support/ldk-server/ on macOS, ~/.ldk-server/ on Linux
+
+# Optional LDK Node PostgreSQL storage for wallet state, channel state, payment history, and forwarding history.
+#[storage.postgres]
+#connection_string = "postgresql://postgres:postgres@localhost:5432" # PostgreSQL connection string. Do not include dbname if db_name is set.
+#db_name = "ldk_db"                         # Optional database name.
+#kv_table_name = "ldk_data"                 # Optional KV table name.
+#certificate_path = "/path/to/postgres-ca.pem" # PEM-encoded CA certificate required to enable PostgreSQL TLS.
+# Without certificate_path, the default sslmode=prefer uses plaintext; sslmode=require fails to connect.
+# With certificate_path, TLS is required; sslmode=disable is rejected.
+
+[log]
+level = "Debug"                               # Log level (Error, Warn, Info, Debug, Trace)
+#file = "/tmp/ldk-server/ldk-server.log"      # Log file path
+# Enabling `log_to_file` writes logs to the configured file while still keeping 
+# the `stdout`/`stderr` logs available too. Logs files are automatically rotated at # `max_size_mb` or `rotation_interval_hours`.
+#
+# To disable the internal rotation and keep logging to file, set `max_size_mb` # and `rotation_interval_hours` params to `0`.
+log_to_file = true                            # Enable logging to a file (default: true, also logs to both stdout and stderr)
+#max_size_mb = 50                             # Max size of log file before rotation (default: 50MB)
+#rotation_interval_hours = 24                 # Max age of log file before rotation (default: 24h)
+#max_files = 5                                # Number of rotated log files to keep (default: 5)
+
+[tls]
+#cert_path = "/path/to/tls.crt"               # Path to TLS certificate, by default uses dir_path/tls.crt
+#key_path = "/path/to/tls.key"                # Path to TLS private key, by default uses dir_path/tls.key
+# For CA-signed certs, point cert_path/key_path to your ACME output files.
+#hosts = ["example.com"]                      # Allowed hosts for TLS, will always include "localhost" and "127.0.0.1"
+
+# Must set one of bitcoind, electrum, or esplora
+
+# Bitcoin Core settings
+[bitcoind]
+rpc_address = "127.0.0.1:18444"               # RPC endpoint
+rpc_user = "polaruser"                        # RPC username
+rpc_password = "polarpass"                    # RPC password
+# Optional: source block/header/tx data from Bitcoin Core's REST interface instead of RPC.
+# RPC above is still used for calls REST doesn't support (e.g. transaction broadcast).
+# Normally the same host:port as rpc_address.
+#rest_address = "127.0.0.1:18444"
+
+# Electrum settings
+[electrum]
+server_url = "ssl://electrum.blockstream.info:50002"  # Electrum endpoint
+# server_url = "tcp://electrum.blockstream.info:50001"
+
+# Esplora settings
+[esplora]
+server_url = "https://mempool.space/api"      # Esplora endpoint
+
+# LSPS Client Support
+# Repeat this section to register several LSPs. Supported protocols are discovered per
+# LSP via bLIP-50 / LSPS0 on startup. Only LSPS2 is supported at present.
+[[liquidity.lsps_client]]
+# The public key of the LSP we source inbound liquidity from.
+node_pubkey = "<lsp node pubkey>"
+# Address to connect to the LSP (IPv4:port, IPv6:port, OnionV3:port, or hostname:port).
+address = "<lsp ip address>:9735"
+# Optional token for authenticating to the LSP.
+# token = ""
+# Accept 0-confirmation channels opened by this LSP. Required for JIT channels to be
+# usable before the funding transaction confirms.
+trust_peer_0conf = true
+
+# Experimental LSPS2 Service Support
+# CAUTION: LSPS2 support is highly experimental and for testing purposes only.
+[liquidity.lsps2_service]
+# Indicates whether the LSPS service will be announced via the gossip network.
+advertise_service = false
+
+# The fee we withhold for the channel open from the initial payment.
+channel_opening_fee_ppm = 1000            # 0.1% fee
+
+# The proportional overprovisioning for the channel.
+channel_over_provisioning_ppm = 500000    # 50% extra capacity
+
+# The minimum fee required for opening a channel.
+min_channel_opening_fee_msat = 10000000   # 10,000 satoshis
+
+# The minimum number of blocks after confirmation we promise to keep the channel open.
+min_channel_lifetime = 4320               # ~30 days
+
+# The maximum number of blocks that the client is allowed to set its `to_self_delay` parameter.
+max_client_to_self_delay = 1440           # ~10 days
+
+# The minimum payment size that we will accept when opening a channel.
+min_payment_size_msat = 10000000          # 10,000 satoshis
+
+# The maximum payment size that we will accept when opening a channel.
+max_payment_size_msat = 25000000000       # 0.25 BTC
+
+# Use the 'client-trusts-LSP' trust model.
+# When set, the service will delay broadcasting the JIT channel's
+# funding transaction until the client claimed sufficient HTLC parts to pay for the channel open.
+client_trusts_lsp = false
+
+# When set, we will allow clients to spend their entire channel balance in the channels
+# we open to them. This allows clients to try to steal your channel balance with
+# no financial penalty, so this should only be set if you trust your clients.
+#
+# See the `disable_counterparty_reserve` argument of `open_channel` to manually open these channels.
+disable_client_reserve = false
+
+# Optional token for clients (uncomment and set if required)
+## A token we may require to be sent by the clients.
+## If set, only requests matching this token will be accepted. (uncomment and set if required)
+# require_token = ""
+
+# Metrics settings
+[metrics]
+enabled = false
+poll_metrics_interval = 60       # The polling interval for metrics in seconds. Defaults to 60secs if unset and metrics enabled.
+# The auth details below are optional, but uncommenting the fields means enabling basic auth, so valid fields must be supplied.
+#username = ""               # The username required to access the metrics endpoint (Basic Auth).
+#password = ""               # The password required to access the metrics endpoint (Basic Auth).
+
+# Tor Config
+[tor]
+# Only connections to OnionV3 peers will be made via this proxy; other connections (IPv4 peers, Electrum server) will not be routed over Tor.
+#proxy_address = "127.0.0.1:9050"      # Tor daemon SOCKS proxy address.
+
+# Human-Readable Names (BIP 353) resolution
+[hrn]
+# Resolution method: "dns" (resolve locally via a DNS server) or "blip32" (ask other
+# nodes to resolve for us via bLIP-32). Defaults to "dns".
+#mode = "dns"
+# DNS server used when `mode = "dns"`. Defaults to 8.8.8.8:53 (Google Public DNS). The
+# port defaults to 53 if omitted (e.g., "1.1.1.1" is treated as "1.1.1.1:53").
+#dns_server_address = "8.8.8.8:53"
+# When set to true (and `mode = "dns"`), also offer HRN resolution to the rest of the
+# network over Onion Messages. Requires the node to be announceable so resolution
+# requests can be routed to us. Defaults to false.
+#enable_resolution_service = false

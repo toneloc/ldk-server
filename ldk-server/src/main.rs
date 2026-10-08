@@ -8,52 +8,52 @@
 // licenses.
 
 mod api;
-mod io;
+mod macaroons;
 mod service;
 mod util;
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use clap::Parser;
 use hex::DisplayHex;
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper::server::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use ldk_node::bitcoin::Network;
-use ldk_node::config::Config;
-use ldk_node::entropy::NodeEntropy;
+use ldk_node::config::{Config, ElectrumSyncConfig, EsploraSyncConfig};
+use ldk_node::lightning::events::{ClosureReason, PaymentFailureReason};
 use ldk_node::lightning::ln::channelmanager::PaymentId;
-use ldk_node::{Builder, Event, Node};
-use ldk_server_protos::events;
-use ldk_server_protos::events::{event_envelope, EventEnvelope};
-use ldk_server_protos::types::Payment;
+use ldk_node::lightning::ln::types::ChannelId;
+use ldk_node::lightning::util::ser::Writeable;
+use ldk_node::{Builder, CustomTlvRecord, Event, Node};
+use ldk_server_grpc::events;
+use ldk_server_grpc::events::{event_envelope, EventEnvelope};
+use ldk_server_grpc::types::{HtlcLocator, Payment};
 use log::{debug, error, info};
+#[cfg(test)]
 use prost::Message;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal::unix::SignalKind;
+use tokio::sync::broadcast;
 
-use crate::io::events::event_publisher::EventPublisher;
-use crate::io::events::get_event_name;
-#[cfg(feature = "events-rabbitmq")]
-use crate::io::events::rabbitmq::{RabbitMqConfig, RabbitMqEventPublisher};
-use crate::io::persist::paginated_kv_store::PaginatedKVStore;
-use crate::io::persist::sqlite_store::SqliteStore;
-use crate::io::persist::{
-	FORWARDED_PAYMENTS_PERSISTENCE_PRIMARY_NAMESPACE,
-	FORWARDED_PAYMENTS_PERSISTENCE_SECONDARY_NAMESPACE, PAYMENTS_PERSISTENCE_PRIMARY_NAMESPACE,
-	PAYMENTS_PERSISTENCE_SECONDARY_NAMESPACE,
-};
+use crate::api::node_to_proto_custom_tlv;
+use crate::macaroons::MacaroonStore;
 use crate::service::NodeService;
-use crate::util::config::{load_config, ArgsConfig, ChainSource};
-use crate::util::logger::ServerLogger;
-use crate::util::proto_adapter::{forwarded_payment_to_proto, payment_to_proto};
+use crate::util::config::{load_config, ArgsConfig, ChainSource, LdkNodeStorageConfig};
+use crate::util::logger::{LogConfig, ServerLogger};
+use crate::util::metrics::Metrics;
+use crate::util::proto_adapter::payment_to_proto;
 use crate::util::tls::get_or_generate_tls_config;
+use crate::util::{systemd, write_new};
 
-const API_KEY_FILE: &str = "api_key";
+const LDK_NODE_POSTGRES_LOCK_FILE: &str = "ldk_node_postgres.lock";
+pub(crate) const FULL_VERSION: &str =
+	concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
 
 pub fn get_default_data_dir() -> Option<PathBuf> {
 	#[cfg(target_os = "macos")]
@@ -109,18 +109,29 @@ fn main() {
 		Network::Regtest => storage_dir.join("regtest"),
 	};
 
-	let log_file_path = config_file.log_file_path.map(PathBuf::from).unwrap_or_else(|| {
-		let mut default_log_path = network_dir.clone();
-		default_log_path.push("ldk-server.log");
-		default_log_path
-	});
+	let log_file_path = if config_file.log_to_file {
+		let path = config_file.log_file_path.map(PathBuf::from).unwrap_or_else(|| {
+			let mut default_log_path = network_dir.clone();
+			default_log_path.push("ldk-server.log");
+			default_log_path
+		});
 
-	if log_file_path == storage_dir || log_file_path == network_dir {
-		eprintln!("Log file path cannot be the same as storage directory path.");
-		std::process::exit(-1);
-	}
+		if path == storage_dir || path == network_dir {
+			eprintln!("Log file path cannot be the same as storage directory path.");
+			std::process::exit(-1);
+		}
+		Some(path)
+	} else {
+		None
+	};
 
-	let logger = match ServerLogger::init(config_file.log_level, &log_file_path) {
+	let log_config = LogConfig {
+		log_max_files: config_file.log_max_files,
+		log_max_size_bytes: config_file.log_max_size_bytes,
+		log_rotation_interval_secs: config_file.log_rotation_interval_secs,
+	};
+
+	let logger = match ServerLogger::init(config_file.log_level, log_file_path, log_config) {
 		Ok(logger) => logger,
 		Err(e) => {
 			eprintln!("Failed to initialize logger: {e}");
@@ -128,10 +139,10 @@ fn main() {
 		},
 	};
 
-	let api_key = match load_or_generate_api_key(&network_dir) {
-		Ok(key) => key,
+	let macaroon_store = match MacaroonStore::load_or_create(&network_dir) {
+		Ok(store) => Arc::new(store),
 		Err(e) => {
-			eprintln!("Failed to load or generate API key: {e}");
+			eprintln!("Failed to load or create macaroons: {e}");
 			std::process::exit(-1);
 		},
 	};
@@ -140,6 +151,13 @@ fn main() {
 	ldk_node_config.listening_addresses = config_file.listening_addrs;
 	ldk_node_config.announcement_addresses = config_file.announcement_addrs;
 	ldk_node_config.network = config_file.network;
+	ldk_node_config.forwarded_payment_tracking_mode = config_file.forwarded_payment_tracking_mode;
+	ldk_node_config.hrn_config = config_file.hrn_config;
+	ldk_node_config.anchor_channels_config.enable_zero_fee_commitments =
+		config_file.enable_zero_fee_commitments;
+	// The server exposes receive-for-hash APIs, so unknown inbound BOLT11 HTLCs
+	// must emit PaymentClaimable instead of being failed back.
+	ldk_node_config.manually_handle_unknown_bolt11_payments = true;
 
 	let mut builder = Builder::from_config(ldk_node_config);
 	builder.set_log_facade_logger();
@@ -152,20 +170,91 @@ fn main() {
 	}
 
 	match config_file.chain_source {
-		ChainSource::Rpc { rpc_host, rpc_port, rpc_user, rpc_password } => {
-			builder.set_chain_source_bitcoind_rpc(rpc_host, rpc_port, rpc_user, rpc_password);
+		ChainSource::Rpc {
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+			rest_host,
+			rest_port,
+			wallet_rescan_from_height,
+		} => match (rest_host, rest_port) {
+			(Some(rest_host), Some(rest_port)) => {
+				builder.set_chain_source_bitcoind_rest(
+					rest_host,
+					rest_port,
+					rpc_host,
+					rpc_port,
+					rpc_user,
+					rpc_password,
+					wallet_rescan_from_height,
+				);
+			},
+			_ => {
+				builder.set_chain_source_bitcoind_rpc(
+					rpc_host,
+					rpc_port,
+					rpc_user,
+					rpc_password,
+					wallet_rescan_from_height,
+				);
+			},
 		},
-		ChainSource::Electrum { server_url } => {
-			builder.set_chain_source_electrum(server_url, None);
+		ChainSource::Electrum { server_url, force_wallet_full_scan } => {
+			let sync_config = force_wallet_full_scan.then(|| ElectrumSyncConfig {
+				force_wallet_full_scan: true,
+				..ElectrumSyncConfig::default()
+			});
+			builder.set_chain_source_electrum(server_url, sync_config);
 		},
-		ChainSource::Esplora { server_url } => {
-			builder.set_chain_source_esplora(server_url, None);
+		ChainSource::Esplora { server_url, force_wallet_full_scan } => {
+			let sync_config = force_wallet_full_scan.then(|| EsploraSyncConfig {
+				force_wallet_full_scan: true,
+				..EsploraSyncConfig::default()
+			});
+			builder.set_chain_source_esplora(server_url, sync_config);
 		},
+	}
+
+	if let Some(pathfinding_scores_source) = config_file.pathfinding_scores_source_url {
+		builder.set_pathfinding_scores_source(pathfinding_scores_source);
+	}
+
+	if let Some(rgs_server_url) = config_file.rgs_server_url {
+		builder.set_gossip_source_rgs(rgs_server_url);
+	}
+
+	if let Some(probing_config) = config_file.probing_config {
+		builder.set_probing_config(probing_config);
+	}
+
+	if let Err(e) = builder.set_async_payments_role(config_file.async_payments_role) {
+		error!("Failed to configure async payments role: {e}");
+		std::process::exit(-1);
+	}
+
+	if let Some(lsps_client_configs) = config_file.lsps_client_config {
+		for lsps_client_config in lsps_client_configs {
+			builder.add_liquidity_source(
+				lsps_client_config.node_id,
+				lsps_client_config.address,
+				lsps_client_config.token,
+				lsps_client_config.trust_peer_0conf,
+			);
+		}
+	}
+
+	if let Some(tor_config) = config_file.tor_config {
+		let tor_config = ldk_node::config::TorConfig { proxy_address: tor_config.proxy_address };
+		if let Err(e) = builder.set_tor_config(tor_config) {
+			error!("Failed to configure Tor proxy: {e}");
+			std::process::exit(-1);
+		}
 	}
 
 	// LSPS2 support is highly experimental and for testing purposes only.
 	#[cfg(feature = "experimental-lsps2-support")]
-	builder.set_liquidity_provider_lsps2(
+	builder.enable_liquidity_provider(
 		config_file.lsps2_service_config.expect("Missing liquidity.lsps2_server config"),
 	);
 
@@ -177,48 +266,47 @@ fn main() {
 		},
 	};
 
-	builder.set_runtime(runtime.handle().clone());
+	if let Err(e) = builder.set_runtime(runtime.handle().clone()) {
+		error!("Failed to set LDK Node runtime: {e}");
+		std::process::exit(-1);
+	}
 
-	let seed_path = storage_dir.join("keys_seed").to_str().unwrap().to_string();
-	let node_entropy = match NodeEntropy::from_seed_path(seed_path) {
+	if let Err(e) =
+		ensure_no_unsupported_storage_migration(&network_dir, &config_file.ldk_node_storage)
+	{
+		error!("{e}");
+		std::process::exit(-1);
+	}
+
+	let node_entropy = match crate::util::entropy::load_or_generate_node_entropy(&storage_dir) {
 		Ok(entropy) => entropy,
 		Err(e) => {
-			error!("Failed to load or generate seed: {e}");
+			error!("Failed to load or generate node entropy: {e}");
 			std::process::exit(-1);
 		},
 	};
 
-	let node = match builder.build(node_entropy) {
-		Ok(node) => Arc::new(node),
+	let uses_postgres =
+		matches!(config_file.ldk_node_storage, LdkNodeStorageConfig::Postgres { .. });
+	let node = match build_node(builder, node_entropy, config_file.ldk_node_storage) {
+		Ok(node) => node,
 		Err(e) => {
 			error!("Failed to build LDK Node: {e}");
 			std::process::exit(-1);
 		},
 	};
+	if uses_postgres {
+		if let Err(e) = persist_postgres_storage_lock(&network_dir) {
+			error!("{e}");
+			std::process::exit(-1);
+		}
+	}
+	let node = Arc::new(node);
 
-	let paginated_store: Arc<dyn PaginatedKVStore> =
-		Arc::new(match SqliteStore::new(network_dir.clone(), None, None) {
-			Ok(store) => store,
-			Err(e) => {
-				error!("Failed to create SqliteStore: {e:?}");
-				std::process::exit(-1);
-			},
-		});
+	let (event_sender, _) = broadcast::channel::<EventEnvelope>(1024);
+	let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-	#[cfg(not(feature = "events-rabbitmq"))]
-	let event_publisher: Arc<dyn EventPublisher> =
-		Arc::new(crate::io::events::event_publisher::NoopEventPublisher);
-
-	#[cfg(feature = "events-rabbitmq")]
-	let event_publisher: Arc<dyn EventPublisher> = {
-		let rabbitmq_config = RabbitMqConfig {
-			connection_string: config_file.rabbitmq_connection_string,
-			exchange_name: config_file.rabbitmq_exchange_name,
-		};
-		Arc::new(RabbitMqEventPublisher::new(rabbitmq_config))
-	};
-
-	info!("Starting up...");
+	info!("Starting ldk-server version {FULL_VERSION}");
 	match node.start() {
 		Ok(()) => {},
 		Err(e) => {
@@ -256,7 +344,45 @@ fn main() {
 			}
 		};
 		let event_node = Arc::clone(&node);
-		let rest_svc_listener = TcpListener::bind(config_file.rest_service_addr)
+		let mut ready_channel_ids: HashSet<ChannelId> = event_node
+			.list_channels()
+			.into_iter()
+			.filter(|channel| channel.is_channel_ready)
+			.map(|channel| channel.channel_id)
+			.collect();
+
+		let metrics: Option<Arc<Metrics>> = if config_file.metrics_enabled {
+			let poll_metrics_interval = Duration::from_secs(config_file.poll_metrics_interval.unwrap_or(60));
+			let metrics_node = Arc::clone(&node);
+			let first_poll = tokio::time::Instant::now() + poll_metrics_interval;
+			let mut interval = tokio::time::interval_at(first_poll, poll_metrics_interval);
+			let metrics = Arc::new(Metrics::new());
+			let metrics_bg = Arc::clone(&metrics);
+
+			// Initialize metrics before the first delayed poll.
+			metrics.initialize_metrics(&metrics_node);
+
+			runtime.spawn(async move {
+				loop {
+					interval.tick().await;
+					metrics_bg.update_all_pollable_metrics(&metrics_node);
+				}
+			});
+			Some(metrics)
+		} else {
+			None
+		};
+
+		let metrics_auth_header = if let (Some(username), Some(password)) =
+			(config_file.metrics_username.as_ref(), config_file.metrics_password.as_ref())
+		{
+			let auth = format!("{}:{}", username, password);
+			Some(format!("Basic {}", BASE64_STANDARD.encode(auth)))
+		} else {
+			None
+		};
+
+		let grpc_listener = TcpListener::bind(config_file.grpc_service_addr)
 			.await
 			.expect("Failed to bind listening port");
 
@@ -271,168 +397,336 @@ fn main() {
 			}
 		};
 		let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-		info!("TLS enabled for REST service on {}", config_file.rest_service_addr);
+		info!("gRPC service listening on {}", config_file.grpc_service_addr);
+
+		systemd::notify_ready();
 
 		loop {
 			select! {
-				event = event_node.next_event_async() => {
-					match event {
-						Event::ChannelPending { channel_id, counterparty_node_id, .. } => {
-							info!(
-								"CHANNEL_PENDING: {} from counterparty {}",
-								channel_id, counterparty_node_id
-							);
-							if let Err(e) = event_node.event_handled() {
-								error!("Failed to mark event as handled: {e}");
+					event = event_node.next_event_async() => {
+						match event {
+							Event::ChannelPending {
+								channel_id,
+								user_channel_id,
+								counterparty_node_id,
+								funding_txo,
+								former_temporary_channel_id,
+							} => {
+								info!(
+									"CHANNEL_PENDING: {} from counterparty {}",
+									channel_id, counterparty_node_id
+								);
+
+								send_channel_state_event(
+									event_envelope::Event::ChannelStateChanged(events::ChannelStateChanged {
+										channel_id: channel_id.0.to_lower_hex_string(),
+										user_channel_id: user_channel_id.0.to_string(),
+										counterparty_node_id: Some(counterparty_node_id.to_string()),
+										state: events::ChannelState::Pending.into(),
+										funding_txo: Some(funding_txo.to_string()),
+										reason: None,
+										closure_initiator: events::ChannelClosureInitiator::Unspecified.into(),
+										former_temporary_channel_id: Some(
+											former_temporary_channel_id.0.to_lower_hex_string(),
+										),
+									}),
+									&event_sender,
+								);
+
+								if let Err(e) = event_node.event_handled() {
+									error!("Failed to mark event as handled: {e}");
+								}
+							},
+							Event::ChannelReady {
+								channel_id,
+								user_channel_id,
+								counterparty_node_id,
+								funding_txo,
+							} => {
+								info!(
+									"CHANNEL_READY: {} from counterparty {:?}",
+									channel_id, counterparty_node_id.map(|p| p.to_string()),
+								);
+
+								let channel_id_hex = channel_id.0.to_lower_hex_string();
+								ready_channel_ids.insert(channel_id);
+
+								send_channel_state_event(
+									event_envelope::Event::ChannelStateChanged(events::ChannelStateChanged {
+										channel_id: channel_id_hex,
+										user_channel_id: user_channel_id.0.to_string(),
+										counterparty_node_id: counterparty_node_id
+											.map(|node_id| node_id.to_string()),
+										state: events::ChannelState::Ready.into(),
+										funding_txo: funding_txo.map(|outpoint| outpoint.to_string()),
+										reason: None,
+										closure_initiator: events::ChannelClosureInitiator::Unspecified.into(),
+										former_temporary_channel_id: None,
+									}),
+									&event_sender,
+								);
+
+								if let Err(e) = event_node.event_handled() {
+									error!("Failed to mark event as handled: {e}");
+								}
+
+							if let Some(metrics) = &metrics {
+								metrics.update_channels_count(false);
 							}
 						},
-						Event::ChannelReady { channel_id, counterparty_node_id, .. } => {
-							info!(
-								"CHANNEL_READY: {} from counterparty {:?}",
-								channel_id, counterparty_node_id
-							);
-							if let Err(e) = event_node.event_handled() {
-								error!("Failed to mark event as handled: {e}");
+							Event::ChannelClosed {
+								channel_id,
+								user_channel_id,
+								counterparty_node_id,
+								reason,
+							} => {
+								info!(
+									"CHANNEL_CLOSED: {} from counterparty {}",
+									channel_id, counterparty_node_id,
+								);
+
+								let channel_id_hex = channel_id.0.to_lower_hex_string();
+								let was_ready = ready_channel_ids.remove(&channel_id);
+								let reason_ref = reason.as_ref();
+								let is_open_failure = !was_ready && is_channel_open_failure(reason_ref);
+
+								send_channel_state_event(
+									event_envelope::Event::ChannelStateChanged(events::ChannelStateChanged {
+										channel_id: channel_id_hex,
+										user_channel_id: user_channel_id.0.to_string(),
+										counterparty_node_id: Some(counterparty_node_id.to_string()),
+										state: if is_open_failure {
+											events::ChannelState::OpenFailed.into()
+										} else {
+											events::ChannelState::Closed.into()
+										},
+										funding_txo: None,
+										reason: reason_ref.map(closure_reason_to_proto),
+										closure_initiator: closure_initiator_from_reason(reason_ref).into(),
+										former_temporary_channel_id: None,
+									}),
+									&event_sender,
+								);
+
+								if let Err(e) = event_node.event_handled() {
+									error!("Failed to mark event as handled: {e}");
+								}
+
+							if let Some(metrics) = &metrics {
+								metrics.update_channels_count(true);
 							}
-						},
-						Event::ChannelClosed { channel_id, reason, .. } => {
-							info!("CHANNEL_CLOSED: {} reason: {:?}", channel_id, reason);
-							if let Err(e) = event_node.event_handled() {
-								error!("Failed to mark event as handled: {e}");
-							}
-						},
-						Event::PaymentReceived { payment_id, payment_hash, amount_msat, custom_records } => {
+						}
+						Event::PaymentReceived {
+							payment_id,
+							payment_hash,
+							amount_msat,
+							custom_records,
+							..
+						} => {
 							info!(
-								"PAYMENT_RECEIVED: with id {:?}, hash {}, amount_msat {}",
+								"PAYMENT_RECEIVED: with id {}, hash {}, amount_msat {}",
 								payment_id, payment_hash, amount_msat
 							);
-							let _ = (&amount_msat, &custom_records); // suppress unused warnings
-							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
 
-							publish_event_and_upsert_payment(&payment_id,
-								|payment_ref| event_envelope::Event::PaymentReceived(events::PaymentReceived {
-									payment: Some(payment_ref.clone()),
-								}),
+							send_payment_event(
+								&payment_id,
+								move |payment| {
+									let custom_records = custom_records
+										.iter()
+										.map(node_to_proto_custom_tlv)
+										.collect();
+									event_envelope::Event::PaymentReceived(events::PaymentReceived {
+										payment_id: payment_id.to_string(),
+										payment: Some(payment),
+										custom_records,
+									})
+								},
 								&event_node,
-								Arc::clone(&event_publisher),
-								Arc::clone(&paginated_store)).await;
-						},
-						Event::PaymentSuccessful {payment_id, ..} => {
-							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
+								&event_sender,
+							);
 
-							publish_event_and_upsert_payment(&payment_id,
-								|payment_ref| event_envelope::Event::PaymentSuccessful(events::PaymentSuccessful {
-									payment: Some(payment_ref.clone()),
-								}),
-								&event_node,
-								Arc::clone(&event_publisher),
-								Arc::clone(&paginated_store)).await;
-						},
-						Event::PaymentFailed {payment_id, ..} => {
-							let payment_id = payment_id.expect("PaymentId expected for ldk-server >=0.1");
-
-							publish_event_and_upsert_payment(&payment_id,
-								|payment_ref| event_envelope::Event::PaymentFailed(events::PaymentFailed {
-									payment: Some(payment_ref.clone()),
-								}),
-								&event_node,
-								Arc::clone(&event_publisher),
-								Arc::clone(&paginated_store)).await;
-						},
-						Event::PaymentClaimable {payment_id, ..} => {
-							if let Some(payment_details) = event_node.payment(&payment_id) {
-								let payment = payment_to_proto(payment_details);
-								upsert_payment_details(&event_node, Arc::clone(&paginated_store), &payment);
-							} else {
-								error!("Unable to find payment with paymentId: {payment_id}");
+							if let Some(metrics) = &metrics {
+								metrics.update_all_balances(&event_node);
 							}
 						},
+						Event::PaymentSuccessful { payment_id, payment_preimage, bolt12_invoice, .. } => {
+							send_payment_event(&payment_id,
+								move |payment| {
+									let payment_preimage = payment_preimage.map(|p| p.to_string());
+									let bolt12_invoice = bolt12_invoice.as_ref().and_then(|invoice| {
+										invoice.bolt12_invoice().map(|i| i.encode().to_lower_hex_string())
+									});
+									event_envelope::Event::PaymentSuccessful(events::PaymentSuccessful {
+										payment_id: payment_id.to_string(),
+										payment: Some(payment),
+										payment_preimage,
+										bolt12_invoice,
+									})
+								},
+								&event_node,
+								&event_sender);
+
+							if let Some(metrics) = &metrics {
+								metrics.update_all_balances(&event_node);
+							}
+						},
+						Event::PaymentFailed {payment_id, reason, ..} => {
+							let proto_reason = reason.as_ref().map(payment_failure_reason_to_proto);
+							send_payment_event(&payment_id,
+								move |payment| event_envelope::Event::PaymentFailed(events::PaymentFailed {
+									payment_id: payment_id.to_string(),
+									payment: Some(payment),
+									reason: proto_reason.map(|r| r as i32),
+								}),
+								&event_node,
+								&event_sender);
+
+						},
+						Event::PaymentClaimable { payment_id, custom_records, claim_deadline, claimable_amount_msat, .. } => {
+							send_payment_event(
+								&payment_id,
+								|payment| {
+									event_envelope::Event::PaymentClaimable(
+										build_payment_claimable_proto(
+											payment,
+											&custom_records,
+											claim_deadline,
+											claimable_amount_msat,
+											payment_id.to_string(),
+										),
+									)
+								},
+								&event_node,
+								&event_sender,
+							);
+						},
 						Event::PaymentForwarded {
-							prev_channel_id,
-							next_channel_id,
-							prev_user_channel_id,
-							next_user_channel_id,
-							prev_node_id,
-							next_node_id,
+							prev_htlcs,
+							next_htlcs,
 							total_fee_earned_msat,
 							skimmed_fee_msat,
 							claim_from_onchain_tx,
 							outbound_amount_forwarded_msat
 						} => {
-
-							info!("PAYMENT_FORWARDED: with outbound_amount_forwarded_msat {}, total_fee_earned_msat: {}, inbound channel: {}, outbound channel: {}",
-								outbound_amount_forwarded_msat.unwrap_or(0), total_fee_earned_msat.unwrap_or(0), prev_channel_id, next_channel_id
+							info!(
+								"PAYMENT_FORWARDED: outbound_amount_forwarded_msat {}, total_fee_earned_msat: {}, inbound HTLCs: {}, outbound HTLCs: {}",
+								outbound_amount_forwarded_msat,
+								total_fee_earned_msat.unwrap_or(0),
+								prev_htlcs.len(),
+								next_htlcs.len(),
 							);
 
-							let forwarded_payment = forwarded_payment_to_proto(
-								prev_channel_id,
-								next_channel_id,
-								prev_user_channel_id,
-								next_user_channel_id,
-								prev_node_id,
-								next_node_id,
+							let prev_htlcs = prev_htlcs
+								.into_iter()
+								.map(|htlc| HtlcLocator {
+									channel_id: htlc.channel_id.to_string(),
+									user_channel_id: htlc.user_channel_id.map(|u| u.0.to_string()),
+									node_id: htlc.node_id.map(|n| n.to_string()),
+									amount_msat: htlc.amount_msat,
+								})
+								.collect();
+							let next_htlcs = next_htlcs
+								.into_iter()
+								.map(|htlc| HtlcLocator {
+									channel_id: htlc.channel_id.to_string(),
+									user_channel_id: htlc.user_channel_id.map(|u| u.0.to_string()),
+									node_id: htlc.node_id.map(|n| n.to_string()),
+									amount_msat: htlc.amount_msat,
+								})
+								.collect();
+
+							let forwarded_payment = events::PaymentForwarded {
+								// Node events have no timestamp, so use the time we handle the event.
+								observed_at_timestamp: SystemTime::now().duration_since(UNIX_EPOCH)
+									.expect("Time must be after the Unix epoch").as_secs(),
+								prev_htlcs,
+								next_htlcs,
 								total_fee_earned_msat,
 								skimmed_fee_msat,
 								claim_from_onchain_tx,
-								outbound_amount_forwarded_msat
-							);
-
-							// We don't expose this payment-id to the user, it is a temporary measure to generate
-							// some unique identifiers until we have forwarded-payment-id available in ldk.
-							// Currently, this is the expected user handling behaviour for forwarded payments.
-							let mut forwarded_payment_id = [0u8; 32];
-							getrandom::getrandom(&mut forwarded_payment_id).expect("Failed to generate random bytes");
-
-							let forwarded_payment_creation_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs() as i64;
-
-							match event_publisher.publish(EventEnvelope {
-									event: Some(event_envelope::Event::PaymentForwarded(events::PaymentForwarded {
-											forwarded_payment: Some(forwarded_payment.clone()),
-									})),
-							}).await {
-								Ok(_) => {},
-								Err(e) => {
-									error!("Failed to publish 'PaymentForwarded' event: {}", e);
-									continue;
-								}
+								outbound_amount_forwarded_msat,
 							};
 
-							match paginated_store.write(FORWARDED_PAYMENTS_PERSISTENCE_PRIMARY_NAMESPACE,FORWARDED_PAYMENTS_PERSISTENCE_SECONDARY_NAMESPACE,
-								&forwarded_payment_id.to_lower_hex_string(),
-								forwarded_payment_creation_time,
-								&forwarded_payment.encode_to_vec(),
-							) {
-								Ok(_) => {
-									if let Err(e) = event_node.event_handled() {
-										error!("Failed to mark event as handled: {e}");
-									}
-								}
-								Err(e) => {
-										error!("Failed to write forwarded payment to persistence: {}", e);
-								}
+							if let Err(e) = event_sender.send(EventEnvelope {
+								event: Some(event_envelope::Event::PaymentForwarded(forwarded_payment)),
+							}) {
+								debug!("No event subscribers connected, skipping event: {e}");
 							}
-						},
-						_ => {
+
 							if let Err(e) = event_node.event_handled() {
 								error!("Failed to mark event as handled: {e}");
 							}
 						},
+						Event::SpliceNegotiated {
+							channel_id,
+							user_channel_id,
+							counterparty_node_id,
+							new_funding_txo,
+						} => {
+							info!(
+								"SPLICE_NEGOTIATED: {} from counterparty {}",
+								channel_id, counterparty_node_id
+							);
+
+							send_channel_state_event(
+								event_envelope::Event::SpliceNegotiated(events::SpliceNegotiated {
+									channel_id: channel_id.0.to_lower_hex_string(),
+									user_channel_id: user_channel_id.0.to_string(),
+									counterparty_node_id: counterparty_node_id.to_string(),
+									new_funding_txo: new_funding_txo.to_string(),
+								}),
+								&event_sender,
+							);
+
+							if let Err(e) = event_node.event_handled() {
+								error!("Failed to mark event as handled: {e}");
+							}
+						},
+						Event::SpliceNegotiationFailed {
+							channel_id,
+							user_channel_id,
+							counterparty_node_id,
+						} => {
+							info!(
+								"SPLICE_NEGOTIATION_FAILED: {} from counterparty {}",
+								channel_id, counterparty_node_id
+							);
+
+							send_channel_state_event(
+								event_envelope::Event::SpliceNegotiationFailed(
+									events::SpliceNegotiationFailed {
+										channel_id: channel_id.0.to_lower_hex_string(),
+										user_channel_id: user_channel_id.0.to_string(),
+										counterparty_node_id: counterparty_node_id.to_string(),
+									},
+								),
+								&event_sender,
+							);
+
+							if let Err(e) = event_node.event_handled() {
+								error!("Failed to mark event as handled: {e}");
+							}
+						},
+
 					}
 				},
-				res = rest_svc_listener.accept() => {
+				res = grpc_listener.accept() => {
 					match res {
 						Ok((stream, _)) => {
 							let node_service = NodeService::new(
 								Arc::clone(&node),
-								Arc::clone(&paginated_store),
-								api_key.clone(),
+								Arc::clone(&macaroon_store),
+								metrics.clone(),
+								metrics_auth_header.clone(),
+								event_sender.clone(),
+								shutdown_rx.clone(),
 							);
 							let acceptor = tls_acceptor.clone();
 							runtime.spawn(async move {
 								match acceptor.accept(stream).await {
 									Ok(tls_stream) => {
 										let io_stream = TokioIo::new(tls_stream);
-										if let Err(err) = http1::Builder::new().serve_connection(io_stream, node_service).await {
+										if let Err(err) = http2::Builder::new(TokioExecutor::new()).serve_connection(io_stream, node_service).await {
 											error!("Failed to serve TLS connection: {err}");
 										}
 									},
@@ -445,97 +739,521 @@ fn main() {
 				}
 				_ = tokio::signal::ctrl_c() => {
 					info!("Received CTRL-C, shutting down..");
+					let _ = shutdown_tx.send(true);
 					break;
 				}
 				_ = sighup_stream.recv() => {
+					info!("Received SIGHUP, reopening log file..");
 					if let Err(e) = logger.reopen() {
 						error!("Failed to reopen log file on SIGHUP: {e}");
 					}
 				}
 				_ = sigterm_stream.recv() => {
 					info!("Received SIGTERM, shutting down..");
+					let _ = shutdown_tx.send(true);
 					break;
 				}
 			}
 		}
 	});
 
+	systemd::notify_stopping();
 	node.stop().expect("Shutdown should always succeed.");
 	info!("Shutdown complete..");
+	log::logger().flush();
 }
 
-async fn publish_event_and_upsert_payment(
-	payment_id: &PaymentId, payment_to_event: fn(&Payment) -> event_envelope::Event,
-	event_node: &Node, event_publisher: Arc<dyn EventPublisher>,
-	paginated_store: Arc<dyn PaginatedKVStore>,
-) {
-	if let Some(payment_details) = event_node.payment(payment_id) {
-		let payment = payment_to_proto(payment_details);
+fn ensure_no_unsupported_storage_migration(
+	network_dir: &Path, ldk_node_storage: &LdkNodeStorageConfig,
+) -> Result<(), String> {
+	let sqlite_path = network_dir.join(ldk_node::io::sqlite_store::SQLITE_DB_FILE_NAME);
+	let sqlite_exists = sqlite_path
+		.try_exists()
+		.map_err(|e| format!("Failed to check for existing SQLite LDK Node state: {e}"))?;
+	let postgres_lock_path = network_dir.join(LDK_NODE_POSTGRES_LOCK_FILE);
+	let postgres_lock_exists = postgres_lock_path
+		.try_exists()
+		.map_err(|e| format!("Failed to check for PostgreSQL storage lock: {e}"))?;
 
-		let event = payment_to_event(&payment);
-		let event_name = get_event_name(&event);
-		match event_publisher.publish(EventEnvelope { event: Some(event) }).await {
-			Ok(_) => {},
-			Err(e) => {
-				error!("Failed to publish '{event_name}' event, : {e}");
-				return;
-			},
-		};
+	match ldk_node_storage {
+		LdkNodeStorageConfig::Postgres { .. } if sqlite_exists => {
+			return Err(format!(
+				"Refusing to switch LDK Node storage from SQLite to PostgreSQL because {} exists. Storage migration is not supported; remove [storage.postgres] to continue using SQLite.",
+				sqlite_path.display()
+			));
+		},
+		LdkNodeStorageConfig::Sqlite if postgres_lock_exists => {
+			return Err(format!(
+				"Refusing to switch LDK Node storage from PostgreSQL to SQLite because {} exists. Storage migration is not supported; restore [storage.postgres] to continue using PostgreSQL.",
+				postgres_lock_path.display()
+			));
+		},
+		_ => {},
+	}
 
-		upsert_payment_details(event_node, Arc::clone(&paginated_store), &payment);
-	} else {
-		error!("Unable to find payment with paymentId: {payment_id}");
+	Ok(())
+}
+
+fn persist_postgres_storage_lock(network_dir: &Path) -> Result<(), String> {
+	let lock_path = network_dir.join(LDK_NODE_POSTGRES_LOCK_FILE);
+	match write_new(&lock_path, &[], 0o600) {
+		Ok(()) => Ok(()),
+		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+		Err(e) => {
+			Err(format!("Failed to persist PostgreSQL storage lock {}: {e}", lock_path.display()))
+		},
 	}
 }
 
-fn upsert_payment_details(
-	event_node: &Node, paginated_store: Arc<dyn PaginatedKVStore>, payment: &Payment,
-) {
-	let time =
-		SystemTime::now().duration_since(UNIX_EPOCH).expect("Time must be > 1970").as_secs() as i64;
+fn build_node(
+	builder: Builder, node_entropy: ldk_node::entropy::NodeEntropy,
+	ldk_node_storage: LdkNodeStorageConfig,
+) -> Result<Node, ldk_node::BuildError> {
+	match ldk_node_storage {
+		LdkNodeStorageConfig::Sqlite => builder.build(node_entropy),
+		LdkNodeStorageConfig::Postgres {
+			connection_string,
+			db_name,
+			kv_table_name,
+			certificate_pem,
+		} => builder.build_with_postgres_store(
+			node_entropy,
+			connection_string,
+			db_name,
+			kv_table_name,
+			certificate_pem,
+		),
+	}
+}
 
-	match paginated_store.write(
-		PAYMENTS_PERSISTENCE_PRIMARY_NAMESPACE,
-		PAYMENTS_PERSISTENCE_SECONDARY_NAMESPACE,
-		&payment.id,
-		time,
-		&payment.encode_to_vec(),
-	) {
-		Ok(_) => {
-			if let Err(e) = event_node.event_handled() {
-				error!("Failed to mark event as handled: {e}");
+fn send_payment_event(
+	payment_id: &PaymentId, payment_to_event: impl FnOnce(Payment) -> event_envelope::Event,
+	event_node: &Node, event_sender: &broadcast::Sender<EventEnvelope>,
+) {
+	if event_sender.receiver_count() == 0 {
+		debug!("No event subscribers connected, skipping payment event");
+		if let Err(e) = event_node.event_handled() {
+			error!("Failed to mark event as handled: {e}");
+		}
+		return;
+	}
+
+	match event_node.payment(payment_id) {
+		Ok(Some(payment_details)) => {
+			let payment = payment_to_proto(payment_details);
+
+			let event = payment_to_event(payment);
+			if let Err(e) = event_sender.send(EventEnvelope { event: Some(event) }) {
+				debug!("No event subscribers connected, skipping event: {e}");
 			}
 		},
+		Ok(None) => {
+			error!("Unable to find payment with payment ID: {payment_id}");
+		},
 		Err(e) => {
-			error!("Failed to write payment to persistence: {e}");
+			error!("Failed to retrieve payment with payment ID {payment_id}: {e}");
+		},
+	}
+	if let Err(e) = event_node.event_handled() {
+		error!("Failed to mark event as handled: {e}");
+	}
+}
+
+fn send_channel_state_event(
+	event: event_envelope::Event, event_sender: &broadcast::Sender<EventEnvelope>,
+) {
+	if let Err(e) = event_sender.send(EventEnvelope { event: Some(event) }) {
+		debug!("No event subscribers connected, skipping event: {e}");
+	}
+}
+
+fn is_channel_open_failure(reason: Option<&ClosureReason>) -> bool {
+	match reason {
+		Some(ClosureReason::FundingTimedOut)
+		| Some(ClosureReason::DisconnectedPeer)
+		| Some(ClosureReason::CounterpartyCoopClosedUnfundedChannel)
+		| Some(ClosureReason::LocallyCoopClosedUnfundedChannel)
+		| Some(ClosureReason::FundingBatchClosure) => true,
+		Some(ClosureReason::CounterpartyForceClosed { .. })
+		| Some(ClosureReason::HolderForceClosed { .. })
+		| Some(ClosureReason::LegacyCooperativeClosure)
+		| Some(ClosureReason::CounterpartyInitiatedCooperativeClosure)
+		| Some(ClosureReason::LocallyInitiatedCooperativeClosure)
+		| Some(ClosureReason::CommitmentTxConfirmed)
+		| Some(ClosureReason::ProcessingError { .. })
+		| Some(ClosureReason::OutdatedChannelManager)
+		| Some(ClosureReason::HTLCsTimedOut { .. })
+		| Some(ClosureReason::PeerFeerateTooLow { .. })
+		| None => false,
+	}
+}
+
+fn closure_initiator_from_reason(
+	reason: Option<&ClosureReason>,
+) -> events::ChannelClosureInitiator {
+	match reason {
+		Some(ClosureReason::HolderForceClosed { .. })
+		| Some(ClosureReason::LocallyInitiatedCooperativeClosure)
+		| Some(ClosureReason::LocallyCoopClosedUnfundedChannel) => events::ChannelClosureInitiator::Local,
+		Some(ClosureReason::CounterpartyForceClosed { .. })
+		| Some(ClosureReason::CounterpartyInitiatedCooperativeClosure)
+		| Some(ClosureReason::CounterpartyCoopClosedUnfundedChannel) => {
+			events::ChannelClosureInitiator::Remote
+		},
+		Some(ClosureReason::LegacyCooperativeClosure)
+		| Some(ClosureReason::CommitmentTxConfirmed)
+		| Some(ClosureReason::FundingTimedOut)
+		| Some(ClosureReason::ProcessingError { .. })
+		| Some(ClosureReason::DisconnectedPeer)
+		| Some(ClosureReason::OutdatedChannelManager)
+		| Some(ClosureReason::FundingBatchClosure)
+		| Some(ClosureReason::HTLCsTimedOut { .. })
+		| Some(ClosureReason::PeerFeerateTooLow { .. }) => events::ChannelClosureInitiator::Unknown,
+		None => events::ChannelClosureInitiator::Unspecified,
+	}
+}
+
+fn payment_failure_reason_to_proto(reason: &PaymentFailureReason) -> events::PaymentFailureReason {
+	match reason {
+		PaymentFailureReason::RecipientRejected => events::PaymentFailureReason::RecipientRejected,
+		PaymentFailureReason::UserAbandoned => events::PaymentFailureReason::UserAbandoned,
+		PaymentFailureReason::RetriesExhausted => events::PaymentFailureReason::RetriesExhausted,
+		PaymentFailureReason::PaymentExpired => events::PaymentFailureReason::PaymentExpired,
+		PaymentFailureReason::RouteNotFound => events::PaymentFailureReason::RouteNotFound,
+		PaymentFailureReason::UnexpectedError => events::PaymentFailureReason::UnexpectedError,
+		PaymentFailureReason::UnknownRequiredFeatures => {
+			events::PaymentFailureReason::UnknownRequiredFeatures
+		},
+		PaymentFailureReason::InvoiceRequestExpired => {
+			events::PaymentFailureReason::InvoiceRequestExpired
+		},
+		PaymentFailureReason::InvoiceRequestRejected => {
+			events::PaymentFailureReason::InvoiceRequestRejected
+		},
+		PaymentFailureReason::BlindedPathCreationFailed => {
+			events::PaymentFailureReason::BlindedPathCreationFailed
 		},
 	}
 }
 
-/// Loads the API key from a file, or generates a new one if it doesn't exist.
-/// The API key file is stored with 0400 permissions (read-only for owner).
-fn load_or_generate_api_key(storage_dir: &Path) -> std::io::Result<String> {
-	let api_key_path = storage_dir.join(API_KEY_FILE);
+fn closure_reason_to_proto(reason: &ClosureReason) -> events::ChannelStateChangeReason {
+	events::ChannelStateChangeReason {
+		kind: closure_reason_kind(reason).into(),
+		message: reason.to_string(),
+		details: closure_reason_details(reason),
+	}
+}
 
-	if api_key_path.exists() {
-		let key_bytes = fs::read(&api_key_path)?;
-		Ok(key_bytes.to_lower_hex_string())
-	} else {
-		// Ensure the storage directory exists
-		fs::create_dir_all(storage_dir)?;
+fn closure_reason_kind(reason: &ClosureReason) -> events::ChannelStateChangeReasonKind {
+	match reason {
+		ClosureReason::CounterpartyForceClosed { .. } => {
+			events::ChannelStateChangeReasonKind::CounterpartyForceClosed
+		},
+		ClosureReason::HolderForceClosed { .. } => {
+			events::ChannelStateChangeReasonKind::HolderForceClosed
+		},
+		ClosureReason::LegacyCooperativeClosure => {
+			events::ChannelStateChangeReasonKind::LegacyCooperativeClosure
+		},
+		ClosureReason::CounterpartyInitiatedCooperativeClosure => {
+			events::ChannelStateChangeReasonKind::CounterpartyInitiatedCooperativeClosure
+		},
+		ClosureReason::LocallyInitiatedCooperativeClosure => {
+			events::ChannelStateChangeReasonKind::LocallyInitiatedCooperativeClosure
+		},
+		ClosureReason::CommitmentTxConfirmed => {
+			events::ChannelStateChangeReasonKind::CommitmentTxConfirmed
+		},
+		ClosureReason::FundingTimedOut => events::ChannelStateChangeReasonKind::FundingTimedOut,
+		ClosureReason::ProcessingError { .. } => {
+			events::ChannelStateChangeReasonKind::ProcessingError
+		},
+		ClosureReason::DisconnectedPeer => events::ChannelStateChangeReasonKind::DisconnectedPeer,
+		ClosureReason::OutdatedChannelManager => {
+			events::ChannelStateChangeReasonKind::OutdatedChannelManager
+		},
+		ClosureReason::CounterpartyCoopClosedUnfundedChannel => {
+			events::ChannelStateChangeReasonKind::CounterpartyCoopClosedUnfundedChannel
+		},
+		ClosureReason::LocallyCoopClosedUnfundedChannel => {
+			events::ChannelStateChangeReasonKind::LocallyCoopClosedUnfundedChannel
+		},
+		ClosureReason::FundingBatchClosure => {
+			events::ChannelStateChangeReasonKind::FundingBatchClosure
+		},
+		ClosureReason::HTLCsTimedOut { .. } => events::ChannelStateChangeReasonKind::HtlcsTimedOut,
+		ClosureReason::PeerFeerateTooLow { .. } => {
+			events::ChannelStateChangeReasonKind::PeerFeerateTooLow
+		},
+	}
+}
 
-		// Generate a 32-byte random API key
-		let mut key_bytes = [0u8; 32];
-		getrandom::getrandom(&mut key_bytes).map_err(std::io::Error::other)?;
+fn closure_reason_details(
+	reason: &ClosureReason,
+) -> Option<events::channel_state_change_reason::Details> {
+	use events::channel_state_change_reason::Details;
 
-		// Write the raw bytes to the file
-		fs::write(&api_key_path, key_bytes)?;
+	match reason {
+		ClosureReason::CounterpartyForceClosed { peer_msg } => {
+			Some(Details::CounterpartyForceClosed(events::CounterpartyForceClosedDetails {
+				peer_msg: peer_msg.to_string(),
+			}))
+		},
+		ClosureReason::HolderForceClosed {
+			broadcasted_latest_txn,
+			message: force_close_message,
+		} => Some(Details::HolderForceClosed(events::HolderForceClosedDetails {
+			broadcasted_latest_txn: *broadcasted_latest_txn,
+			message: force_close_message.clone(),
+		})),
+		ClosureReason::ProcessingError { err } => {
+			Some(Details::ProcessingError(events::ProcessingErrorDetails { err: err.clone() }))
+		},
+		ClosureReason::HTLCsTimedOut { payment_hash } => {
+			Some(Details::HtlcsTimedOut(events::HtlcsTimedOutDetails {
+				payment_hash: payment_hash.map(|hash| hash.to_string()),
+			}))
+		},
+		ClosureReason::PeerFeerateTooLow {
+			peer_feerate_sat_per_kw,
+			required_feerate_sat_per_kw,
+		} => Some(Details::PeerFeerateTooLow(events::PeerFeerateTooLowDetails {
+			peer_feerate_sat_per_kw: *peer_feerate_sat_per_kw,
+			required_feerate_sat_per_kw: *required_feerate_sat_per_kw,
+		})),
+		ClosureReason::LegacyCooperativeClosure
+		| ClosureReason::CounterpartyInitiatedCooperativeClosure
+		| ClosureReason::LocallyInitiatedCooperativeClosure
+		| ClosureReason::CommitmentTxConfirmed
+		| ClosureReason::FundingTimedOut
+		| ClosureReason::DisconnectedPeer
+		| ClosureReason::OutdatedChannelManager
+		| ClosureReason::CounterpartyCoopClosedUnfundedChannel
+		| ClosureReason::LocallyCoopClosedUnfundedChannel
+		| ClosureReason::FundingBatchClosure => None,
+	}
+}
 
-		// Set permissions to 0400 (read-only for owner)
-		let permissions = fs::Permissions::from_mode(0o400);
-		fs::set_permissions(&api_key_path, permissions)?;
+fn build_payment_claimable_proto(
+	payment: Payment, custom_records: &[CustomTlvRecord], claim_deadline: Option<u32>,
+	claimable_amount_msat: u64, payment_id: String,
+) -> events::PaymentClaimable {
+	let proto_custom_records: Vec<_> =
+		custom_records.iter().map(node_to_proto_custom_tlv).collect();
+	events::PaymentClaimable {
+		payment_id,
+		payment: Some(payment),
+		custom_records: proto_custom_records,
+		claim_deadline,
+		claimable_amount_msat,
+	}
+}
 
-		debug!("Generated new API key at {}", api_key_path.display());
-		Ok(key_bytes.to_lower_hex_string())
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use ldk_server_grpc::events::channel_state_change_reason::Details;
+
+	use super::*;
+
+	#[test]
+	fn postgres_storage_rejects_existing_sqlite_state() {
+		let network_dir = test_network_dir("postgres-rejects-sqlite");
+		let sqlite_path = network_dir.join(ldk_node::io::sqlite_store::SQLITE_DB_FILE_NAME);
+		fs::write(&sqlite_path, []).unwrap();
+		let postgres = LdkNodeStorageConfig::Postgres {
+			connection_string: "postgresql://localhost".to_string(),
+			db_name: None,
+			kv_table_name: None,
+			certificate_pem: None,
+		};
+
+		let err = ensure_no_unsupported_storage_migration(&network_dir, &postgres).unwrap_err();
+
+		assert!(err.contains("Refusing to switch LDK Node storage from SQLite to PostgreSQL"));
+		assert!(err.contains(sqlite_path.to_str().unwrap()));
+		fs::remove_dir_all(network_dir).unwrap();
+	}
+
+	#[test]
+	fn postgres_storage_allows_fresh_network_directory() {
+		let network_dir = test_network_dir("postgres-allows-fresh");
+		let postgres = LdkNodeStorageConfig::Postgres {
+			connection_string: "postgresql://localhost".to_string(),
+			db_name: None,
+			kv_table_name: None,
+			certificate_pem: None,
+		};
+
+		assert!(ensure_no_unsupported_storage_migration(&network_dir, &postgres).is_ok());
+		fs::remove_dir_all(network_dir).unwrap();
+	}
+
+	#[test]
+	fn sqlite_storage_allows_existing_sqlite_state() {
+		let network_dir = test_network_dir("sqlite-allows-sqlite");
+		let sqlite_path = network_dir.join(ldk_node::io::sqlite_store::SQLITE_DB_FILE_NAME);
+		fs::write(sqlite_path, []).unwrap();
+
+		assert!(ensure_no_unsupported_storage_migration(
+			&network_dir,
+			&LdkNodeStorageConfig::Sqlite
+		)
+		.is_ok());
+		fs::remove_dir_all(network_dir).unwrap();
+	}
+
+	#[test]
+	fn sqlite_storage_rejects_recorded_postgres_backend() {
+		let network_dir = test_network_dir("sqlite-rejects-postgres-marker");
+		fs::write(network_dir.join(LDK_NODE_POSTGRES_LOCK_FILE), []).unwrap();
+
+		let err =
+			ensure_no_unsupported_storage_migration(&network_dir, &LdkNodeStorageConfig::Sqlite)
+				.unwrap_err();
+
+		assert!(err.contains("Refusing to switch LDK Node storage from PostgreSQL to SQLite"));
+		fs::remove_dir_all(network_dir).unwrap();
+	}
+
+	#[test]
+	fn postgres_storage_lock_is_persisted_and_can_be_reopened() {
+		let network_dir = test_network_dir("postgres-lock-persists");
+
+		persist_postgres_storage_lock(&network_dir).unwrap();
+		persist_postgres_storage_lock(&network_dir).unwrap();
+
+		assert!(network_dir.join(LDK_NODE_POSTGRES_LOCK_FILE).exists());
+		fs::remove_dir_all(network_dir).unwrap();
+	}
+
+	fn test_network_dir(name: &str) -> PathBuf {
+		let dir = std::env::temp_dir()
+			.join(format!("ldk-server-storage-migration-test-{name}-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir(&dir).unwrap();
+		dir
+	}
+
+	#[test]
+	fn test_is_channel_open_failure_classification() {
+		assert!(is_channel_open_failure(Some(&ClosureReason::FundingTimedOut)));
+		assert!(is_channel_open_failure(Some(&ClosureReason::DisconnectedPeer)));
+		assert!(is_channel_open_failure(Some(&ClosureReason::FundingBatchClosure)));
+		assert!(is_channel_open_failure(Some(
+			&ClosureReason::CounterpartyCoopClosedUnfundedChannel,
+		)));
+		assert!(is_channel_open_failure(Some(&ClosureReason::LocallyCoopClosedUnfundedChannel,)));
+
+		assert!(!is_channel_open_failure(Some(&ClosureReason::CommitmentTxConfirmed)));
+		assert!(!is_channel_open_failure(None));
+	}
+
+	#[test]
+	fn test_closure_initiator_mapping() {
+		assert_eq!(
+			closure_initiator_from_reason(Some(&ClosureReason::HolderForceClosed {
+				broadcasted_latest_txn: Some(true),
+				message: "local close".to_string(),
+			})),
+			events::ChannelClosureInitiator::Local
+		);
+		assert_eq!(
+			closure_initiator_from_reason(
+				Some(&ClosureReason::LocallyInitiatedCooperativeClosure,)
+			),
+			events::ChannelClosureInitiator::Local
+		);
+
+		assert_eq!(
+			closure_initiator_from_reason(Some(
+				&ClosureReason::CounterpartyInitiatedCooperativeClosure,
+			)),
+			events::ChannelClosureInitiator::Remote
+		);
+		assert_eq!(
+			closure_initiator_from_reason(Some(
+				&ClosureReason::CounterpartyCoopClosedUnfundedChannel,
+			)),
+			events::ChannelClosureInitiator::Remote
+		);
+
+		assert_eq!(
+			closure_initiator_from_reason(Some(&ClosureReason::CommitmentTxConfirmed)),
+			events::ChannelClosureInitiator::Unknown
+		);
+		assert_eq!(
+			closure_initiator_from_reason(None),
+			events::ChannelClosureInitiator::Unspecified
+		);
+	}
+
+	#[test]
+	fn test_closure_reason_to_proto_holder_force_closed_details() {
+		let proto = closure_reason_to_proto(&ClosureReason::HolderForceClosed {
+			broadcasted_latest_txn: Some(false),
+			message: "manual force close".to_string(),
+		});
+
+		assert_eq!(proto.kind, events::ChannelStateChangeReasonKind::HolderForceClosed as i32);
+		assert!(proto.message.contains("manual force close"));
+		match proto.details {
+			Some(Details::HolderForceClosed(details)) => {
+				assert_eq!(details.broadcasted_latest_txn, Some(false));
+				assert_eq!(details.message, "manual force close");
+			},
+			other => panic!("expected HolderForceClosed details, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn test_closure_reason_to_proto_peer_feerate_details() {
+		let proto = closure_reason_to_proto(&ClosureReason::PeerFeerateTooLow {
+			peer_feerate_sat_per_kw: 100,
+			required_feerate_sat_per_kw: 250,
+		});
+
+		assert_eq!(proto.kind, events::ChannelStateChangeReasonKind::PeerFeerateTooLow as i32);
+		match proto.details {
+			Some(Details::PeerFeerateTooLow(details)) => {
+				assert_eq!(details.peer_feerate_sat_per_kw, 100);
+				assert_eq!(details.required_feerate_sat_per_kw, 250);
+			},
+			other => panic!("expected PeerFeerateTooLow details, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn test_closure_reason_to_proto_without_details() {
+		let proto = closure_reason_to_proto(&ClosureReason::FundingTimedOut);
+		assert_eq!(proto.kind, events::ChannelStateChangeReasonKind::FundingTimedOut as i32);
+		assert!(proto.details.is_none());
+	}
+
+	#[test]
+	fn payment_claimable_proto_preserves_event_fields() {
+		let payment = ldk_server_grpc::types::Payment::default();
+		let records = vec![
+			CustomTlvRecord { type_num: 65537, value: vec![1, 2, 3] },
+			CustomTlvRecord { type_num: 65538, value: Vec::new() },
+		];
+		let proto = build_payment_claimable_proto(
+			payment,
+			&records,
+			Some(800_000),
+			42_123,
+			"abc123".to_string(),
+		);
+		let encoded = proto.encode_to_vec();
+		let proto = events::PaymentClaimable::decode(encoded.as_slice()).unwrap();
+		assert_eq!(proto.payment_id, "abc123");
+		assert_eq!(proto.claim_deadline, Some(800_000));
+		assert_eq!(proto.claimable_amount_msat, 42_123);
+		assert_eq!(proto.custom_records.len(), 2);
+		assert_eq!(proto.custom_records[0].type_num, 65537);
+		assert_eq!(proto.custom_records[0].value.to_vec(), vec![1, 2, 3]);
+		assert_eq!(proto.custom_records[1].type_num, 65538);
+		assert!(proto.custom_records[1].value.to_vec().is_empty());
 	}
 }

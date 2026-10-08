@@ -8,31 +8,42 @@
 // licenses.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::Address;
 use ldk_node::UserChannelId;
-use ldk_server_protos::api::{
-	SpliceInRequest, SpliceInResponse, SpliceOutRequest, SpliceOutResponse,
+use ldk_server_grpc::api::splice_in_request::Amount;
+use ldk_server_grpc::api::{
+	BumpChannelFundingFeeRequest, BumpChannelFundingFeeResponse, SpliceInRequest, SpliceInResponse,
+	SpliceOutRequest, SpliceOutResponse,
 };
 
 use crate::api::error::LdkServerError;
 use crate::api::error::LdkServerErrorCode::InvalidRequestError;
+use crate::api::require_amount;
 use crate::service::Context;
 
-pub(crate) fn handle_splice_in_request(
-	context: Context, request: SpliceInRequest,
+pub(crate) async fn handle_splice_in_request(
+	context: Arc<Context>, request: SpliceInRequest,
 ) -> Result<SpliceInResponse, LdkServerError> {
 	let user_channel_id = parse_user_channel_id(&request.user_channel_id)?;
 	let counterparty_node_id = parse_counterparty_node_id(&request.counterparty_node_id)?;
 
-	context.node.splice_in(&user_channel_id, counterparty_node_id, request.splice_amount_sats)?;
+	match require_amount(request.amount)? {
+		Amount::SpliceAmountSats(amount_sats) => {
+			context.node.splice_in(&user_channel_id, counterparty_node_id, amount_sats)?
+		},
+		Amount::AllFunds(_) => {
+			context.node.splice_in_with_all(&user_channel_id, counterparty_node_id)?
+		},
+	}
 
 	Ok(SpliceInResponse {})
 }
 
-pub(crate) fn handle_splice_out_request(
-	context: Context, request: SpliceOutRequest,
+pub(crate) async fn handle_splice_out_request(
+	context: Arc<Context>, request: SpliceOutRequest,
 ) -> Result<SpliceOutResponse, LdkServerError> {
 	let user_channel_id = parse_user_channel_id(&request.user_channel_id)?;
 	let counterparty_node_id = parse_counterparty_node_id(&request.counterparty_node_id)?;
@@ -60,6 +71,15 @@ pub(crate) fn handle_splice_out_request(
 	)?;
 
 	Ok(SpliceOutResponse { address: address.to_string() })
+}
+
+pub(crate) async fn handle_bump_channel_funding_fee_request(
+	context: Arc<Context>, request: BumpChannelFundingFeeRequest,
+) -> Result<BumpChannelFundingFeeResponse, LdkServerError> {
+	let user_channel_id = parse_user_channel_id(&request.user_channel_id)?;
+	let counterparty_node_id = parse_counterparty_node_id(&request.counterparty_node_id)?;
+	context.node.bump_channel_funding_fee(&user_channel_id, counterparty_node_id)?;
+	Ok(BumpChannelFundingFeeResponse {})
 }
 
 fn parse_user_channel_id(id: &str) -> Result<UserChannelId, LdkServerError> {

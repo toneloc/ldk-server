@@ -7,13 +7,16 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-use ldk_server_protos::api::{Bolt12ReceiveRequest, Bolt12ReceiveResponse};
+use std::sync::Arc;
+
+use hex::DisplayHex;
+use ldk_server_grpc::api::{Bolt12ReceiveRequest, Bolt12ReceiveResponse};
 
 use crate::api::error::LdkServerError;
 use crate::service::Context;
 
-pub(crate) fn handle_bolt12_receive_request(
-	context: Context, request: Bolt12ReceiveRequest,
+pub(crate) async fn handle_bolt12_receive_request(
+	context: Arc<Context>, request: Bolt12ReceiveRequest,
 ) -> Result<Bolt12ReceiveResponse, LdkServerError> {
 	let offer = match request.amount_msat {
 		Some(amount_msat) => context.node.bolt12_payment().receive(
@@ -28,6 +31,7 @@ pub(crate) fn handle_bolt12_receive_request(
 			.receive_variable_amount(&request.description, request.expiry_secs)?,
 	};
 
-	let response = Bolt12ReceiveResponse { offer: offer.to_string() };
+	let offer_id = offer.id().0.to_lower_hex_string();
+	let response = Bolt12ReceiveResponse { offer: offer.to_string(), offer_id };
 	Ok(response)
 }
