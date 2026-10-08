@@ -5,6 +5,82 @@ Coinbase's [`cb-mpc`](https://github.com/coinbase/cb-mpc) two-party ECDSA (ECDSA
 Two independent MPC processes each hold one key share; the complete private key is never
 assembled anywhere. All Lightning channel state stays in LDK Server / LDK Node.
 
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph host["LDK Server host"]
+        direction TB
+        subgraph ldks["ldk-server process"]
+            API["gRPC API / CLI"]
+            NODE["LDK Node (patched)<br/>channel state machine, HTLCs,<br/>payments, monitors, persistence"]
+            SP["WalletKeysManager<br/>(SignerProvider)"]
+            NCS["NodeChannelSigner<br/>= InMemorySigner + external funding key"]
+            MFS["MpcFundingSigner<br/>(ExternalFundingSigner impl)"]
+            MC["MpcClient"]
+            API --> NODE --> SP --> NCS
+            NCS -- "funding-key ops only:<br/>pubkeys / sign commitment,<br/>closing, anchor, announcement, splice" --> MFS --> MC
+            NCS -. "all other keys stay local:<br/>revocation, payment, delayed, HTLC,<br/>per-commitment secrets" .-> NCS
+        end
+        KV[("LDK KV store<br/>channels, monitors, wallet")]
+        NODE --> KV
+    end
+
+    subgraph pa["MPC Party A process (cb-mpc P1)"]
+        P1["ldk-server-mpc-party --role p1"]
+        KA[("share A<br/>&lt;key_id&gt;.share")]
+        P1 --> KA
+    end
+
+    subgraph pb["MPC Party B process (cb-mpc P2)"]
+        P2["ldk-server-mpc-party --role p2"]
+        KB[("share B<br/>&lt;key_id&gt;.share")]
+        P2 --> KB
+    end
+
+    MC -- "TCP, one request per call:<br/>EnsureKey{key_id} -> pubkey<br/>Sign{key_id, digest, context} -> sig" --> P1
+    P1 <-- "framed TCP session per operation:<br/>SessionStart -> SessionAck -><br/>cb-mpc ECDSA-2P rounds (DKG / sign)<br/>-> SessionDone{pubkey}" --> P2
+
+    classDef mpc fill:#eef6ff,stroke:#3b6fb6;
+    classDef ldk fill:#f6f6f6,stroke:#666;
+    class P1,P2,KA,KB,MC,MFS mpc;
+    class API,NODE,SP,NCS,KV ldk;
+```
+
+Trust and data boundaries:
+
+- **LDK Server** owns all Lightning state (channels, commitments, HTLCs, revocation
+  secrets, monitors) and the on-chain wallet. It never sees a funding private key.
+- **Party A (P1)** is the only endpoint LDK Server talks to and the only party that
+  obtains the final signature (a property of cb-mpc's ECDSA-2P protocol). It holds share A.
+- **Party B (P2)** only accepts protocol sessions from Party A and holds share B. Neither
+  party stores any channel state; the only state is the opaque per-key share blob.
+- The full private key never exists: DKG produces the shares directly, and signing is an
+  interactive protocol over the shares.
+
+Signing flow for one commitment update:
+
+```text
+ LDK channel state machine          MpcFundingSigner        Party A (P1)             Party B (P2)
+ ────────────────────────           ────────────────        ────────────             ────────────
+ sign_counterparty_commitment ─┐
+   HTLC sigs: local htlc key   │
+   funding sig: sighash ───────┼──▶ key_id = H(tag ‖ channel_keys_id)
+                               │    Sign{key_id, digest, ctx} ──▶ load share A
+                               │                                 policy.authorize (AllowAll)
+                               │                                 SessionStart ────────────▶ load share B
+                               │                                 ◀──────────── SessionAck   policy.authorize
+                               │                                 ◀═ cb-mpc ECDSA-2P sign ═▶
+                               │                                 DER sig (P1 only)
+                               │                                 ◀──────────── SessionDone{pubkey}
+                               │                                 verify, low-S normalize
+                               │    ◀── Signature (compact)
+                               │    verify against cached pubkey
+ ◀─ (funding sig, HTLC sigs) ──┘
+```
+
+Legacy overview (same thing, flattened):
+
 ```text
                  LDK Server (ldk-server)
                      |  Builder::set_external_funding_signer(MpcFundingSigner)
