@@ -8,15 +8,15 @@
 
 [node]
 network = "signet"
-listening_addresses = ["127.0.0.1:9735"]
+listening_addresses = ["127.0.0.1:19735"]
 alias = "ldk-mpc-signet"
-grpc_service_address = "127.0.0.1:3536"
+grpc_service_address = "127.0.0.1:13536"
 
 [storage.disk]
 dir_path = "/tmp/ldk-server-mpc-signet/"
 
 [esplora]
-server_url = "https://mempool.space/signet/api"
+server_url = "https://blockstream.info/signet/api"
 
 [log]
 level = "Debug"
