@@ -161,3 +161,47 @@ fn additive_tweak_derivation_matches_secp_and_signs() {
 	let rb = h.join().unwrap();
 	assert!(ra.is_err() || rb.is_err());
 }
+
+#[test]
+fn mul_add_derivation_matches_secp_and_signs() {
+	use ldk_server_mpc::bitcoin::secp256k1::Scalar;
+	let secp = Secp256k1::new();
+	let (a, b) = run_dkg();
+	let base = PublicKey::from_slice(&a.public_key_compressed().unwrap()).unwrap();
+
+	let mut mul = [0x11u8; 32];
+	mul[0] = 0x01;
+	let mut add = [0x22u8; 32];
+	add[0] = 0x01;
+	let da = a.derive_mul_add(&mul, &add).unwrap();
+	let db = b.derive_mul_add(&mul, &add).unwrap();
+	let pk_a = PublicKey::from_slice(&da.public_key_compressed().unwrap()).unwrap();
+	let pk_b = PublicKey::from_slice(&db.public_key_compressed().unwrap()).unwrap();
+	assert_eq!(pk_a, pk_b);
+	let expected = base
+		.mul_tweak(&secp, &Scalar::from_be_bytes(mul).unwrap())
+		.unwrap()
+		.add_exp_tweak(&secp, &Scalar::from_be_bytes(add).unwrap())
+		.unwrap();
+	assert_eq!(pk_a, expected, "derived key is mul*Q + add*G");
+
+	let (da, db) = (Arc::new(da), Arc::new(db));
+	for i in 0..3u8 {
+		let digest = [0x90 + i; 32];
+		let (sig, _) = run_sign(&da, &db, digest);
+		let mut sig = Signature::from_der(&sig.unwrap()).unwrap();
+		sig.normalize_s();
+		secp.verify_ecdsa(&Message::from_digest(digest), &sig, &pk_a).unwrap();
+	}
+	// Chaining: an additive derivation on top of a mul/add derivation still signs.
+	let t = [0x33u8; 32];
+	let ca = Arc::new(da.derive_additive_tweak(&t).unwrap());
+	let cb = Arc::new(db.derive_additive_tweak(&t).unwrap());
+	let pk_c = PublicKey::from_slice(&ca.public_key_compressed().unwrap()).unwrap();
+	assert_eq!(pk_c, expected.add_exp_tweak(&secp, &Scalar::from_be_bytes(t).unwrap()).unwrap());
+	let digest = [0xa0u8; 32];
+	let (sig, _) = run_sign(&ca, &cb, digest);
+	let mut sig = Signature::from_der(&sig.unwrap()).unwrap();
+	sig.normalize_s();
+	secp.verify_ecdsa(&Message::from_digest(digest), &sig, &pk_c).unwrap();
+}

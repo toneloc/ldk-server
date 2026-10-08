@@ -1,21 +1,21 @@
-From 3f38bf97276389d89b408ce5def6461518eba103 Mon Sep 17 00:00:00 2001
+From 38dcc051c91971b8d81a6978f0d424c66306ed8e Mon Sep 17 00:00:00 2001
 From: toneloc <3665696+toneloc@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 00:22:36 -0400
-Subject: [PATCH] Add ecdsa_2p::derive_additive_tweak (local additive key
- derivation, C and C++ API)
+Subject: [PATCH] Add ecdsa_2p::derive_additive_tweak and derive_mul_add (local
+ key derivation, C and C++ API)
 
 ---
- include/cbmpc/api/ecdsa_2p.h   |  6 ++++++
- include/cbmpc/c_api/ecdsa_2p.h |  7 +++++++
- src/cbmpc/api/ecdsa2pc.cpp     | 34 ++++++++++++++++++++++++++++++++++
- src/cbmpc/c_api/ecdsa2pc.cpp   | 23 +++++++++++++++++++++++
- 4 files changed, 70 insertions(+)
+ include/cbmpc/api/ecdsa_2p.h   | 11 +++++
+ include/cbmpc/c_api/ecdsa_2p.h | 11 +++++
+ src/cbmpc/api/ecdsa2pc.cpp     | 73 ++++++++++++++++++++++++++++++++++
+ src/cbmpc/c_api/ecdsa2pc.cpp   | 48 ++++++++++++++++++++++
+ 4 files changed, 143 insertions(+)
 
 diff --git a/include/cbmpc/api/ecdsa_2p.h b/include/cbmpc/api/ecdsa_2p.h
-index c95a5e6..0fb989e 100644
+index c95a5e6..1154386 100644
 --- a/include/cbmpc/api/ecdsa_2p.h
 +++ b/include/cbmpc/api/ecdsa_2p.h
-@@ -34,6 +34,12 @@ error_t refresh(const coinbase::api::job_2p_t& job, mem_t key_blob, buf_t& new_k
+@@ -34,6 +34,17 @@ error_t refresh(const coinbase::api::job_2p_t& job, mem_t key_blob, buf_t& new_k
  // On any error, `sig_der` is cleared.
  error_t sign(const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash, buf_t& sid, buf_t& sig_der);
  
@@ -25,14 +25,19 @@ index c95a5e6..0fb989e 100644
 +// additive key derivation (BOLT 3 per-commitment keys).
 +error_t derive_additive_tweak(mem_t key_blob, mem_t tweak, buf_t& out_key_blob);
 +
++// Locally derive a key blob for `key * mul + add` (32-byte big-endian scalars, mul in [1, q),
++// add in [0, q)). Both parties apply the same values. Public key is mul*Q + add*G. Intended for
++// BOLT 3 revocation keys; derived blobs are ephemeral and must not be refreshed.
++error_t derive_mul_add(mem_t key_blob, mem_t mul, mem_t add, buf_t& out_key_blob);
++
  // Get the compressed public key from a key blob.
  error_t get_public_key_compressed(mem_t key_blob, buf_t& pub_key);
  
 diff --git a/include/cbmpc/c_api/ecdsa_2p.h b/include/cbmpc/c_api/ecdsa_2p.h
-index b82bd02..b895bd4 100644
+index b82bd02..882a675 100644
 --- a/include/cbmpc/c_api/ecdsa_2p.h
 +++ b/include/cbmpc/c_api/ecdsa_2p.h
-@@ -42,6 +42,13 @@ cbmpc_error_t cbmpc_ecdsa_2p_refresh(const cbmpc_2pc_job_t* job, cmem_t key_blob
+@@ -42,6 +42,17 @@ cbmpc_error_t cbmpc_ecdsa_2p_refresh(const cbmpc_2pc_job_t* job, cmem_t key_blob
  cbmpc_error_t cbmpc_ecdsa_2p_sign(const cbmpc_2pc_job_t* job, cmem_t key_blob, cmem_t msg_hash, cmem_t sid_in,
                                    cmem_t* sid_out, cmem_t* sig_der_out);
  
@@ -43,14 +48,18 @@ index b82bd02..b895bd4 100644
 +// Ownership: same as `cbmpc_ecdsa_2p_get_public_key_compressed`.
 +cbmpc_error_t cbmpc_ecdsa_2p_derive_additive_tweak(cmem_t key_blob, cmem_t tweak, cmem_t* out_key_blob);
 +
++// Locally derive a key blob for `key * mul + add` (32-byte scalars). Public key is
++// mul*Q + add*G. Ephemeral; do not refresh derived blobs. Ownership as above.
++cbmpc_error_t cbmpc_ecdsa_2p_derive_mul_add(cmem_t key_blob, cmem_t mul, cmem_t add, cmem_t* out_key_blob);
++
  // Compute compressed public key for a key blob.
  //
  // Ownership:
 diff --git a/src/cbmpc/api/ecdsa2pc.cpp b/src/cbmpc/api/ecdsa2pc.cpp
-index 142455e..7cd31ac 100644
+index 142455e..5e39230 100644
 --- a/src/cbmpc/api/ecdsa2pc.cpp
 +++ b/src/cbmpc/api/ecdsa2pc.cpp
-@@ -179,6 +179,40 @@ error_t sign(const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash,
+@@ -179,6 +179,79 @@ error_t sign(const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash,
    return sign_common(&coinbase::mpc::ecdsa2pc::sign, job, key_blob, msg_hash, sid, sig_der);
  }
  
@@ -88,14 +97,53 @@ index 142455e..7cd31ac 100644
 +  return serialize_key_blob(derived, out_key_blob);
 +}
 +
++error_t derive_mul_add(mem_t key_blob, mem_t mul, mem_t add, buf_t& out_key_blob) {
++  // Local derivation of `key * mul + add`: Q' = mul*Q + add*G. With the additive sharing
++  // x = x1 + x2, both shares are multiplied by `mul`; P1's Paillier ciphertext c_key = Enc(x1)
++  // becomes Enc(x1 * mul) via deterministic (non-rerandomized) homomorphic scalar
++  // multiplication so both parties hold the same ciphertext; P2 additionally adds `add`.
++  // P1's integer representative x1 * mul stays far below N (x1 < 2q after refresh, mul < q).
++  // Intended for BOLT 3 revocation keys; derived blobs are ephemeral and must not be refreshed.
++  out_key_blob.free();
++  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
++                                                                          coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
++    return rv;
++  if (mul.size != 32 || add.size != 32) return coinbase::error(E_BADARG, "mul/add must be 32 bytes");
++
++  coinbase::mpc::ecdsa2pc::key_t key;
++  if (const error_t rv = deserialize_key_blob(key_blob, key)) return rv;
++
++  const mod_t& q = key.curve.order();
++  const auto& G = key.curve.generator();
++  const bn_t m = bn_t::from_bin(mul);
++  const bn_t a = bn_t::from_bin(add);
++  if (m == 0 || m >= q) return coinbase::error(E_BADARG, "mul out of range");
++  if (a >= q) return coinbase::error(E_BADARG, "add out of range");
++
++  coinbase::mpc::ecdsa2pc::key_t derived;
++  derived.role = key.role;
++  derived.curve = key.curve;
++  derived.paillier = key.paillier;
++  derived.c_key = key.paillier.mul_scalar(key.c_key, m, coinbase::crypto::paillier_t::rerand_e::off);
++  derived.Q = m * key.Q + a * G;
++  if (key.role == coinbase::mpc::party_t::p2) {
++    MODULO(q) derived.x_share = key.x_share * m + a;
++  } else {
++    derived.x_share = key.x_share * m;  // plain integer, matches Dec(c_key')
++    if (!key.paillier.get_N().is_in_range(derived.x_share)) return coinbase::error(E_RANGE, "share too large");
++  }
++  if (key.curve.check(derived.Q)) return coinbase::error(E_CRYPTO, "derived point invalid");
++  return serialize_key_blob(derived, out_key_blob);
++}
++
  error_t get_public_key_compressed(mem_t key_blob, buf_t& pub_key) {
    if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
                                                                            coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
 diff --git a/src/cbmpc/c_api/ecdsa2pc.cpp b/src/cbmpc/c_api/ecdsa2pc.cpp
-index db7249d..5225e44 100644
+index db7249d..9b437d3 100644
 --- a/src/cbmpc/c_api/ecdsa2pc.cpp
 +++ b/src/cbmpc/c_api/ecdsa2pc.cpp
-@@ -145,6 +145,29 @@ cbmpc_error_t cbmpc_ecdsa_2p_sign(const cbmpc_2pc_job_t* job, cmem_t key_blob, c
+@@ -145,6 +145,54 @@ cbmpc_error_t cbmpc_ecdsa_2p_sign(const cbmpc_2pc_job_t* job, cmem_t key_blob, c
    return sign_common(&coinbase::api::ecdsa_2p::sign, job, key_blob, msg_hash, sid_in, sid_out, sig_der_out);
  }
  
@@ -111,6 +159,31 @@ index db7249d..5225e44 100644
 +    coinbase::buf_t out;
 +    const coinbase::error_t rv =
 +        coinbase::api::ecdsa_2p::derive_additive_tweak(view_cmem(key_blob), view_cmem(tweak), out);
++    if (rv) return rv;
++    return alloc_cmem_from_buf(out, out_key_blob);
++  } catch (const std::bad_alloc&) {
++    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
++    return E_INSUFFICIENT;
++  } catch (...) {
++    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
++    return E_GENERAL;
++  }
++}
++
++cbmpc_error_t cbmpc_ecdsa_2p_derive_mul_add(cmem_t key_blob, cmem_t mul, cmem_t add, cmem_t* out_key_blob) {
++  try {
++    if (!out_key_blob) return E_BADARG;
++    *out_key_blob = cmem_t{nullptr, 0};
++    const auto vkb = validate_cmem(key_blob);
++    if (vkb) return vkb;
++    const auto vm = validate_cmem(mul);
++    if (vm) return vm;
++    const auto va = validate_cmem(add);
++    if (va) return va;
++
++    coinbase::buf_t out;
++    const coinbase::error_t rv =
++        coinbase::api::ecdsa_2p::derive_mul_add(view_cmem(key_blob), view_cmem(mul), view_cmem(add), out);
 +    if (rv) return rv;
 +    return alloc_cmem_from_buf(out, out_key_blob);
 +  } catch (const std::bad_alloc&) {

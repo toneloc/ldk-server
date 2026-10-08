@@ -362,6 +362,26 @@ impl KeyBlob {
 	}
 }
 
+impl KeyBlob {
+	/// Locally derives the share blob of `key * mul + add` (BOLT 3 revocation-key derivation:
+	/// `revocation_base * H1 + per_commitment_secret * H2`, where the second term is public to
+	/// both parties once the counterparty has revealed the per-commitment secret).
+	///
+	/// Derived blobs are ephemeral and must not be refreshed.
+	pub fn derive_mul_add(&self, mul: &[u8; 32], add: &[u8; 32]) -> Result<KeyBlob, CbmpcError> {
+		unsafe {
+			let mut out = ffi::cmem_t::null();
+			check(ffi::cbmpc_ecdsa_2p_derive_mul_add(
+				view(&self.0),
+				view(mul),
+				view(add),
+				&mut out,
+			))?;
+			Ok(KeyBlob(take_cmem(out)))
+		}
+	}
+}
+
 impl Drop for KeyBlob {
 	fn drop(&mut self) {
 		// Best-effort zeroization of secret share material.

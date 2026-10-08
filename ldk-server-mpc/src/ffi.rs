@@ -113,6 +113,9 @@ extern "C" {
 	pub fn cbmpc_ecdsa_2p_derive_additive_tweak(
 		key_blob: cmem_t, tweak: cmem_t, out_key_blob: *mut cmem_t,
 	) -> cbmpc_error_t;
+	pub fn cbmpc_ecdsa_2p_derive_mul_add(
+		key_blob: cmem_t, mul: cmem_t, add: cmem_t, out_key_blob: *mut cmem_t,
+	) -> cbmpc_error_t;
 	pub fn cbmpc_ecdsa_2p_get_public_key_compressed(
 		key_blob: cmem_t, out_pub_key: *mut cmem_t,
 	) -> cbmpc_error_t;
