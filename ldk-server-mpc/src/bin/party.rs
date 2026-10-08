@@ -14,6 +14,7 @@ use std::time::Duration;
 use clap::Parser;
 use ldk_server_mpc::cbmpc::Party;
 use ldk_server_mpc::party::{PartyConfig, PartyService};
+use ldk_server_mpc::policy::{PayoutAllowlist, PolicyConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,6 +49,23 @@ struct Args {
 	/// Log level: error, warn, info, debug, trace.
 	#[arg(long, env = "LDK_MPC_LOG", default_value = "info")]
 	log_level: log::LevelFilter,
+	/// Account-level BIP 84 xpub whose addresses are the only allowed payout destinations for
+	/// cooperative closes and sweeps (LDK Server writes it to `<storage>/onchain_wallet_xpub`).
+	/// Repeatable.
+	#[arg(long, env = "LDK_MPC_PAYOUT_XPUB", value_delimiter = ',')]
+	payout_xpub: Vec<String>,
+	/// Explicit allowed payout address. Repeatable.
+	#[arg(long, value_delimiter = ',')]
+	payout_address: Vec<String>,
+	/// How many addresses per xpub chain to allow-list.
+	#[arg(long, default_value_t = 2000)]
+	payout_lookahead: u32,
+	/// Maximum drop of our channel balance between two consecutive signed commitments, in sats.
+	#[arg(long)]
+	max_balance_decrease_sat: Option<u64>,
+	/// Maximum a cooperative close may pay us below our last tracked balance, in sats.
+	#[arg(long, default_value_t = 10_000)]
+	max_closing_fee_sat: u64,
 }
 
 struct StderrLogger;
@@ -73,6 +91,32 @@ fn main() {
 	let _ = log::set_logger(&LOGGER);
 	log::set_max_level(args.log_level);
 
+	let mut payout = PayoutAllowlist::default();
+	for xpub in &args.payout_xpub {
+		let xpub = match xpub.parse() {
+			Ok(x) => x,
+			Err(e) => {
+				eprintln!("invalid --payout-xpub {xpub}: {e}");
+				std::process::exit(2);
+			},
+		};
+		if let Err(e) = payout.add_bip84_xpub(&xpub, args.payout_lookahead) {
+			eprintln!("failed to derive payout addresses: {e}");
+			std::process::exit(2);
+		}
+	}
+	for addr in &args.payout_address {
+		if let Err(e) = payout.add_address(addr) {
+			eprintln!("invalid --payout-address {addr}: {e}");
+			std::process::exit(2);
+		}
+	}
+	let policy = PolicyConfig {
+		payout: if payout.is_empty() { None } else { Some(payout) },
+		max_holder_balance_decrease_sat: args.max_balance_decrease_sat,
+		max_closing_fee_sat: args.max_closing_fee_sat,
+	};
+
 	let cfg = PartyConfig {
 		party: args.role,
 		listen_addr: args.listen,
@@ -82,6 +126,7 @@ fn main() {
 		p2_name: args.p2_name,
 		protocol_timeout: Duration::from_secs(args.protocol_timeout_secs),
 		client_timeout: Duration::from_secs(args.client_timeout_secs),
+		policy,
 	};
 	let service = match PartyService::new(cfg) {
 		Ok(s) => s,

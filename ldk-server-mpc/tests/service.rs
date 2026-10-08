@@ -40,6 +40,7 @@ fn start_party(
 		p2_name: "test-party-b".into(),
 		protocol_timeout: Duration::from_secs(30),
 		client_timeout: Duration::from_secs(60),
+		policy: Default::default(),
 	};
 	let svc = PartyService::new(cfg).unwrap();
 	let s = Arc::clone(&svc);
@@ -73,12 +74,7 @@ fn dkg_sign_and_restore_over_tcp() {
 	assert_eq!(pair.p2.public_key(&key_id).unwrap(), pk);
 
 	let digest = [0xabu8; 32];
-	let ctx = SigningContext {
-		op: Some(SigningOp::CounterpartyCommitment),
-		channel_keys_id: Some(key_id),
-		channel_value_satoshis: Some(50_000),
-		..Default::default()
-	};
+	let ctx = SigningContext { op: Some(SigningOp::Test), ..Default::default() };
 	let sig = client.sign(&secp, &key_id, &digest, Some(ctx), Some(&pk)).unwrap();
 	secp.verify_ecdsa(&Message::from_digest(digest), &sig, &pk).unwrap();
 	// Low-S enforced.

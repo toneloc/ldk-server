@@ -60,6 +60,32 @@ fn load_or_generate_entropy_at(mnemonic_path: &Path, protects: &str) -> io::Resu
 	Ok(NodeEntropy::from_bip39_mnemonic(mnemonic, None))
 }
 
+/// Derives the BIP 84 account xpub (`m/84'/coin'/0'`) of the on-chain wallet backed by the
+/// mnemonic at `mnemonic_path` and writes it to `out_path`. Returns the xpub string.
+pub(crate) fn write_onchain_wallet_xpub(
+	mnemonic_path: &Path, out_path: &Path, network: ldk_node::bitcoin::Network,
+) -> io::Result<String> {
+	use ldk_node::bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
+	use ldk_node::bitcoin::secp256k1::Secp256k1;
+
+	let raw = read_to_string_with_limit(mnemonic_path, MNEMONIC_FILE_SIZE_LIMIT)?;
+	let mnemonic = Mnemonic::from_str(raw.trim())
+		.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+	let seed = mnemonic.to_seed("");
+	let secp = Secp256k1::new();
+	let master = Xpriv::new_master(network, &seed).map_err(io::Error::other)?;
+	let coin = if network == ldk_node::bitcoin::Network::Bitcoin { 0 } else { 1 };
+	let path = [
+		ChildNumber::from_hardened_idx(84).unwrap(),
+		ChildNumber::from_hardened_idx(coin).unwrap(),
+		ChildNumber::from_hardened_idx(0).unwrap(),
+	];
+	let account = master.derive_priv(&secp, &path).map_err(io::Error::other)?;
+	let xpub = Xpub::from_priv(&secp, &account).to_string();
+	std::fs::write(out_path, format!("{xpub}\n"))?;
+	Ok(xpub)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;

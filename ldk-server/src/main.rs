@@ -273,16 +273,16 @@ fn main() {
 	}
 
 	if let Some(mpc_config) = &config_file.mpc_config {
-		let mpc_signer = crate::mpc_signer::MpcFundingSigner::new(mpc_config);
+		let mpc_signer = crate::mpc_signer::MpcChannelSigner::new(mpc_config);
 		if let Err(e) = mpc_signer.ping() {
 			error!("MPC party A at {} is unreachable: {e}", mpc_config.party_address);
 			std::process::exit(-1);
 		}
 		info!(
-			"Channel funding keys are 2-of-2 MPC-backed via party A at {}",
-			mpc_config.party_address
+			"Channel keys are 2-of-2 MPC-backed via party A at {} (coverage: {:?})",
+			mpc_config.party_address, mpc_config.coverage
 		);
-		builder.set_external_funding_signer(Arc::new(mpc_signer));
+		builder.set_external_channel_signer(Arc::new(mpc_signer));
 	}
 
 	if let Err(e) =
@@ -311,6 +311,23 @@ fn main() {
 			};
 		info!("On-chain wallet is derived from a separate mnemonic at {path}");
 		builder.set_onchain_wallet_entropy(wallet_entropy);
+	}
+
+	// Export the on-chain wallet's account xpub so an MPC Party B payout allow-list can be
+	// configured from it without access to any secret.
+	{
+		let mnemonic_path = match &config_file.onchain_wallet_mnemonic_path {
+			Some(p) => PathBuf::from(p),
+			None => storage_dir.join("keys_mnemonic"),
+		};
+		match crate::util::entropy::write_onchain_wallet_xpub(
+			&mnemonic_path,
+			&storage_dir.join("onchain_wallet_xpub"),
+			config_file.network,
+		) {
+			Ok(xpub) => info!("On-chain wallet account xpub (BIP 84): {xpub}"),
+			Err(e) => error!("Failed to export on-chain wallet xpub: {e}"),
+		}
 	}
 
 	let uses_postgres =
