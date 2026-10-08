@@ -37,6 +37,16 @@ pub(crate) struct MpcChannelSigner {
 	secp: Secp256k1<All>,
 	/// Public keys fetched from the MPC service, keyed by MPC key id.
 	pubkeys: Mutex<HashMap<KeyId, PublicKey>>,
+	/// State notices that could not be delivered (MPC unreachable), replayed in order before
+	/// the next request. Returning an error from LDK's validation callbacks would force-close
+	/// the channel, so notices are best-effort with ordered retry instead.
+	pending_notices: Mutex<Vec<PendingNotice>>,
+}
+
+#[derive(Clone, Debug)]
+enum PendingNotice {
+	HolderCommitmentValidated { channel: ChannelId, commitment_number: u64 },
+	CounterpartyRevocationValidated { channel: ChannelId, idx: u64, secret: [u8; 32] },
 }
 
 impl MpcChannelSigner {
@@ -64,7 +74,46 @@ impl MpcChannelSigner {
 			coverage,
 			secp: Secp256k1::new(),
 			pubkeys: Mutex::new(HashMap::new()),
+			pending_notices: Mutex::new(Vec::new()),
 		})
+	}
+
+	fn deliver(&self, notice: &PendingNotice) -> Result<(), ClientError> {
+		match notice {
+			PendingNotice::HolderCommitmentValidated { channel, commitment_number } => {
+				self.client.holder_commitment_validated(channel, *commitment_number)
+			},
+			PendingNotice::CounterpartyRevocationValidated { channel, idx, secret } => {
+				self.client.counterparty_revocation_validated(channel, *idx, *secret)
+			},
+		}
+	}
+
+	/// Replays queued notices in order. Fails (leaving the rest queued) if one cannot be
+	/// delivered, so later requests never overtake an undelivered state update.
+	fn flush_notices(&self) -> Result<(), ClientError> {
+		let mut pending = self.pending_notices.lock().unwrap();
+		while let Some(notice) = pending.first().cloned() {
+			self.deliver(&notice)?;
+			pending.remove(0);
+		}
+		Ok(())
+	}
+
+	/// Delivers a notice now, or queues it for ordered retry if the MPC is unreachable.
+	fn notify(&self, notice: PendingNotice) {
+		let res = self.flush_notices().and_then(|_| self.deliver(&notice));
+		match res {
+			Ok(()) => {},
+			Err(ClientError::Remote { code, message }) => {
+				// The policy rejected the notice: nothing to retry.
+				error!("MPC rejected state notice {notice:?}: {code:?}: {message}");
+			},
+			Err(e) => {
+				error!("MPC state notice {notice:?} queued for retry: {e}");
+				self.pending_notices.lock().unwrap().push(notice);
+			},
+		}
 	}
 
 	/// Checks the MPC service is reachable.
@@ -329,6 +378,7 @@ impl ExternalChannelSigner for MpcChannelSigner {
 	}
 
 	fn per_commitment_point(&self, channel_keys_id: [u8; 32], idx: u64) -> Result<PublicKey, ()> {
+		self.flush_notices().map_err(|e| error!("MPC notice replay failed: {e}"))?;
 		self.client.per_commitment_point(&Self::channel_id(channel_keys_id), idx).map_err(|e| {
 			error!("MPC per-commitment point {idx} failed: {e}");
 		})
@@ -337,6 +387,7 @@ impl ExternalChannelSigner for MpcChannelSigner {
 	fn release_commitment_secret(
 		&self, channel_keys_id: [u8; 32], idx: u64,
 	) -> Result<[u8; 32], ()> {
+		self.flush_notices().map_err(|e| error!("MPC notice replay failed: {e}"))?;
 		self.client.release_commitment_secret(&Self::channel_id(channel_keys_id), idx).map_err(
 			|e| {
 				error!("MPC release of commitment secret {idx} failed: {e}");
@@ -347,30 +398,28 @@ impl ExternalChannelSigner for MpcChannelSigner {
 	fn holder_commitment_validated(
 		&self, channel_keys_id: [u8; 32], commitment_number: u64,
 	) -> Result<(), ()> {
-		self.client
-			.holder_commitment_validated(&Self::channel_id(channel_keys_id), commitment_number)
-			.map_err(|e| {
-				error!("MPC holder commitment validation notice failed: {e}");
-			})
+		self.notify(PendingNotice::HolderCommitmentValidated {
+			channel: Self::channel_id(channel_keys_id),
+			commitment_number,
+		});
+		Ok(())
 	}
 
 	fn counterparty_revocation_validated(
 		&self, channel_keys_id: [u8; 32], idx: u64, secret: &SecretKey,
 	) -> Result<(), ()> {
-		self.client
-			.counterparty_revocation_validated(
-				&Self::channel_id(channel_keys_id),
-				idx,
-				secret.secret_bytes(),
-			)
-			.map_err(|e| {
-				error!("MPC counterparty revocation notice failed: {e}");
-			})
+		self.notify(PendingNotice::CounterpartyRevocationValidated {
+			channel: Self::channel_id(channel_keys_id),
+			idx,
+			secret: secret.secret_bytes(),
+		});
+		Ok(())
 	}
 
 	fn sign(
 		&self, channel_keys_id: [u8; 32], requests: Vec<SignRequest>,
 	) -> Result<Vec<Signature>, ()> {
+		self.flush_notices().map_err(|e| error!("MPC notice replay failed: {e}"))?;
 		let started = std::time::Instant::now();
 		let ops: Vec<ChannelSignOp> = requests.iter().map(|r| r.context.op).collect();
 		let mut items = Vec::with_capacity(requests.len());
