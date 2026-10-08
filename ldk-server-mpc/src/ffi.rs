@@ -110,6 +110,9 @@ extern "C" {
 		job: *const cbmpc_2pc_job_t, key_blob: cmem_t, msg_hash: cmem_t, sid_in: cmem_t,
 		sid_out: *mut cmem_t, sig_der_out: *mut cmem_t,
 	) -> cbmpc_error_t;
+	pub fn cbmpc_ecdsa_2p_derive_additive_tweak(
+		key_blob: cmem_t, tweak: cmem_t, out_key_blob: *mut cmem_t,
+	) -> cbmpc_error_t;
 	pub fn cbmpc_ecdsa_2p_get_public_key_compressed(
 		key_blob: cmem_t, out_pub_key: *mut cmem_t,
 	) -> cbmpc_error_t;

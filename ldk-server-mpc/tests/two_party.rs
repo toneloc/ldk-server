@@ -117,3 +117,47 @@ fn transport_failure_is_reported() {
 	let err = Job::new(Party::P1, "party-a", "party-b", &ta).sign(&a, &[0u8; 32]).unwrap_err();
 	assert!(matches!(err, ldk_server_mpc::cbmpc::ProtocolError::Transport(_)), "{err}");
 }
+
+#[test]
+fn additive_tweak_derivation_matches_secp_and_signs() {
+	use ldk_server_mpc::bitcoin::secp256k1::Scalar;
+	let secp = Secp256k1::new();
+	let (a, b) = run_dkg();
+	let base = PublicKey::from_slice(&a.public_key_compressed().unwrap()).unwrap();
+
+	// A BOLT 3 style tweak: SHA256(per_commitment_point || basepoint), here just fixed bytes.
+	let mut tweak = [0x5au8; 32];
+	tweak[0] = 0x01;
+	let da = a.derive_additive_tweak(&tweak).unwrap();
+	let db = b.derive_additive_tweak(&tweak).unwrap();
+	let pk_a = PublicKey::from_slice(&da.public_key_compressed().unwrap()).unwrap();
+	let pk_b = PublicKey::from_slice(&db.public_key_compressed().unwrap()).unwrap();
+	assert_eq!(pk_a, pk_b, "both parties derive the same public key");
+	let expected = base.add_exp_tweak(&secp, &Scalar::from_be_bytes(tweak).unwrap()).unwrap();
+	assert_eq!(pk_a, expected, "derived key is Q + tweak*G");
+	assert_ne!(pk_a, base);
+
+	// The derived shares produce valid signatures for the derived key.
+	let (da, db) = (Arc::new(da), Arc::new(db));
+	let digest = [0x77u8; 32];
+	let (sig, _) = run_sign(&da, &db, digest);
+	let mut sig = Signature::from_der(&sig.unwrap()).unwrap();
+	sig.normalize_s();
+	secp.verify_ecdsa(&Message::from_digest(digest), &sig, &pk_a).unwrap();
+	assert!(secp.verify_ecdsa(&Message::from_digest(digest), &sig, &base).is_err());
+
+	// Different tweaks give different keys; a zero tweak is rejected.
+	let other = a.derive_additive_tweak(&[0x02u8; 32]).unwrap();
+	assert_ne!(other.public_key_compressed().unwrap(), da.public_key_compressed().unwrap());
+	assert!(a.derive_additive_tweak(&[0u8; 32]).is_err());
+
+	// Mismatched tweaks between the parties must not produce a signature.
+	let dm = Arc::new(b.derive_additive_tweak(&[0x03u8; 32]).unwrap());
+	let (ta, tb) = ChannelTransport::pair(Duration::from_secs(60));
+	let dm2 = Arc::clone(&dm);
+	let h =
+		thread::spawn(move || Job::new(Party::P2, "party-a", "party-b", &tb).sign(&dm2, &digest));
+	let ra = Job::new(Party::P1, "party-a", "party-b", &ta).sign(&da, &digest);
+	let rb = h.join().unwrap();
+	assert!(ra.is_err() || rb.is_err());
+}

@@ -348,6 +348,20 @@ impl KeyBlob {
 	}
 }
 
+impl KeyBlob {
+	/// Locally derives the share blob of `key + tweak` (BOLT 3 style additive derivation).
+	///
+	/// Both parties apply the same 32-byte tweak to their blobs of the same key and obtain
+	/// shares of the derived key, whose public key is `Q + tweak*G`. No network round trip.
+	pub fn derive_additive_tweak(&self, tweak: &[u8; 32]) -> Result<KeyBlob, CbmpcError> {
+		unsafe {
+			let mut out = ffi::cmem_t::null();
+			check(ffi::cbmpc_ecdsa_2p_derive_additive_tweak(view(&self.0), view(tweak), &mut out))?;
+			Ok(KeyBlob(take_cmem(out)))
+		}
+	}
+}
+
 impl Drop for KeyBlob {
 	fn drop(&mut self) {
 		// Best-effort zeroization of secret share material.

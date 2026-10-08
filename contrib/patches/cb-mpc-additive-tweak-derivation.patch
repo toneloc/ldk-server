@@ -1,0 +1,130 @@
+From 3f38bf97276389d89b408ce5def6461518eba103 Mon Sep 17 00:00:00 2001
+From: toneloc <3665696+toneloc@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:22:36 -0400
+Subject: [PATCH] Add ecdsa_2p::derive_additive_tweak (local additive key
+ derivation, C and C++ API)
+
+---
+ include/cbmpc/api/ecdsa_2p.h   |  6 ++++++
+ include/cbmpc/c_api/ecdsa_2p.h |  7 +++++++
+ src/cbmpc/api/ecdsa2pc.cpp     | 34 ++++++++++++++++++++++++++++++++++
+ src/cbmpc/c_api/ecdsa2pc.cpp   | 23 +++++++++++++++++++++++
+ 4 files changed, 70 insertions(+)
+
+diff --git a/include/cbmpc/api/ecdsa_2p.h b/include/cbmpc/api/ecdsa_2p.h
+index c95a5e6..0fb989e 100644
+--- a/include/cbmpc/api/ecdsa_2p.h
++++ b/include/cbmpc/api/ecdsa_2p.h
+@@ -34,6 +34,12 @@ error_t refresh(const coinbase::api::job_2p_t& job, mem_t key_blob, buf_t& new_k
+ // On any error, `sig_der` is cleared.
+ error_t sign(const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash, buf_t& sid, buf_t& sig_der);
+ 
++// Locally derive a key blob for `key + tweak` (tweak: 32-byte big-endian scalar in [1, q)).
++// Non-interactive; both parties apply the same tweak to their blobs of the same key and obtain
++// shares of the derived key, whose public key is Q + tweak*G. Used for Lightning-style
++// additive key derivation (BOLT 3 per-commitment keys).
++error_t derive_additive_tweak(mem_t key_blob, mem_t tweak, buf_t& out_key_blob);
++
+ // Get the compressed public key from a key blob.
+ error_t get_public_key_compressed(mem_t key_blob, buf_t& pub_key);
+ 
+diff --git a/include/cbmpc/c_api/ecdsa_2p.h b/include/cbmpc/c_api/ecdsa_2p.h
+index b82bd02..b895bd4 100644
+--- a/include/cbmpc/c_api/ecdsa_2p.h
++++ b/include/cbmpc/c_api/ecdsa_2p.h
+@@ -42,6 +42,13 @@ cbmpc_error_t cbmpc_ecdsa_2p_refresh(const cbmpc_2pc_job_t* job, cmem_t key_blob
+ cbmpc_error_t cbmpc_ecdsa_2p_sign(const cbmpc_2pc_job_t* job, cmem_t key_blob, cmem_t msg_hash, cmem_t sid_in,
+                                   cmem_t* sid_out, cmem_t* sig_der_out);
+ 
++// Locally derive a key blob for `key + tweak` (32-byte big-endian scalar in [1, q)).
++// Both parties apply the same tweak to blobs of the same key; the derived public key is
++// Q + tweak*G. Non-interactive.
++//
++// Ownership: same as `cbmpc_ecdsa_2p_get_public_key_compressed`.
++cbmpc_error_t cbmpc_ecdsa_2p_derive_additive_tweak(cmem_t key_blob, cmem_t tweak, cmem_t* out_key_blob);
++
+ // Compute compressed public key for a key blob.
+ //
+ // Ownership:
+diff --git a/src/cbmpc/api/ecdsa2pc.cpp b/src/cbmpc/api/ecdsa2pc.cpp
+index 142455e..7cd31ac 100644
+--- a/src/cbmpc/api/ecdsa2pc.cpp
++++ b/src/cbmpc/api/ecdsa2pc.cpp
+@@ -179,6 +179,40 @@ error_t sign(const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash,
+   return sign_common(&coinbase::mpc::ecdsa2pc::sign, job, key_blob, msg_hash, sid, sig_der);
+ }
+ 
++error_t derive_additive_tweak(mem_t key_blob, mem_t tweak, buf_t& out_key_blob) {
++  // Local (non-interactive) derivation of `key + tweak`: Q' = Q + tweak*G, and P2 adds the
++  // tweak to its share. P1's share and the Paillier ciphertext c_key = Enc(x1) are unchanged,
++  // exactly as the non-hardened step of hd_keyset_ecdsa_2p::derive_keys does. Both parties
++  // must apply the same tweak to the same key blob to obtain shares of the same derived key.
++  out_key_blob.free();
++  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
++                                                                          coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
++    return rv;
++  if (tweak.size != 32) return coinbase::error(E_BADARG, "tweak must be 32 bytes");
++
++  coinbase::mpc::ecdsa2pc::key_t key;
++  if (const error_t rv = deserialize_key_blob(key_blob, key)) return rv;
++
++  const mod_t& q = key.curve.order();
++  const auto& G = key.curve.generator();
++  const bn_t t = bn_t::from_bin(tweak);
++  if (t == 0 || t >= q) return coinbase::error(E_BADARG, "tweak out of range");
++
++  coinbase::mpc::ecdsa2pc::key_t derived;
++  derived.role = key.role;
++  derived.curve = key.curve;
++  derived.paillier = key.paillier;
++  derived.c_key = key.c_key;
++  derived.Q = key.Q + t * G;
++  if (key.role == coinbase::mpc::party_t::p2) {
++    MODULO(q) derived.x_share = key.x_share + t;
++  } else {
++    derived.x_share = key.x_share;
++  }
++  if (key.curve.check(derived.Q)) return coinbase::error(E_CRYPTO, "derived point invalid");
++  return serialize_key_blob(derived, out_key_blob);
++}
++
+ error_t get_public_key_compressed(mem_t key_blob, buf_t& pub_key) {
+   if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
+                                                                           coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
+diff --git a/src/cbmpc/c_api/ecdsa2pc.cpp b/src/cbmpc/c_api/ecdsa2pc.cpp
+index db7249d..5225e44 100644
+--- a/src/cbmpc/c_api/ecdsa2pc.cpp
++++ b/src/cbmpc/c_api/ecdsa2pc.cpp
+@@ -145,6 +145,29 @@ cbmpc_error_t cbmpc_ecdsa_2p_sign(const cbmpc_2pc_job_t* job, cmem_t key_blob, c
+   return sign_common(&coinbase::api::ecdsa_2p::sign, job, key_blob, msg_hash, sid_in, sid_out, sig_der_out);
+ }
+ 
++cbmpc_error_t cbmpc_ecdsa_2p_derive_additive_tweak(cmem_t key_blob, cmem_t tweak, cmem_t* out_key_blob) {
++  try {
++    if (!out_key_blob) return E_BADARG;
++    *out_key_blob = cmem_t{nullptr, 0};
++    const auto vkb = validate_cmem(key_blob);
++    if (vkb) return vkb;
++    const auto vtw = validate_cmem(tweak);
++    if (vtw) return vtw;
++
++    coinbase::buf_t out;
++    const coinbase::error_t rv =
++        coinbase::api::ecdsa_2p::derive_additive_tweak(view_cmem(key_blob), view_cmem(tweak), out);
++    if (rv) return rv;
++    return alloc_cmem_from_buf(out, out_key_blob);
++  } catch (const std::bad_alloc&) {
++    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
++    return E_INSUFFICIENT;
++  } catch (...) {
++    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
++    return E_GENERAL;
++  }
++}
++
+ cbmpc_error_t cbmpc_ecdsa_2p_get_public_key_compressed(cmem_t key_blob, cmem_t* out_pub_key) {
+   try {
+     if (!out_pub_key) return E_BADARG;
+-- 
+2.50.1 (Apple Git-155)
+
