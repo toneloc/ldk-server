@@ -1,0 +1,29 @@
+# LDK Server on Bitcoin Signet with Coinbase cb-mpc 2-of-2 MPC-backed channel funding keys.
+#
+# Start the two MPC parties first (see run-mpc-parties.sh), then:
+#   ldk-server contrib/mpc-signet/ldk-server-signet-mpc.toml
+#
+# Use a FRESH storage directory: existing channels created with locally derived funding
+# keys cannot be migrated to MPC keys.
+
+[node]
+network = "signet"
+listening_addresses = ["127.0.0.1:9735"]
+alias = "ldk-mpc-signet"
+grpc_service_address = "127.0.0.1:3536"
+
+[storage.disk]
+dir_path = "/tmp/ldk-server-mpc-signet/"
+
+[esplora]
+server_url = "https://mempool.space/signet/api"
+
+[log]
+level = "Debug"
+log_to_file = true
+
+[mpc]
+# Address of MPC Party A (cb-mpc P1). Party B is only reachable by Party A.
+party_address = "127.0.0.1:7701"
+request_timeout_secs = 30
+dkg_timeout_secs = 120

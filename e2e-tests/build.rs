@@ -31,6 +31,8 @@ fn main() {
 			"ldk-server-cli",
 			"-p",
 			"ldk-server-mcp",
+			"-p",
+			"ldk-server-mpc",
 		])
 		.current_dir(&workspace_root)
 		.env("CARGO_TARGET_DIR", &target_dir)
@@ -44,13 +46,16 @@ fn main() {
 	let server_bin = bin_dir.join("ldk-server");
 	let cli_bin = bin_dir.join("ldk-server-cli");
 	let mcp_bin = bin_dir.join("ldk-server-mcp");
+	let mpc_party_bin = bin_dir.join("ldk-server-mpc-party");
 
 	println!("cargo:rustc-env=LDK_SERVER_BIN={}", server_bin.display());
 	println!("cargo:rustc-env=LDK_SERVER_CLI_BIN={}", cli_bin.display());
 	println!("cargo:rustc-env=LDK_SERVER_MCP_BIN={}", mcp_bin.display());
+	println!("cargo:rustc-env=LDK_SERVER_MPC_PARTY_BIN={}", mpc_party_bin.display());
 
 	// Rebuild when server or CLI source changes
 	println!("cargo:rerun-if-changed=../ldk-server/src");
+	println!("cargo:rerun-if-changed=../ldk-server-mpc/src");
 	println!("cargo:rerun-if-changed=../ldk-server/Cargo.toml");
 	println!("cargo:rerun-if-changed=../ldk-server-cli/src");
 	println!("cargo:rerun-if-changed=../ldk-server-cli/Cargo.toml");
