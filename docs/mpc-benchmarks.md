@@ -62,6 +62,33 @@ unaffected.
 Signet (real network, `contrib/mpc-signet`): `CounterpartyCommitment` for the channel open
 with a remote LND peer took 67.6 ms.
 
+## Full key coverage (regtest e2e, `coverage = "all"`, measured 2026-10-08)
+
+Latency inside `ExternalChannelSigner::sign` (policy on both parties, parallel sessions to
+Party B, signature verification), from the ldk-server log of `e2e-tests/tests/mpc.rs`:
+
+| batch                                             | n | min     | p50     | max     |
+|---------------------------------------------------|---|---------|---------|---------|
+| `[CounterpartyCommitment]`                        | 7 | 51.2 ms | 53.1 ms | 65.0 ms |
+| `[CounterpartyCommitment, CounterpartyCommitmentHtlc]` (1 HTLC) | 6 | 60.0 ms | 64.0 ms | 88.9 ms |
+| `[HolderCommitment]` (force close)                | 1 | 69.3 ms | 69.3 ms | 69.3 ms |
+| `[ClosingTransaction]`                            | 2 | 46.5 ms | 46.6 ms | 46.6 ms |
+| `[ChannelAnnouncement]`                           | 4 | 47.1 ms | 59.1 ms | 74.0 ms |
+| five DKGs at channel open (parallel)              | 1 | 431 ms wall |     |         |
+
+HTLC signatures run as parallel sessions, so a commitment with *k* HTLCs costs roughly
+one session plus a few ms per extra HTLC rather than *k* sequential sessions.
+
+## Signet (funding-only coverage, 2026-10-08)
+
+Real-network timings from `contrib/mpc-signet` against a third-party LND node (Blink staging)
+and a second LDK Server, both parties on the same machine as the node:
+
+- `CounterpartyCommitment`: 40–66 ms; `ClosingTransaction`: 39.6 ms; `HolderCommitment`
+  (force close): 44.4 / 73.2 ms.
+- A 20,000 sat BOLT11 receive was recorded (`PAYMENT_RECEIVED`) 164 ms after the sender's
+  `bolt11-send` command returned, including network round trips to the peer.
+
 ## How to reproduce
 
 ```bash

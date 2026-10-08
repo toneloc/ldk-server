@@ -87,12 +87,18 @@ It is covered by both crate-local tests and an `e2e-tests` sanity suite against 
 
 ### MPC Channel Signing (Coinbase cb-mpc)
 
-This fork adds a proof of concept that puts each channel's **funding key** under
-[Coinbase cb-mpc](https://github.com/coinbase/cb-mpc) two-party ECDSA. Two independent
-MPC processes each hold one key share; the complete private key is never assembled. All
-Lightning channel state stays in LDK Server / LDK Node. Details, build steps and remaining
-work are in [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md); measurements are in
-[`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
+This fork puts **every channel key** (funding, payment, delayed-payment, HTLC and revocation
+basepoints) and the per-commitment secrets under [Coinbase cb-mpc](https://github.com/coinbase/cb-mpc)
+two-party ECDSA. Two independent MPC processes each hold one share of every key; the complete
+private keys are never assembled. Party B holds the commitment seed and enforces a signing
+policy: it recomputes every sighash from the transaction it is given, checks key kinds and
+BOLT 3 derivations, keeps commitment numbers monotonic, releases per-commitment secrets only
+once a newer holder commitment was validated, tracks our balance in every commitment and
+caps how much it may drop per update, and only signs closes and sweeps that pay an
+allow-listed script (the wallet's xpub). Links are PSK-authenticated and encrypted; shares
+are encrypted at rest. All Lightning channel state stays in LDK Server / LDK Node. Details,
+build steps and remaining work are in [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md);
+measurements are in [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
 
 #### Architecture
 
@@ -105,30 +111,30 @@ flowchart TB
             NODE["LDK Node (patched)<br/>channel state machine, HTLCs,<br/>payments, monitors, persistence"]
             SP["WalletKeysManager<br/>(SignerProvider)"]
             NCS["NodeChannelSigner<br/>= InMemorySigner + external funding key"]
-            MFS["MpcFundingSigner<br/>(ExternalFundingSigner impl)"]
+            MFS["MpcChannelSigner<br/>(ExternalChannelSigner impl)"]
             MC["MpcClient"]
             API --> NODE --> SP --> NCS
-            NCS -- "funding-key ops only:<br/>pubkeys / sign commitment,<br/>closing, anchor, announcement, splice" --> MFS --> MC
-            NCS -. "all other keys stay local:<br/>revocation, payment, delayed, HTLC,<br/>per-commitment secrets" .-> NCS
+            NCS -- "all channel keys:<br/>pubkeys, per-commitment points/secrets,<br/>commitment, HTLC, closing, justice,<br/>sweep signatures (full tx context)" --> MFS --> MC
+            NCS -. "stays local:<br/>node identity key,<br/>on-chain wallet (own mnemonic)" .-> NCS
         end
         KV[("LDK KV store<br/>channels, monitors, wallet")]
         NODE --> KV
     end
 
     subgraph pa["MPC Party A process (cb-mpc P1)"]
-        P1["ldk-server-mpc-party --role p1"]
-        KA[("share A<br/>&lt;key_id&gt;.share")]
+        P1["ldk-server-mpc-party --role p1<br/>policy (first line)"]
+        KA[("shares A (encrypted)<br/>5 per channel")]
         P1 --> KA
     end
 
     subgraph pb["MPC Party B process (cb-mpc P2)"]
-        P2["ldk-server-mpc-party --role p2"]
-        KB[("share B<br/>&lt;key_id&gt;.share")]
+        P2["ldk-server-mpc-party --role p2<br/>policy (authoritative)<br/>commitment seed"]
+        KB[("shares B (encrypted)<br/>+ master secret<br/>+ per-channel policy state")]
         P2 --> KB
     end
 
-    MC -- "TCP, one request per call:<br/>EnsureKey{key_id} -> pubkey<br/>Sign{key_id, digest, context} -> sig" --> P1
-    P1 <-- "framed TCP session per operation:<br/>SessionStart -> SessionAck -><br/>cb-mpc ECDSA-2P rounds (DKG / sign)<br/>-> SessionDone{pubkey}" --> P2
+    MC -- "PSK-encrypted TCP, one request per call:<br/>EnsureKey{key, channel, kind} -> pubkey<br/>PerCommitmentPoint / ReleaseSecret<br/>Sign{items: key, derivation, digest, full tx} -> sigs" --> P1
+    P1 <-- "PSK-encrypted session per item (parallel):<br/>SessionStart -> policy -> SessionAck -><br/>cb-mpc ECDSA-2P rounds (DKG / sign)<br/>-> SessionDone{pubkey}" --> P2
 
     classDef mpc fill:#eef6ff,stroke:#3b6fb6;
     classDef ldk fill:#f6f6f6,stroke:#666;
@@ -139,84 +145,100 @@ flowchart TB
 - **LDK Server** owns all Lightning state and the on-chain wallet; it never sees a funding
   private key.
 - **Party A (P1)** is the only endpoint LDK Server talks to and the only party that
-  obtains the final signature (a property of cb-mpc ECDSA-2P). It holds share A.
-- **Party B (P2)** only accepts protocol sessions from Party A and holds share B. Neither
-  party stores channel state; the only state is the opaque per-key share blob.
+  obtains the final signature (a property of cb-mpc ECDSA-2P). It holds the A shares and
+  runs the policy as a first line.
+- **Party B (P2)** only accepts protocol sessions from Party A, holds the B shares, the
+  commitment-seed master secret and the per-channel policy counters, and is the authoritative
+  policy. It never sees LDK's database; everything it checks it recomputes from the
+  transaction bytes in the request.
 
-#### Signing flow for one commitment update
+#### Signing flow for one commitment update (funding signature + one HTLC signature)
 
 ```text
- LDK channel state machine          MpcFundingSigner        Party A (P1)             Party B (P2)
- ────────────────────────           ────────────────        ────────────             ────────────
+ LDK channel state machine        MpcChannelSigner           Party A (P1)                    Party B (P2)
+ ────────────────────────         ────────────────           ────────────                    ────────────
  sign_counterparty_commitment ─┐
-   HTLC sigs: local htlc key   │
-   funding sig: sighash ───────┼──▶ key_id = H(tag ‖ channel_keys_id)
-                               │    Sign{key_id, digest, ctx} ──▶ load share A
-                               │                                 policy.authorize (AllowAll)
-                               │                                 SessionStart ────────────▶ load share B
-                               │                                 ◀──────────── SessionAck   policy.authorize
-                               │                                 ◀═ cb-mpc ECDSA-2P sign ═▶
-                               │                                 DER sig (P1 only)
-                               │                                 ◀──────────── SessionDone{pubkey}
-                               │                                 verify, low-S normalize
-                               │    ◀── Signature (compact)
-                               │    verify against cached pubkey
+   build commitment + HTLC txs │
+   funding sighash, HTLC sighash
+                               ├─▶ items: [funding key, none, digest, full tx ctx],
+                               │          [htlc basepoint, +SHA256(pcp‖base), digest, htlc tx ctx]
+                               │   Sign{channel, items} ──▶ policy.authorize(each item)
+                               │                            derive share (+tweak) locally
+                               │                            ┌─ session 1 ──SessionStart──▶ policy: sighash ✓, key kind ✓,
+                               │                            │                               derivation ✓, commitment nr ✓,
+                               │                            │                               balance by script ✓ (cap)
+                               │                            │  ◀──── SessionAck ────────── derive share B (+tweak)
+                               │                            │  ◀═ cb-mpc ECDSA-2P sign ═▶
+                               │                            │  ◀──── SessionDone{pubkey}── commit state
+                               │                            └─ session 2 (in parallel) ... same for the HTLC item
+                               │                            verify each sig vs derived pubkey, low-S
+                               │   ◀── [sig, sig]
+                               │   verify vs locally derived pubkeys
  ◀─ (funding sig, HTLC sigs) ──┘
+ ...
+ validate_holder_commitment(n) ──▶ HolderCommitmentValidated{n} ──▶ (mirror) ──▶ record n
+ release_commitment_secret(n+1) ─▶ ReleaseSecret{n+1} ──▶ forward ──▶ seed: allowed iff n+1 > validated(n)
 ```
 
-#### What is MPC-backed
+#### What is MPC-backed (`coverage = "all"`)
 
-| Key / operation                                        | Backing                    |
-|--------------------------------------------------------|----------------------------|
-| Funding key (2-of-2 funding multisig)                  | **cb-mpc 2-of-2 (A + B)**  |
-| Counterparty / holder commitment funding signatures    | MPC                        |
-| Cooperative closing transaction                        | MPC                        |
-| Keyed anchor input, channel announcement               | MPC                        |
-| Splice shared input / spliced funding key              | MPC (fresh DKG per splice) |
-| HTLC signatures, revocation, payment, delayed basepoints | local (`InMemorySigner`) |
-| Per-commitment secrets, justice and HTLC claim txs     | local                      |
-| Node identity, gossip, BOLT12, on-chain wallet (BDK)   | local, unchanged           |
+| Key / operation                                        | Backing                                    |
+|--------------------------------------------------------|--------------------------------------------|
+| Funding key, spliced funding keys                      | **cb-mpc 2-of-2 (A + B)**, fresh DKG per splice |
+| Payment point (`to_remote`)                            | MPC                                        |
+| Delayed-payment / HTLC basepoints and per-commitment keys | MPC, per-commitment key = share + BOLT 3 tweak |
+| Revocation basepoint and revocation keys               | MPC, `share·H1 + secret·H2` on shares      |
+| Per-commitment secrets and points                      | **Party B only**, released under policy    |
+| Commitment, HTLC, closing, anchor, splice, justice, sweep signatures | MPC                           |
+| Node identity, gossip, BOLT12                          | local                                      |
+| On-chain wallet (BDK)                                  | local, own mnemonic; Party B only pays out to its addresses |
 
-This is **funding-key protection only**. An attacker who controls the LDK Server host
-cannot produce new commitment, closing or splice signatures on their own, but still holds
-every local key: they can broadcast an already-signed old state, leak per-commitment
-secrets, force-close with the already-signed latest state and sweep the confirmed
-`to_local`/HTLC outputs to any address (the usual destination, the BDK wallet, comes from
-the same seed), settle HTLCs, and Party B signs whatever
-it is asked (`AllowAllPolicy`, unverified context). Treat it as a custody split for the
-funding key, not a validating signer. See the crate README for details.
+`coverage = "funding"` keeps the original funding-key-only mode.
 
-Because of this, the on-chain wallet should not share a seed with the Lightning node. Set
-`onchain_wallet_mnemonic_path` in `[node]` (or `--node-onchain-wallet-mnemonic-path`) and
-LDK Server derives the BDK wallet from a separate BIP39 mnemonic at that path (generated on
-first start), so a compromise of the node mnemonic does not expose on-chain funds and vice
-versa. Enable it only on a fresh node.
+With full coverage and Party B on separate infrastructure, an attacker who controls the LDK
+Server host cannot produce any channel signature, sweep any channel output, obtain a
+per-commitment secret early, get an old state or a balance-draining commitment signed, or
+redirect a close or sweep away from the allow-listed wallet. They can still broadcast the
+latest already-signed commitment (a force-close whose outputs only sweep to the wallet),
+stall the node, and spend the on-chain wallet, whose mnemonic remains on the host
+(`onchain_wallet_mnemonic_path` keeps it separate from the node seed; moving it off-host is
+the remaining step).
 
 #### Measured performance (Apple M4, both parties on one machine, cb-mpc `0b71670`)
 
-| Operation                              | p50     | p95     | p99     | Throughput |
-|----------------------------------------|---------|---------|---------|------------|
-| DKG (full path)                        | 151 ms  | 400 ms  | 400 ms  | ~5 /s      |
-| Sign, full path, concurrency 1         | 42.6 ms | 43.6 ms | 45.3 ms | 23.4 /s    |
-| Sign, full path, concurrency 4         | 46.0 ms | 52.1 ms | 56.6 ms | 85.5 /s    |
-| Sign, in-process (protocol only)       | 38.1 ms | 40.5 ms | 51.6 ms | 25.8 /s    |
+| Operation                                               | p50     | p95     | p99     | Throughput |
+|---------------------------------------------------------|---------|---------|---------|------------|
+| DKG, one key (full path)                                | 151 ms  | 400 ms  | 400 ms  | ~5 /s      |
+| DKG, all five channel keys in parallel (channel open)   | ~430 ms wall |    |         |            |
+| Sign, one key, concurrency 1                            | 42.6 ms | 43.6 ms | 45.3 ms | 23.4 /s    |
+| Sign, one key, concurrency 4                            | 46.0 ms | 52.1 ms | 56.6 ms | 85.5 /s    |
+| Commitment update, no HTLC (policy + 1 session)         | 53 ms   |         | 65 ms   |            |
+| Commitment update with 1 HTLC (2 parallel sessions)     | 64 ms   |         | 89 ms   |            |
+| Signet: commitment / closing / holder commitment        | 40–66 / 40 / 44–73 ms |  |        |            |
 
 Each party uses ~3.4 MB RSS and 35–50 % of one core while signing at concurrency 1. A
-direct-channel BOLT11 payment adds roughly 90–100 ms of MPC time (two commitment
-signatures). See [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
+direct-channel BOLT11 payment adds roughly 110–130 ms of MPC time (two commitment updates,
+each with the HTLC signature in parallel); on signet a 20,000 sat receive completed 164 ms
+after the send command. See [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
 
 #### Running it
 
 ```bash
-# one-time: build cb-mpc and the patched ldk-node (see ldk-server-mpc/README.md)
+# one-time: build cb-mpc (+ derivation patch) and the patched ldk-node (see ldk-server-mpc/README.md)
 cargo build --release -p ldk-server -p ldk-server-cli -p ldk-server-mpc
 contrib/mpc-signet/run-mpc-parties.sh                 # Party B then Party A, separate keystores
-target/release/ldk-server contrib/mpc-signet/ldk-server-signet-mpc.toml   # [mpc] party_address = ...
+target/release/ldk-server contrib/mpc-signet/ldk-server-signet-mpc.toml   # [mpc] party_address, coverage, auth_key_path
 ```
 
-Tests: `cargo test -p ldk-server-mpc` (two-party and service tests) and
-`cd e2e-tests && cargo test --test mpc -- --test-threads=1` (regtest: open, pay both ways,
-restart parties and server, cooperative close with the DKG'd key verified on-chain, force close).
+Production layout: Party A with `--auth-key-file`/`--peer-auth-key-file`/`--share-key-file`,
+LDK Server with `[mpc] auth_key_path` and `[node] onchain_wallet_mnemonic_path`, then Party B
+on separate infrastructure with the same peer PSK and `--payout-xpub $(cat <storage>/onchain_wallet_xpub)`.
+
+Tests: `cargo test -p ldk-server-mpc` (two-party DKG/sign/derivation, policy, secure
+transport and service tests) and `cd e2e-tests && cargo test --test mpc -- --test-threads=1`
+(regtest, full coverage: open with five DKGs, pay both ways, restart parties and server,
+cooperative close with a DKG'd key verified on-chain, force close; PSK links, encrypted
+shares and Party B allow-listing the wallet xpub).
 
 ### Contributing
 
