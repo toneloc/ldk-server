@@ -180,7 +180,9 @@ flowchart TB
 This is **funding-key protection only**. An attacker who controls the LDK Server host
 cannot produce new commitment, closing or splice signatures on their own, but still holds
 every local key: they can broadcast an already-signed old state, leak per-commitment
-secrets, sweep confirmed `to_local`/HTLC outputs and settle HTLCs, and Party B signs whatever
+secrets, force-close with the already-signed latest state and sweep the confirmed
+`to_local`/HTLC outputs to any address (the usual destination, the BDK wallet, comes from
+the same seed), settle HTLCs, and Party B signs whatever
 it is asked (`AllowAllPolicy`, unverified context). Treat it as a custody split for the
 funding key, not a validating signer. See the crate README for details.
 

@@ -121,7 +121,11 @@ keyed anchor, announcement). It still holds every local key, so it can:
 
 - broadcast an already-signed old commitment (the signature exists; MPC cannot revoke it),
 - leak per-commitment secrets, enabling the counterparty to claim revoked states,
-- sweep confirmed `to_local` and HTLC outputs with the delayed-payment and HTLC keys,
+- force-close with the already-signed latest commitment, wait out the delay, and sweep the
+  confirmed `to_local` and HTLC outputs with the delayed-payment and HTLC keys to any
+  address. The normal sweep destination is the BDK wallet, which is derived from the same
+  seed, so "the funds return to our on-chain wallet" offers no protection against a host
+  compromise,
 - claim or time out HTLCs,
 - and ask Party B for any funding-key signature, since the only policy is `AllowAllPolicy`
   and the signing context is not verified.
