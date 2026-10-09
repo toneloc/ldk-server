@@ -21,7 +21,7 @@ path = "src/bin/bench.rs"
 
 [dependencies]
 bitcoin = { version = "0.32", default-features = false, features = ["std", "rand-std"] }
-lightning = { git = "https://github.com/lightningdevkit/rust-lightning", rev = "697a239f2beff8ecadd4ddaffbcff8f1e5b3d09e", features = ["std"] }
+lightning = { git = "https://github.com/lightningdevkit/rust-lightning", rev = "d7a980641c6325ddda5072a0f470ef8392676cf5", features = ["std"] }
 hex-conservative = { version = "0.2", default-features = false, features = ["std"] }
 log = { version = "0.4", features = ["std"] }
 ring = { version = "0.17", default-features = false }

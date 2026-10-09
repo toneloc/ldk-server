@@ -237,7 +237,7 @@ DKG keyed by `(channel_keys_id, splice_parent_funding_txid)`.
 
    ```bash
    git clone https://github.com/lightningdevkit/ldk-node ../ldk-node
-   cd ../ldk-node && git checkout f375e4d5de18093c29a023f19f08c93d890af220
+   cd ../ldk-node && git checkout 179b4b263762155a7ff515ddad7e757a80807fd5
    git am ../ldk-server/contrib/patches/ldk-node-external-funding-signer.patch
    ```
 

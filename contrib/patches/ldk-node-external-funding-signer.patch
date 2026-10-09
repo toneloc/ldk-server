@@ -1,4 +1,4 @@
-From 29e0793316030aaa3c585dc8a6259f627b4b558d Mon Sep 17 00:00:00 2001
+From f95be6664c55a511c16655bb190d37a4fd79a311 Mon Sep 17 00:00:00 2001
 From: toneloc <3665696+toneloc@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 22:52:46 -0400
 Subject: [PATCH 1/5] Add ExternalFundingSigner hook for externally held
@@ -29,7 +29,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  create mode 100644 src/signer.rs
 
 diff --git a/Cargo.toml b/Cargo.toml
-index 453212a..ee78e39 100755
+index 502fa1a..111f2df 100755
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -63,6 +63,8 @@ unified-payments = [
@@ -42,7 +42,7 @@ index 453212a..ee78e39 100755
  	"uniffi",
  	"chain-esplora",
 diff --git a/src/builder.rs b/src/builder.rs
-index 0372e74..2f4776c 100644
+index ff7626a..c0af68e 100644
 --- a/src/builder.rs
 +++ b/src/builder.rs
 @@ -90,7 +90,7 @@ use crate::io::{
@@ -62,7 +62,7 @@ index 0372e74..2f4776c 100644
  use crate::tx_broadcaster::TransactionBroadcaster;
  use crate::types::{
  	AsyncPersister, ChainMonitor, ChannelManager, DynStore, DynStoreRef, DynStoreWrapper,
-@@ -326,6 +327,7 @@ impl std::error::Error for BuildError {}
+@@ -329,6 +330,7 @@ impl std::error::Error for BuildError {}
  #[derive(Debug)]
  pub struct NodeBuilder {
  	config: Config,
@@ -70,7 +70,7 @@ index 0372e74..2f4776c 100644
  	chain_data_source_config: Option<ChainDataSourceConfig>,
  	gossip_source_config: Option<GossipSourceConfig>,
  	liquidity_source_config: Option<LiquiditySourceConfig>,
-@@ -365,6 +367,7 @@ impl NodeBuilder {
+@@ -368,6 +370,7 @@ impl NodeBuilder {
  			async_payments_role: None,
  			pathfinding_scores_sync_config,
  			probing_config,
@@ -78,7 +78,7 @@ index 0372e74..2f4776c 100644
  		}
  	}
  
-@@ -699,6 +702,18 @@ impl NodeBuilder {
+@@ -702,6 +705,18 @@ impl NodeBuilder {
  		self
  	}
  
@@ -97,7 +97,7 @@ index 0372e74..2f4776c 100644
  	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
  	/// previously configured.
  	#[cfg(feature = "storage-sqlite")]
-@@ -964,6 +979,7 @@ impl NodeBuilder {
+@@ -973,6 +988,7 @@ impl NodeBuilder {
  			self.pathfinding_scores_sync_config.as_ref(),
  			self.probing_config.as_ref(),
  			self.async_payments_role,
@@ -105,7 +105,7 @@ index 0372e74..2f4776c 100644
  			seed_bytes,
  			runtime,
  			logger,
-@@ -1301,6 +1317,12 @@ impl Builder {
+@@ -1310,6 +1326,12 @@ impl Builder {
  	pub fn set_probing_config(&self, config: Arc<ProbingConfig>) {
  		self.inner.write().expect("lock").set_probing_config((*config).clone());
  	}
@@ -118,7 +118,7 @@ index 0372e74..2f4776c 100644
  }
  
  #[cfg(all(feature = "uniffi", feature = "storage-sqlite"))]
-@@ -1512,7 +1534,8 @@ fn build_with_store_internal(
+@@ -1524,7 +1546,8 @@ fn build_with_store_internal(
  	liquidity_source_config: Option<&LiquiditySourceConfig>,
  	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
  	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
@@ -128,7 +128,7 @@ index 0372e74..2f4776c 100644
  ) -> Result<Node, BuildError> {
  	optionally_install_rustls_cryptoprovider();
  
-@@ -1943,13 +1966,18 @@ fn build_with_store_internal(
+@@ -1956,13 +1979,18 @@ fn build_with_store_internal(
  	})?;
  
  	let ldk_seed_bytes: [u8; 32] = xprv.private_key.secret_bytes();
@@ -150,7 +150,7 @@ index 0372e74..2f4776c 100644
  		channel_forwarding_stats,
  		config.forwarded_payment_tracking_mode,
 diff --git a/src/lib.rs b/src/lib.rs
-index 6d13141..649d2e1 100644
+index 1c88de2..a5b8f7b 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -112,6 +112,7 @@ mod peer_store;
@@ -639,7 +639,7 @@ index fd86d1b..f53e02c 100644
  	Arc<Broadcaster>,
  	Arc<OnchainFeeEstimator>,
 diff --git a/src/wallet/mod.rs b/src/wallet/mod.rs
-index 3e43398..804e2c9 100644
+index 13a8ef4..a867eb9 100644
 --- a/src/wallet/mod.rs
 +++ b/src/wallet/mod.rs
 @@ -43,8 +43,8 @@ use lightning::ln::msgs::UnsignedGossipMessage;
@@ -661,7 +661,7 @@ index 3e43398..804e2c9 100644
  use crate::types::{Broadcaster, PaymentStore, PendingPaymentStore};
  use crate::{ChainSource, Error};
  
-@@ -2468,6 +2469,7 @@ pub(crate) struct WalletKeysManager {
+@@ -2465,6 +2466,7 @@ pub(crate) struct WalletKeysManager {
  	inner: KeysManager,
  	wallet: Arc<Wallet>,
  	logger: Arc<Logger>,
@@ -669,7 +669,7 @@ index 3e43398..804e2c9 100644
  }
  
  impl WalletKeysManager {
-@@ -2480,7 +2482,12 @@ impl WalletKeysManager {
+@@ -2477,7 +2479,12 @@ impl WalletKeysManager {
  		logger: Arc<Logger>,
  	) -> Self {
  		let inner = KeysManager::new(seed, starting_time_secs, starting_time_nanos, true);
@@ -683,7 +683,7 @@ index 3e43398..804e2c9 100644
  	}
  
  	pub fn sign_message(&self, msg: &[u8]) -> String {
-@@ -2564,14 +2571,35 @@ impl EntropySource for WalletKeysManager {
+@@ -2561,14 +2568,35 @@ impl EntropySource for WalletKeysManager {
  }
  
  impl SignerProvider for WalletKeysManager {
@@ -725,7 +725,7 @@ index 3e43398..804e2c9 100644
 2.50.1 (Apple Git-155)
 
 
-From dea58d083b911d902058f97e4f192dc46ab787c5 Mon Sep 17 00:00:00 2001
+From 25384f5644885af960fc0d77350a9dd124179f9e Mon Sep 17 00:00:00 2001
 From: toneloc <3665696+toneloc@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 23:53:40 -0400
 Subject: [PATCH 2/5] Allow deriving the on-chain wallet from separate entropy
@@ -742,10 +742,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  1 file changed, 37 insertions(+), 4 deletions(-)
 
 diff --git a/src/builder.rs b/src/builder.rs
-index 2f4776c..e1c4dcc 100644
+index c0af68e..7d124eb 100644
 --- a/src/builder.rs
 +++ b/src/builder.rs
-@@ -328,6 +328,7 @@ impl std::error::Error for BuildError {}
+@@ -331,6 +331,7 @@ impl std::error::Error for BuildError {}
  pub struct NodeBuilder {
  	config: Config,
  	external_funding_signer: Option<ExternalFundingSignerHandle>,
@@ -753,7 +753,7 @@ index 2f4776c..e1c4dcc 100644
  	chain_data_source_config: Option<ChainDataSourceConfig>,
  	gossip_source_config: Option<GossipSourceConfig>,
  	liquidity_source_config: Option<LiquiditySourceConfig>,
-@@ -368,6 +369,7 @@ impl NodeBuilder {
+@@ -371,6 +372,7 @@ impl NodeBuilder {
  			pathfinding_scores_sync_config,
  			probing_config,
  			external_funding_signer: None,
@@ -761,7 +761,7 @@ index 2f4776c..e1c4dcc 100644
  		}
  	}
  
-@@ -714,6 +716,17 @@ impl NodeBuilder {
+@@ -717,6 +719,17 @@ impl NodeBuilder {
  		self
  	}
  
@@ -779,7 +779,7 @@ index 2f4776c..e1c4dcc 100644
  	/// Builds a [`Node`] instance with a [`SqliteStore`] backend and according to the options
  	/// previously configured.
  	#[cfg(feature = "storage-sqlite")]
-@@ -980,6 +993,7 @@ impl NodeBuilder {
+@@ -989,6 +1002,7 @@ impl NodeBuilder {
  			self.probing_config.as_ref(),
  			self.async_payments_role,
  			self.external_funding_signer.clone().map(|h| h.0),
@@ -787,7 +787,7 @@ index 2f4776c..e1c4dcc 100644
  			seed_bytes,
  			runtime,
  			logger,
-@@ -1323,6 +1337,12 @@ impl Builder {
+@@ -1332,6 +1346,12 @@ impl Builder {
  	pub fn set_external_funding_signer(&self, signer: Arc<dyn ExternalFundingSigner>) {
  		self.inner.write().expect("lock").set_external_funding_signer(signer);
  	}
@@ -800,7 +800,7 @@ index 2f4776c..e1c4dcc 100644
  }
  
  #[cfg(all(feature = "uniffi", feature = "storage-sqlite"))]
-@@ -1534,8 +1554,9 @@ fn build_with_store_internal(
+@@ -1546,8 +1566,9 @@ fn build_with_store_internal(
  	liquidity_source_config: Option<&LiquiditySourceConfig>,
  	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
  	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
@@ -812,7 +812,7 @@ index 2f4776c..e1c4dcc 100644
  ) -> Result<Node, BuildError> {
  	optionally_install_rustls_cryptoprovider();
  
-@@ -1758,8 +1779,20 @@ fn build_with_store_internal(
+@@ -1770,8 +1791,20 @@ fn build_with_store_internal(
  		BuildError::WalletSetupFailed
  	})?;
  
@@ -834,12 +834,12 @@ index 2f4776c..e1c4dcc 100644
 +	let change_descriptor = Bip84(wallet_xprv, KeychainKind::Internal);
  	let mut wallet_persister =
  		KVStoreWalletPersister::new(Arc::clone(&kv_store), Arc::clone(&logger));
- 	let wallet_opt = runtime
+ 	#[allow(deprecated)]
 -- 
 2.50.1 (Apple Git-155)
 
 
-From e39b2f1fc6f0f3e29081cc6c13dde5aa36ed9748 Mon Sep 17 00:00:00 2001
+From d833fb23440815ba0010c9d26e308f0f753a57e6 Mon Sep 17 00:00:00 2001
 From: toneloc <3665696+toneloc@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 00:31:38 -0400
 Subject: [PATCH 3/5] Generalize external signer to all channel keys
@@ -863,7 +863,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  3 files changed, 799 insertions(+), 235 deletions(-)
 
 diff --git a/src/builder.rs b/src/builder.rs
-index e1c4dcc..06dd768 100644
+index 7d124eb..57563ee 100644
 --- a/src/builder.rs
 +++ b/src/builder.rs
 @@ -102,7 +102,7 @@ use crate::probing::{
@@ -875,7 +875,7 @@ index e1c4dcc..06dd768 100644
  use crate::tx_broadcaster::TransactionBroadcaster;
  use crate::types::{
  	AsyncPersister, ChainMonitor, ChannelManager, DynStore, DynStoreRef, DynStoreWrapper,
-@@ -327,7 +327,7 @@ impl std::error::Error for BuildError {}
+@@ -330,7 +330,7 @@ impl std::error::Error for BuildError {}
  #[derive(Debug)]
  pub struct NodeBuilder {
  	config: Config,
@@ -884,7 +884,7 @@ index e1c4dcc..06dd768 100644
  	onchain_wallet_seed_bytes: Option<[u8; 64]>,
  	chain_data_source_config: Option<ChainDataSourceConfig>,
  	gossip_source_config: Option<GossipSourceConfig>,
-@@ -368,7 +368,7 @@ impl NodeBuilder {
+@@ -371,7 +371,7 @@ impl NodeBuilder {
  			async_payments_role: None,
  			pathfinding_scores_sync_config,
  			probing_config,
@@ -893,7 +893,7 @@ index e1c4dcc..06dd768 100644
  			onchain_wallet_seed_bytes: None,
  		}
  	}
-@@ -704,15 +704,17 @@ impl NodeBuilder {
+@@ -707,15 +707,17 @@ impl NodeBuilder {
  		self
  	}
  
@@ -917,7 +917,7 @@ index e1c4dcc..06dd768 100644
  		self
  	}
  
-@@ -992,7 +994,7 @@ impl NodeBuilder {
+@@ -1001,7 +1003,7 @@ impl NodeBuilder {
  			self.pathfinding_scores_sync_config.as_ref(),
  			self.probing_config.as_ref(),
  			self.async_payments_role,
@@ -926,7 +926,7 @@ index e1c4dcc..06dd768 100644
  			self.onchain_wallet_seed_bytes,
  			seed_bytes,
  			runtime,
-@@ -1333,9 +1335,9 @@ impl Builder {
+@@ -1342,9 +1344,9 @@ impl Builder {
  	}
  
  	/// Routes channel funding keys and the signatures made with them to an external signer.
@@ -939,7 +939,7 @@ index e1c4dcc..06dd768 100644
  	}
  
  	/// Derives the on-chain wallet from separate entropy. See
-@@ -1554,7 +1556,7 @@ fn build_with_store_internal(
+@@ -1566,7 +1568,7 @@ fn build_with_store_internal(
  	liquidity_source_config: Option<&LiquiditySourceConfig>,
  	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
  	probing_config: Option<&ProbingConfig>, async_payments_role: Option<AsyncPaymentsRole>,
@@ -948,7 +948,7 @@ index e1c4dcc..06dd768 100644
  	onchain_wallet_seed_bytes: Option<[u8; 64]>, seed_bytes: [u8; 64], runtime: Arc<Runtime>,
  	logger: Arc<Logger>, kv_store: Arc<DynStore>,
  ) -> Result<Node, BuildError> {
-@@ -2006,9 +2008,13 @@ fn build_with_store_internal(
+@@ -2019,9 +2021,13 @@ fn build_with_store_internal(
  		Arc::clone(&wallet),
  		Arc::clone(&logger),
  	);
@@ -2049,7 +2049,7 @@ index d4ce75a..535a8de 100644
  	}
  }
 diff --git a/src/wallet/mod.rs b/src/wallet/mod.rs
-index 804e2c9..b636c2a 100644
+index a867eb9..bac23e8 100644
 --- a/src/wallet/mod.rs
 +++ b/src/wallet/mod.rs
 @@ -66,7 +66,7 @@ use crate::payment::{
@@ -2061,7 +2061,7 @@ index 804e2c9..b636c2a 100644
  use crate::types::{Broadcaster, PaymentStore, PendingPaymentStore};
  use crate::{ChainSource, Error};
  
-@@ -2469,7 +2469,8 @@ pub(crate) struct WalletKeysManager {
+@@ -2466,7 +2466,8 @@ pub(crate) struct WalletKeysManager {
  	inner: KeysManager,
  	wallet: Arc<Wallet>,
  	logger: Arc<Logger>,
@@ -2071,7 +2071,7 @@ index 804e2c9..b636c2a 100644
  }
  
  impl WalletKeysManager {
-@@ -2482,12 +2483,12 @@ impl WalletKeysManager {
+@@ -2479,12 +2480,12 @@ impl WalletKeysManager {
  		logger: Arc<Logger>,
  	) -> Self {
  		let inner = KeysManager::new(seed, starting_time_secs, starting_time_nanos, true);
@@ -2088,7 +2088,7 @@ index 804e2c9..b636c2a 100644
  	}
  
  	pub fn sign_message(&self, msg: &[u8]) -> String {
-@@ -2553,14 +2554,68 @@ impl OutputSpender for WalletKeysManager {
+@@ -2550,14 +2551,68 @@ impl OutputSpender for WalletKeysManager {
  		change_destination_script: ScriptBuf, feerate_sat_per_1000_weight: u32,
  		locktime: Option<LockTime>, secp_ctx: &Secp256k1<All>,
  	) -> Result<Transaction, ()> {
@@ -2165,7 +2165,7 @@ index 804e2c9..b636c2a 100644
  	}
  }
  
-@@ -2579,25 +2634,23 @@ impl SignerProvider for WalletKeysManager {
+@@ -2576,25 +2631,23 @@ impl SignerProvider for WalletKeysManager {
  
  	fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
  		let inner = self.inner.derive_channel_signer(channel_keys_id);
@@ -2211,7 +2211,7 @@ index 804e2c9..b636c2a 100644
 2.50.1 (Apple Git-155)
 
 
-From e2d6e8c03b31f2cf572aceacd0f50af7df99c24d Mon Sep 17 00:00:00 2001
+From 0fcc0512a27c5ba94ed07235d4f1e411d22c3d30 Mon Sep 17 00:00:00 2001
 From: toneloc <3665696+toneloc@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 00:40:40 -0400
 Subject: [PATCH 4/5] signer: carry the sighash type in SignContext
@@ -2269,7 +2269,7 @@ index 535a8de..d1784de 100644
 2.50.1 (Apple Git-155)
 
 
-From 4f7bf15d1e33e73907f6419563507a120749a359 Mon Sep 17 00:00:00 2001
+From dc631843ff0d415b07570e2a67a4dfb622e7d170 Mon Sep 17 00:00:00 2001
 From: toneloc <3665696+toneloc@users.noreply.github.com>
 Date: Thu, 8 Oct 2026 01:00:21 -0400
 Subject: [PATCH 5/5] Periodically call signer_unblocked when an external
@@ -2284,10 +2284,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  2 files changed, 30 insertions(+)
 
 diff --git a/src/lib.rs b/src/lib.rs
-index 649d2e1..e4a024f 100644
+index a5b8f7b..6e87215 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -535,6 +535,32 @@ impl Node {
+@@ -538,6 +538,32 @@ impl Node {
  		let connect_cm = Arc::clone(&self.connection_manager);
  		let connect_pm = Arc::clone(&self.peer_manager);
  		let connect_logger = Arc::clone(&self.logger);
@@ -2321,10 +2321,10 @@ index 649d2e1..e4a024f 100644
  		let mut stop_connect = self.stop_sender.subscribe();
  		self.runtime.spawn_cancellable_background_task(async move {
 diff --git a/src/wallet/mod.rs b/src/wallet/mod.rs
-index b636c2a..acfc042 100644
+index bac23e8..5f1fb66 100644
 --- a/src/wallet/mod.rs
 +++ b/src/wallet/mod.rs
-@@ -2491,6 +2491,10 @@ impl WalletKeysManager {
+@@ -2488,6 +2488,10 @@ impl WalletKeysManager {
  		self.external_channel_signer = Some(signer);
  	}
  
