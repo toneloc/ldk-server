@@ -16,14 +16,12 @@
 //! guidance to avoid many parallel signing sessions on one key.
 
 use std::collections::HashMap;
-use std::fs;
-use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
+use std::{fs, io, thread};
 
 use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::{All, Message, PublicKey, Scalar, Secp256k1};
@@ -728,7 +726,8 @@ impl PartyService {
 				.ok_or_else(|| ServiceError::new(ErrorCode::KeyNotFound, "unknown key id"))?;
 			let auth = self.policy.authorize(channel.as_ref(), &item, &self.store)?;
 			Ok((blob, auth))
-		})();
+		})(
+		);
 		let (blob, auth) = match prepared {
 			Ok(x) => x,
 			Err(e) => {

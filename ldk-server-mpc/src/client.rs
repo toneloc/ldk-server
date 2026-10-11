@@ -3,10 +3,9 @@
 //! Each call opens a fresh TCP connection, sends one [`Request`] and reads one [`Response`].
 //! Calls are bounded by `timeout` so LDK's signer callbacks can never block indefinitely.
 
-use std::fmt;
-use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
+use std::{fmt, io};
 
 use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, Verification};
