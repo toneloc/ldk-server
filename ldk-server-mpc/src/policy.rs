@@ -22,13 +22,11 @@
 //! State is persisted per channel under the keystore directory.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::{fmt, fs, io};
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpub};
 use bitcoin::consensus::encode::deserialize;
