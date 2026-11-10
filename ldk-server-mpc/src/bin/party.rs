@@ -102,6 +102,11 @@ struct Args {
 	/// `<keystore>/kits`.
 	#[arg(long, env = "LDK_MPC_KIT_DIR")]
 	kit_dir: Option<PathBuf>,
+	/// Threads each signing session may use for its oblivious transfers, the most expensive
+	/// step of a signature. Leave at 1 unless this machine has cores to spare: the threads of
+	/// concurrent sessions add up.
+	#[arg(long, env = "LDK_MPC_OT_THREADS", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=64))]
+	ot_threads: u8,
 }
 
 struct StderrLogger;
@@ -126,6 +131,8 @@ fn main() {
 	let args = Args::parse();
 	let _ = log::set_logger(&LOGGER);
 	log::set_max_level(args.log_level);
+	// cb-mpc reads this once, on its first signature. Nothing else is running yet.
+	std::env::set_var("CBMPC_BASE_OT_THREADS", args.ot_threads.to_string());
 
 	let mut payout = PayoutAllowlist::default();
 	for xpub in &args.payout_xpub {

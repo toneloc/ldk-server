@@ -1,0 +1,196 @@
+From cc0d91660d2f8e3944426692d0d5de279be94f7c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 13:45:54 +0000
+Subject: [PATCH] Optional multi-threading of the base OT loops
+
+The 256 base OT instances a signature runs per pair of parties are independent of
+each other. With CBMPC_BASE_OT_THREADS=N (default 1: unchanged) they are spread
+over N threads. Messages and outputs are identical.
+
+Written with the help of an AI tool (Claude).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FEFPxoVaygFeJXwvZUffGz
+---
+ src/cbmpc/protocol/ot.cpp | 118 ++++++++++++++++++++++++++++++--------
+ 1 file changed, 95 insertions(+), 23 deletions(-)
+
+diff --git a/src/cbmpc/protocol/ot.cpp b/src/cbmpc/protocol/ot.cpp
+index dffa993..8817dd5 100644
+--- a/src/cbmpc/protocol/ot.cpp
++++ b/src/cbmpc/protocol/ot.cpp
+@@ -1,3 +1,8 @@
++#include <algorithm>
++#include <cstdlib>
++#include <thread>
++#include <vector>
++
+ #include <cbmpc/internal/crypto/ro.h>
+ #include <cbmpc/internal/protocol/ot.h>
+ 
+@@ -5,6 +10,64 @@ namespace coinbase::mpc {
+ 
+ // ----------------------- base_ot_protocol_pvw_ctx_t -----------------------------------
+ 
++namespace {
++
++// Number of threads the base OT loops below may use, from the CBMPC_BASE_OT_THREADS environment
++// variable (read once). Unset, or 1, keeps everything on the calling thread, as before.
++int base_ot_threads() {
++  static const int threads = [] {
++    const char* v = std::getenv("CBMPC_BASE_OT_THREADS");
++    const int t = v ? std::atoi(v) : 1;
++    return std::min(std::max(t, 1), 64);
++  }();
++  return threads;
++}
++
++// Runs body(i) for every i in [0, m) and returns the first error by index order of the worker
++// that hit it. The base OT instances are independent of each other: each iteration draws its
++// own randomness and reads and writes only its own index of the vectors involved. So spreading
++// the iterations over threads changes neither the messages sent nor the outputs, only the
++// wall-clock time. Worker threads are outside any variable-time scope of the caller (that state
++// is thread-local), so the point multiplications stay constant-time.
++template <class F>
++error_t for_each_base_ot(int m, F&& body) {
++  const int threads = std::min(base_ot_threads(), m);
++  if (threads <= 1) {
++    for (int i = 0; i < m; i++) {
++      if (error_t rv = body(i)) return rv;
++    }
++    return SUCCESS;
++  }
++
++  std::vector<error_t> results(threads, SUCCESS);
++  std::vector<std::thread> workers;
++  workers.reserve(threads);
++  auto work = [&](int t) {
++    for (int i = t; i < m; i += threads) {
++      if (error_t rv = body(i)) {
++        results[t] = rv;
++        return;
++      }
++    }
++  };
++  for (int t = 1; t < threads; t++) {
++    try {
++      workers.emplace_back(work, t);
++    } catch (...) {
++      // No thread to be had: do that share of the work here.
++      work(t);
++    }
++  }
++  work(0);
++  for (auto& w : workers) w.join();
++  for (error_t rv : results) {
++    if (rv) return rv;
++  }
++  return SUCCESS;
++}
++
++}  // namespace
++
+ error_t base_ot_protocol_pvw_ctx_t::step1_R2S(const coinbase::bits_t& b) {
+   cb_assert(!sid.empty());
+ 
+@@ -22,14 +85,16 @@ error_t base_ot_protocol_pvw_ctx_t::step1_R2S(const coinbase::bits_t& b) {
+   G[1] = crypto::ro::hash_curve(sid, 2).curve(curve);
+   H[1] = crypto::ro::hash_curve(sid, 3).curve(curve);
+ 
+-  for (int i = 0; i < m; i++) {
+-    r[i] = bn_t::rand(q);
+-    int bi = static_cast<int>(b[i]);
+-    A[i] = r[i] * G[bi];
+-    B[i] = r[i] * H[bi];
+-  }
++  // Read the choice bits up front: bits_t packs them, the workers below should not share it.
++  std::vector<int> choice(m);
++  for (int i = 0; i < m; i++) choice[i] = static_cast<int>(b[i]);
+ 
+-  return SUCCESS;
++  return for_each_base_ot(m, [&](int i) -> error_t {
++    r[i] = bn_t::rand(q);
++    A[i] = r[i] * G[choice[i]];
++    B[i] = r[i] * H[choice[i]];
++    return SUCCESS;
++  });
+ }
+ 
+ error_t base_ot_protocol_pvw_ctx_t::step2_S2R(const std::vector<buf_t>& x0, const std::vector<buf_t>& x1) {
+@@ -61,9 +126,11 @@ error_t base_ot_protocol_pvw_ctx_t::step2_S2R(const std::vector<buf_t>& x0, cons
+   U1.resize(m);
+   V1.resize(m);
+ 
+-  for (int i = 0; i < m; i++) {
+-    if (rv = curve.check(A[i])) return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::step2_S2R: check A[i] failed");
+-    if (rv = curve.check(B[i])) return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::step2_S2R: check B[i] failed");
++  return for_each_base_ot(m, [&](int i) -> error_t {
++    if (error_t rv = curve.check(A[i]))
++      return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::step2_S2R: check A[i] failed");
++    if (error_t rv = curve.check(B[i]))
++      return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::step2_S2R: check B[i] failed");
+ 
+     bn_t s0 = bn_t::rand(q);
+     bn_t t0 = bn_t::rand(q);
+@@ -76,9 +143,8 @@ error_t base_ot_protocol_pvw_ctx_t::step2_S2R(const std::vector<buf_t>& x0, cons
+     U1[i] = ecc_point_t::weighted_sum(s1, G1, t1, H1);  // U1[i] = s1 * G[1] + t1 * H[1];
+     X = ecc_point_t::weighted_sum(s1, A[i], t1, B[i]);  // X     = s1 * A[i] + t1 * B[i];
+     V1[i] = crypto::ro::hash_string(X).bitlen(l) ^ x1[i];
+-  }
+-
+-  return SUCCESS;
++    return SUCCESS;
++  });
+ }
+ 
+ error_t base_ot_protocol_pvw_ctx_t::output_R(std::vector<buf_t>& x) {
+@@ -90,16 +156,23 @@ error_t base_ot_protocol_pvw_ctx_t::output_R(std::vector<buf_t>& x) {
+ 
+   x.resize(m);
+ 
+-  for (int i = 0; i < m; i++) {
++  // Read the choice bits up front: bits_t packs them, the workers below should not share it.
++  std::vector<bool> choice(m);
++  for (int i = 0; i < m; i++) choice[i] = b[i];
++
++  return for_each_base_ot(m, [&](int i) -> error_t {
++    const bool bi = choice[i];
+     if (coinbase::bytes_to_bits(V0[i].size()) != l || coinbase::bytes_to_bits(V1[i].size()) != l)
+       return coinbase::error(E_FORMAT, "base_ot_protocol_pvw_ctx_t::output_R: V0/V1 size mismatch");
+-    if (rv = curve.check(U0[i])) return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::output_R: check U0[i] failed");
+-    if (rv = curve.check(U1[i])) return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::output_R: check U1[i] failed");
++    if (error_t rv = curve.check(U0[i]))
++      return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::output_R: check U0[i] failed");
++    if (error_t rv = curve.check(U1[i]))
++      return coinbase::error(rv, "base_ot_protocol_pvw_ctx_t::output_R: check U1[i] failed");
+     // Optimization: if the curve backend supports constant-time point cmov, select U_b and V_b and do
+     // a single scalar-mul/hash. Otherwise (e.g., OpenSSL EC_POINT curves), fall back to the dual-computation path.
+     ecc_point_t Ubi = U0[i];
+-    if (curve.cnd_copy_point(b[i], U1[i], Ubi)) {
+-      const buf_t Vbi = ct_select_buf(b[i], V1[i], V0[i]);
++    if (curve.cnd_copy_point(bi, U1[i], Ubi)) {
++      const buf_t Vbi = ct_select_buf(bi, V1[i], V0[i]);
+       x[i] = crypto::ro::hash_string(r[i] * Ubi).bitlen(l) ^ Vbi;
+     } else {
+       // NOTE: This fallback is intentionally NOT constant-time w.r.t. the choice bit b[i].
+@@ -107,13 +180,12 @@ error_t base_ot_protocol_pvw_ctx_t::output_R(std::vector<buf_t>& x) {
+       // computing both branches is ~2x slower here (extra scalar-mul + hash). We choose the fast
+       // single-branch computation, and assume this timing difference is not practically exploitable
+       // in our threat model for this code path.
+-      mem_t Vbi = b[i] ? mem_t(V1[i]) : mem_t(V0[i]);
+-      const ecc_point_t& Ubi = b[i] ? U1[i] : U0[i];
++      mem_t Vbi = bi ? mem_t(V1[i]) : mem_t(V0[i]);
++      const ecc_point_t& Ubi = bi ? U1[i] : U0[i];
+       x[i] = crypto::ro::hash_string(r[i] * Ubi).bitlen(l) ^ Vbi;
+     }
+-  }
+-
+-  return SUCCESS;
++    return SUCCESS;
++  });
+ }
+ 
+ // ------------------------- transpose ---------------------
+-- 
+2.43.0
+

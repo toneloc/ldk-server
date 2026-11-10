@@ -33,6 +33,11 @@ use crate::secure::{AtRestKey, SecureStream, SecureWriter};
 /// only provides encryption; the identity signatures provide authentication either way.
 const NO_PSK: [u8; 32] = *b"ldk-server-mpc/mesh/no-group-psk";
 
+/// How long to wait for another party to accept a connection. A party that does not answer
+/// within this is treated as down, so a host that silently drops packets cannot stall every
+/// request for the whole protocol timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// A party's Ed25519 identity key.
 pub struct Identity {
 	keypair: Ed25519KeyPair,
@@ -202,7 +207,10 @@ impl Roster {
 		if peer == self.me || peer >= self.parties.len() {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "no such peer"));
 		}
-		let stream = TcpStream::connect_timeout(&self.parties[peer].addr, self.timeout)?;
+		let stream = TcpStream::connect_timeout(
+			&self.parties[peer].addr,
+			self.timeout.min(CONNECT_TIMEOUT),
+		)?;
 		stream.set_nodelay(true)?;
 		stream.set_read_timeout(Some(self.timeout))?;
 		stream.set_write_timeout(Some(self.timeout))?;

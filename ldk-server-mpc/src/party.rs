@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::rand::{thread_rng, RngCore};
@@ -47,6 +47,12 @@ use crate::protocol::{
 };
 use crate::secure::{AtRestKey, Conn, SecureStream};
 use crate::tdh2::{self, Tdh2Key};
+
+/// How many signing sessions a leader runs at once for one request.
+const MAX_PARALLEL_SESSIONS: usize = 8;
+
+/// How long a leader leaves a party it could not reach out of the quorums it tries first.
+const DOWN_FOR: Duration = Duration::from_secs(15);
 
 /// Warn when a channel's kit has this many commitment numbers left.
 const LOW_KIT_WARNING: u64 = 256;
@@ -284,6 +290,8 @@ pub struct PartyService {
 	tdh2: Mutex<Option<Arc<Tdh2Key>>>,
 	joins: JoinRegistry,
 	key_locks: Mutex<HashMap<KeyId, Arc<Mutex<()>>>>,
+	/// Parties this one recently failed to reach, and when.
+	unreachable: Mutex<HashMap<usize, Instant>>,
 	secp: Secp256k1<All>,
 	shutdown: AtomicBool,
 }
@@ -320,6 +328,7 @@ impl PartyService {
 			tdh2: Mutex::new(tdh2),
 			joins: JoinRegistry::default(),
 			key_locks: Mutex::new(HashMap::new()),
+			unreachable: Mutex::new(HashMap::new()),
 			secp: Secp256k1::new(),
 			shutdown: AtomicBool::new(false),
 		}))
@@ -707,6 +716,18 @@ impl PartyService {
 		for pos in 1..members.len() {
 			mesh.link(pos).and_then(|l| l.send(FRAME_COMMIT)).map_err(ServiceError::unavailable)?;
 		}
+		// Wait until every party has stored its share, so that whoever asked can use the key
+		// right away. The key exists from the commit on: a party that fails here is logged,
+		// not turned into a failed key generation.
+		for (pos, party) in members.iter().enumerate().skip(1) {
+			let stored = mesh.link(pos).and_then(|l| l.recv());
+			if !matches!(&stored, Ok(frame) if frame.as_slice() == FRAME_COMMIT) {
+				log::warn!(
+					"party '{}' did not confirm storing its share",
+					self.roster.parties[*party].name
+				);
+			}
+		}
 		Ok(result)
 	}
 
@@ -959,9 +980,23 @@ impl PartyService {
 		let locks: Vec<_> = key_ids.iter().map(|id| self.key_lock(id)).collect();
 		let _guards: Vec<_> = locks.iter().map(|l| l.lock().unwrap()).collect();
 
+		// Try the quorums made only of parties believed reachable first, then the rest: a
+		// party that was down a moment ago should not cost every request a failed attempt,
+		// but neither should a stale memory of it stop a request that needs it.
+		let recently_down: Vec<usize> = {
+			let mut unreachable = self.unreachable.lock().unwrap();
+			unreachable.retain(|_, since| since.elapsed() < DOWN_FOR);
+			unreachable.keys().copied().collect()
+		};
+		let (mut quorums, doubtful): (Vec<_>, Vec<_>) = self
+			.quorums()
+			.into_iter()
+			.partition(|quorum| !quorum.iter().any(|p| recently_down.contains(p)));
+		quorums.extend(doubtful);
+
 		let mut down: Vec<usize> = Vec::new();
 		let mut last_error = ServiceError::unavailable("no quorum reachable");
-		for quorum in self.quorums() {
+		for quorum in quorums {
 			if quorum.iter().any(|p| down.contains(p)) {
 				continue;
 			}
@@ -979,6 +1014,7 @@ impl PartyService {
 					log::warn!("signing with {:?} failed: {}", self.names(&quorum), e.message);
 					if let (Some(peer), ErrorCode::PeerUnavailable) = (culprit, e.code) {
 						down.push(peer);
+						self.unreachable.lock().unwrap().insert(peer, Instant::now());
 					}
 					if e.code == ErrorCode::PolicyDenied
 						|| last_error.code != ErrorCode::PolicyDenied
@@ -991,18 +1027,48 @@ impl PartyService {
 		Err(last_error)
 	}
 
+	/// Signs every item with `quorum`, each in a session of its own, several at a time: the
+	/// signatures of one request are independent, so a commitment update with HTLCs need not
+	/// wait for them one after another.
 	fn sign_with_quorum(
 		&self, quorum: &[usize], channel: Option<ChannelId>, items: &[SignItem],
 	) -> Result<Vec<Signature>, (Option<usize>, ServiceError)> {
-		let mesh = self.lead(quorum, SessionOp::Sign { channel, items: items.to_vec() })?;
 		let mut sigs = Vec::with_capacity(items.len());
-		for item in items {
-			let sig = self.sign_item(quorum, 0, item, &mesh).map_err(|e| (None, e))?.ok_or_else(
-				|| (None, ServiceError::new(ErrorCode::ProtocolFailed, "leader got no signature")),
-			)?;
-			sigs.push(sig);
+		for chunk in items.chunks(MAX_PARALLEL_SESSIONS) {
+			let results: Vec<_> = thread::scope(|scope| {
+				let handles: Vec<_> = chunk
+					.iter()
+					.map(|item| scope.spawn(move || self.sign_in_session(quorum, channel, item)))
+					.collect();
+				handles
+					.into_iter()
+					.map(|h| {
+						h.join().unwrap_or_else(|_| {
+							Err((
+								None,
+								ServiceError::new(ErrorCode::Internal, "signing thread panicked"),
+							))
+						})
+					})
+					.collect()
+			});
+			for res in results {
+				sigs.push(res?);
+			}
 		}
-		// A member that fails after the signatures exist cannot take them back; its record of
+		Ok(sigs)
+	}
+
+	/// One signing session with `quorum` for one item.
+	fn sign_in_session(
+		&self, quorum: &[usize], channel: Option<ChannelId>, item: &SignItem,
+	) -> Result<Signature, (Option<usize>, ServiceError)> {
+		let mesh = self.lead(quorum, SessionOp::Sign { channel, items: vec![item.clone()] })?;
+		let sig =
+			self.sign_item(quorum, 0, item, &mesh).map_err(|e| (None, e))?.ok_or_else(|| {
+				(None, ServiceError::new(ErrorCode::ProtocolFailed, "leader got no signature"))
+			})?;
+		// A member that fails after the signature exists cannot take it back; its record of
 		// the channel just lags until the next request it takes part in.
 		for (pos, party) in quorum.iter().enumerate().skip(1) {
 			if let Err(e) = self.read_done(&mesh, pos) {
@@ -1013,7 +1079,7 @@ impl PartyService {
 				);
 			}
 		}
-		Ok(sigs)
+		Ok(sig)
 	}
 
 	/// Signs one item as member `position` of `quorum`. The leader (position 0) gets the
@@ -1277,7 +1343,8 @@ impl PartyService {
 		if leader.recv()? != FRAME_COMMIT {
 			return Err(io::Error::new(io::ErrorKind::InvalidData, "expected the leader's commit"));
 		}
-		store(result).map_err(|e| io::Error::other(e.message))
+		store(result).map_err(|e| io::Error::other(e.message))?;
+		leader.send(FRAME_COMMIT)
 	}
 
 	/// A signing session led by another party: this party's own policy decides whether it

@@ -16,10 +16,60 @@ network round trips.
 | signature                       | 2 of 2        | 40 | 188 ms | 186 ms | 210 ms | 172 ms | 221 ms |
 
 In the regtest end-to-end test, on the same machine with four party processes, LDK Server
-logged 380 to 410 ms for one holder-commitment signature. The signatures of one request are
-made one after another, so a commitment update that carries HTLCs takes one such round per
-signature. This is several times slower than the two-party protocol below; it has not been
-measured on the hardware those numbers come from.
+logged 380 to 410 ms for one holder-commitment signature.
+
+### Where the time goes (2026-11-10)
+
+`ldk-server-mpc-bench --mode profile` (release build) counts CPU time and traffic per party.
+
+| per signature                    | 2 of 2  | 3 of 4  |
+|----------------------------------|---------|---------|
+| wall time, this machine          | 180 ms  | 405 ms  |
+| CPU time per party               | 105 ms  | 200 ms  |
+| messages sent per party          | 7       | 14      |
+| bytes sent per party             | 122 KiB | 244 KiB |
+| rounds                           | 8       | 8       |
+
+For scale: the old two-party protocol (ECDSA-2P, below) takes 93 ms on this container and
+39 ms on the M4, a factor of 2.4 between the machines. Three-of-four signing is therefore
+about four times slower than two-party signing was, and should land near 165 ms on the M4.
+That last figure is an estimate, not a measurement.
+
+A CPU profile puts about 60% of a party's time in the base oblivious transfers (256 per pair
+of parties, redone for every signature) and about 22% in zero-knowledge proofs. Nearly all of
+it is constant-time secp256k1 point multiplication. The network is not the bottleneck: eight
+rounds at 1 ms between parties is 8 ms.
+
+### What was tuned
+
+| change                                              | before  | after   |
+|-----------------------------------------------------|---------|---------|
+| request with 3 signatures, four party processes     | 1302 ms | 951 ms  |
+| one signature, 2 of 2, `--ot-threads 2`             | 180 ms  | 143 ms  |
+| one signature, 3 of 4, `--ot-threads 2` (in-process)| 405 ms  | 353 ms  |
+
+- **Signatures of one request run side by side**, each in its own session (up to eight at a
+  time). A commitment with HTLCs used to take one signing round per signature, one after the
+  other. Three parties on two cores are CPU-bound here; with a core or more per party the
+  request should take about as long as one signature.
+- **`--ot-threads N`** on the party (patch `cb-mpc-base-ot-threads.patch`, off by default)
+  spreads the base OTs of a signature over N threads. Messages and results are unchanged.
+  This container cannot show the full effect: its two cores are already shared by the
+  parties, and through four party processes `--ot-threads 2` made no measurable difference.
+  On a party with four idle cores the base-OT share of the time should fall to about a
+  quarter. Measure it on real hardware before relying on it.
+- **A party that did not answer is skipped for 15 seconds**, and connecting to a party times
+  out after 3 seconds, so one dead party costs a single slow request rather than every one.
+- Key generation now returns only after every party has stored its share (this was a race:
+  a signature right after a channel open could reach a party that had not written its share
+  yet).
+
+### What was not done
+
+The largest lever left is to stop redoing the base OTs for every signature: run them once per
+pair of parties and extend them. That is a change to the signing protocol itself, cb-mpc does
+not offer it, and its specification could not be consulted from here. It could remove about
+half of the CPU cost, and it needs a cryptographer's review before anyone writes it.
 
 The rest of this page is the earlier two-party (ECDSA-2P) measurement, kept for comparison.
 

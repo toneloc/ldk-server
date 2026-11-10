@@ -6,14 +6,17 @@
 //!   party services over TCP, exactly as LDK Server does.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use ldk_server_mpc::bitcoin::secp256k1::{Message, Secp256k1};
+use ldk_server_mpc::cbmpc::TransportError;
 use ldk_server_mpc::client::MpcClient;
-use ldk_server_mpc::mp::{self, Threshold};
+use ldk_server_mpc::mp::{self, MpTransport, Threshold};
+use ldk_server_mpc::protocol::{Derivation, SignItem, SigningContext, SigningOp};
 use ldk_server_mpc::transport::LocalMesh;
 
 #[derive(Parser, Debug)]
@@ -38,6 +41,12 @@ struct Args {
 	/// Concurrent signing threads (remote mode; each thread uses its own key).
 	#[arg(long, default_value_t = 1)]
 	concurrency: usize,
+	/// The parties' `--auth-key-file`, if they use one (remote mode).
+	#[arg(long)]
+	auth_key_file: Option<std::path::PathBuf>,
+	/// Also time requests that carry this many signatures each (remote mode).
+	#[arg(long, default_value_t = 1)]
+	batch: usize,
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -121,16 +130,91 @@ fn inproc(args: &Args) {
 	report("sign (inproc)", sign_samples, sign_start.elapsed());
 }
 
+/// Counts what one party sends, to size the protocol's network cost.
+struct Counting<'a> {
+	inner: &'a LocalMesh,
+	messages: AtomicU64,
+	bytes: AtomicU64,
+}
+
+impl MpTransport for Counting<'_> {
+	fn send(&self, peer: usize, msg: &[u8]) -> Result<(), TransportError> {
+		self.messages.fetch_add(1, Ordering::Relaxed);
+		self.bytes.fetch_add(msg.len() as u64, Ordering::Relaxed);
+		self.inner.send(peer, msg)
+	}
+
+	fn recv(&self, peer: usize) -> Result<Vec<u8>, TransportError> {
+		self.inner.recv(peer)
+	}
+}
+
+/// CPU time this thread has used so far (Linux only; zero elsewhere).
+fn thread_cpu() -> Duration {
+	std::fs::read_to_string("/proc/thread-self/schedstat")
+		.ok()
+		.and_then(|s| s.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()))
+		.map(Duration::from_nanos)
+		.unwrap_or_default()
+}
+
+/// Where a signature's time goes: wall time, each party's CPU time, and what each sends.
+/// With every party in one process the wall time is inflated when there are fewer cores than
+/// parties; a party's CPU time is what it would need on a machine of its own.
+fn profile(args: &Args) {
+	let ac =
+		Threshold::new((0..args.parties).map(|i| format!("party-{i}")).collect(), args.threshold)
+			.expect("valid --parties / --threshold");
+	let ac2 = ac.clone();
+	let shares =
+		Arc::new(run_parties(args.parties, move |i, mesh| mp::dkg(&ac2, i, mesh).unwrap()));
+	let quorum: Vec<usize> = (0..args.threshold).collect();
+	let (mut wall, mut cpu, mut messages, mut bytes) = (Vec::new(), Vec::new(), 0u64, 0u64);
+	for i in 0..args.signs {
+		let mut digest = [0u8; 32];
+		digest[..8].copy_from_slice(&(i as u64).to_be_bytes());
+		let (ac2, quorum2, shares2) = (ac.clone(), quorum.clone(), Arc::clone(&shares));
+		let t0 = Instant::now();
+		let out = run_parties(quorum.len(), move |pos, mesh| {
+			let counting =
+				Counting { inner: mesh, messages: AtomicU64::new(0), bytes: AtomicU64::new(0) };
+			let c0 = thread_cpu();
+			mp::sign(&ac2, &quorum2, pos, &shares2[quorum2[pos]], &digest, 0, &counting).unwrap();
+			(thread_cpu() - c0, counting.messages.into_inner(), counting.bytes.into_inner())
+		});
+		wall.push(t0.elapsed());
+		for (c, m, b) in out {
+			cpu.push(c);
+			messages += m;
+			bytes += b;
+		}
+	}
+	let total = wall.iter().sum();
+	report("sign wall time", wall, total);
+	let total = cpu.iter().sum();
+	report("sign CPU time per party", cpu, total);
+	let per_party = (args.signs * args.threshold) as u64;
+	println!(
+		"each party sends {} messages, {:.0} KiB per signature",
+		messages / per_party,
+		bytes as f64 / per_party as f64 / 1024.0
+	);
+}
+
 fn remote(args: &Args) {
 	let addr = args.party.expect("--party required in remote mode");
-	let client = MpcClient::new(addr);
+	let mut client = MpcClient::new(addr);
+	if let Some(path) = &args.auth_key_file {
+		let psk = ldk_server_mpc::secure::load_or_create_key_file(path).expect("auth key file");
+		client = client.with_psk(psk);
+	}
 	client.ping().expect("ping the party");
 	let secp = Secp256k1::new();
 
 	let mut dkg_samples = Vec::new();
 	let dkg_start = Instant::now();
 	let mut keys = Vec::new();
-	for i in 0..args.dkgs.max(args.concurrency).max(1) {
+	for i in 0..args.dkgs.max(args.concurrency).max(args.batch).max(1) {
 		let mut key_id = [0u8; 32];
 		key_id[..8].copy_from_slice(
 			&std::time::SystemTime::now()
@@ -172,7 +256,36 @@ fn remote(args: &Args) {
 	}
 	let total = sign_start.elapsed();
 	report(&format!("sign (remote, full path, concurrency={})", args.concurrency), all, total);
-	let _ = secp;
+
+	// One request carrying several signatures on different keys, as a commitment update with
+	// HTLCs does (the funding signature plus one per HTLC).
+	if args.batch > 1 {
+		let mut samples = Vec::new();
+		let start = Instant::now();
+		for i in 0..(args.signs / args.batch).max(3) {
+			let items: Vec<SignItem> = (0..args.batch)
+				.map(|n| {
+					let mut digest = [0xb7u8; 32];
+					digest[..8].copy_from_slice(&((i * 1_000 + n) as u64).to_be_bytes());
+					SignItem {
+						key_id: keys[n % keys.len()].0,
+						derivation: Derivation::None,
+						digest,
+						context: SigningContext { op: Some(SigningOp::Test), ..Default::default() },
+					}
+				})
+				.collect();
+			let pks: Vec<_> = (0..args.batch).map(|n| keys[n % keys.len()].1).collect();
+			let t0 = Instant::now();
+			client.sign_batch(&secp, None, items, Some(&pks)).expect("sign batch");
+			samples.push(t0.elapsed());
+		}
+		report(
+			&format!("request with {} signatures (remote, full path)", args.batch),
+			samples,
+			start.elapsed(),
+		);
+	}
 }
 
 fn main() {
@@ -180,6 +293,7 @@ fn main() {
 	match args.mode.as_str() {
 		"inproc" => inproc(&args),
 		"remote" => remote(&args),
+		"profile" => profile(&args),
 		other => {
 			eprintln!("unknown mode {other}");
 			std::process::exit(2);

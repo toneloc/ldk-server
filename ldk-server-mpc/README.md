@@ -237,6 +237,7 @@ and never refreshed or stored. Spliced funding keys use a fresh key generation k
    git clone https://github.com/coinbase/cb-mpc ../cb-mpc
    cd ../cb-mpc && git checkout 0b71670 && git submodule update --init vendors/secp256k1
    git am ../ldk-server/contrib/patches/cb-mpc-additive-tweak-derivation.patch
+   git am ../ldk-server/contrib/patches/cb-mpc-base-ot-threads.patch   # optional, for --ot-threads
    pip3 install --user cmake            # if cmake is not installed
    export CBMPC_OPENSSL_ROOT=$PWD/openssl-3.6.4-install
    bash scripts/openssl/build-static-openssl-macos-m1.sh
