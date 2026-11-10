@@ -15,11 +15,11 @@ agree to sign. No party ever holds a whole key. The revocation secrets, which ca
 shared the same way because they come from a hash chain, exist online only as ciphertexts
 that the same three-of-four must agree to decrypt.
 
-Each party is a validator, not a rubber stamp. It rebuilds each transaction from the bytes
-it is given, checks the key and the channel state against its own record, verifies the
-counterparty's signature on every new state itself before an old one can be revoked, tracks
-the node's balance, and refuses to sign old states, balance-draining updates, or closes and
-sweeps to addresses it does not know.
+Each party is a validator, not a rubber stamp. It rebuilds every commitment from its
+balances and HTLCs with keys it trusts, runs the Validating Lightning Signer's rules on it,
+verifies the counterparty's signature on every new state itself before an old one can be
+revoked, counts what leaves the node's balance against a limit, and refuses to sign old
+states, or closes, splices and sweeps to addresses it does not know.
 
 Three of four is the smallest setup that survives one party being down **and** one party
 being compromised at the same time: any two groups of three share two parties, so at least
@@ -27,14 +27,13 @@ one honest party in every group has seen everything that came before.
 
 This runs real Lightning end to end on regtest: channel open, payments in both directions,
 restarts, payments with one party down (including the one LDK Server was talking to),
-cooperative close and force-close.
+splices, cooperative close and force-close.
 
-Caveats. It is a proof of concept reviewed by no one but its authors (parts of it written
-with AI assistance), all parties run on one machine in the tests, the policy covers the big
-cases but not HTLC accounting, and one small key-derivation helper is added outside cb-mpc's
-audited public API. The on-chain wallet is the one key still on the host: channel funds can
-only be sent into that wallet, but once there the host can spend them. Do not use this with
-real funds.
+Caveats. It is a proof of concept reviewed by no one but its authors (much of it written
+with AI assistance), all parties run on one machine in the tests, and one small
+key-derivation helper is added outside cb-mpc's audited public API. The on-chain wallet is
+the one key still on the host: channel funds can only be sent into that wallet, but once
+there the host can spend them. Do not use this with real funds.
 
 ## What it does
 
@@ -58,48 +57,88 @@ real funds.
 Details, diagrams and the threat model are in
 [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md).
 
-## Status (2026-11-09, branch `mpc`)
+## Status (2026-11-10, branch `mpc`)
 
-- **Regtest, full coverage, four parties:** `e2e-tests/tests/mpc.rs`. Channel open (five key
+What is built, in the order it went in:
+
+1. **Revocation secrets.** Made offline from a seed split among custodians, stored
+   threshold-encrypted, released only after the parties have checked the counterparty's
+   signature on a newer state.
+2. **Three-of-four signing.** Every channel key is a distributed key. Each party checks every
+   request against its own record before it takes part.
+3. **Signing speed, measured.** About 400 ms per signature with three parties sharing a
+   two-core test machine; the signatures of one request run side by side. Most of the time
+   is oblivious transfers that the protocol redoes for every signature. See
+   [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
+4. **Splices.** The parties follow a channel only to a funding output that a splice they
+   signed creates, and refuse a splice that pays our balance to an address they do not know.
+5. **No revoking what was signed.** A state signed for broadcast is never revoked.
+6. **The VLS validator in every party.** Each commitment is rebuilt from its balances and
+   HTLCs and judged by the
+   [Validating Lightning Signer](https://gitlab.com/lightning-signer/validating-lightning-signer)'s
+   rules. An outflow limit caps what may leave our balances per hour or day, by any route.
+
+How it is tested:
+
+- **Regtest, four party processes:** `e2e-tests/tests/mpc.rs`. Channel open (five key
   generations), payments both ways, restart of all parties, payments with one party down and
-  with the leading party down, restart of LDK Server, cooperative close with a distributed
-  key verified in the on-chain 2-of-2 script, and a holder force-close. The kits are made by
-  the real ceremony tool.
-- **Party tests:** `cargo test -p ldk-server-mpc`. They include every quorum signing and
-  decrypting, derived keys checked against the expected public keys, LDK's own shachain
-  store accepting released secrets, a compromised host, a compromised party, a party that
-  missed updates, and an attempt to get a revoked state signed through a party with an
-  outdated record.
-- **Latency:** a threshold signature takes about 390 ms with three parties sharing a
-  two-core test machine (about 190 ms for two parties), against about 40 ms for the earlier
-  two-party protocol on an Apple M4. Signatures in one request are made one after another,
-  so a commitment update with HTLCs takes one such round per signature. See
-  [`docs/mpc-benchmarks.md`](docs/mpc-benchmarks.md).
-- **Not run on signet.** The earlier two-party, funding-key version was
-  ([`docs/mpc-signet-demo.md`](docs/mpc-signet-demo.md)); this design has only run on regtest.
+  with the leading party down, restart of LDK Server, cooperative close, holder force-close,
+  splice-in, a splice by the counterparty, splice-out, a splice-out three parties refuse
+  against a fourth that sides with the host, and a payment refused at the outflow limit.
+  The kits are made by the real ceremony tool.
+- **Party tests:** `cargo test -p ldk-server-mpc`. Every quorum signing and decrypting, LDK's
+  own shachain store accepting released secrets, a compromised host, a compromised party, a
+  party that missed updates or a splice, a forged transaction behind a true description.
+- **Not run on signet or mainnet,** and never on separate machines. The earlier two-party,
+  funding-key version ran on signet ([`docs/mpc-signet-demo.md`](docs/mpc-signet-demo.md)).
 
-## Not yet covered
+## How far this gets
 
-- **Share rotation and the on-chain wallet.** Key shares are not refreshed yet, and the
-  wallet mnemonic is still on the LDK Server host (separate from the node seed, and parties
-  only pay out to its addresses).
-- **Key generation needs every party.** A channel cannot open while a party is down.
-- **Splices, partly.** The parties follow a channel only to a funding output created by a
-  splice transaction they signed, and refuse a splice that pays our balance anywhere but an
-  allow-listed address. Fee bumps of a pending splice have not been run with MPC, and a
-  splice the parties refuse midway stays pending (see `ldk-server-mpc/README.md`).
-- **Policy.** Every party rebuilds each commitment from its balances and HTLCs and runs the
-  Validating Lightning Signer's validator on it, so it signs nothing but real commitments of
-  the channel. How much may leave our balances is a limit per hour or day that is off by
-  default (`--max-outflow-sat-per-day`); without it a compromised LDK Server can still pay
-  our balance out over Lightning. When the limit is reached the channel stops updating
-  until the window moves on.
-- **Revocation kits.** A kit covers a fixed number of channel states and must be refilled by
-  the ceremony before it runs out. The master seed is whole during a ceremony run, offline.
-- **Independence.** The parties must run on separate infrastructure with separate operators
-  to be a trust boundary; the tests run them on one machine.
-- **cb-mpc.** `derive_mul_add_ac` uses cb-mpc's internal key representation and is outside
-  its public, bug-bounty-covered API.
+The goal is a Lightning node that no single machine can rob. Scored honestly, from 0 (does
+not help) to 10 (solves it decently well): the design is about a 7, and what is built is
+about a 6 with the outflow limit set, 4 without it.
+
+A compromised LDK Server host can no longer sign away a channel, revoke a live state, close
+or splice to its own address, or get anything signed that is not a real commitment of the
+channel. What it can still do is listed next.
+
+## What remains
+
+Theft paths still open:
+
+- **Lightning payments, up to the limit.** The parties never see invoices, so they cannot
+  tell a payment the operator meant from one a compromised host made up. The outflow limit
+  (`--max-outflow-sat-per-day`) bounds both alike, and it is off unless set.
+- **The on-chain wallet** is still a key on the LDK Server host. Channel funds can only be
+  paid into it, and then the host can spend them.
+- **The seed.** The revocation secrets come from one seed. It is split among custodians, but
+  whole on the ceremony machine for every run, refills included. With it, a counterparty
+  can take a channel the moment we force-close.
+- **One operator, one codebase.** Four parties running the same software under one
+  administrator are one target. They are a trust boundary only on separate infrastructure
+  with separate operators.
+- **No review.** Nobody outside has looked at this. `derive_mul_add_ac` and the threaded
+  oblivious transfers are patches outside cb-mpc's public, bug-bounty-covered API.
+
+Things that do not work well yet:
+
+- **Opening a channel needs all four parties up**, and key shares are never rotated.
+- **A refusal stalls the channel.** A splice the parties refuse midway stays pending, and a
+  commitment refused at the outflow limit stops all updates until the window has room.
+  Recovery from a stuck splice is not worked out; a force close is the fallback.
+- **VLS's limits are its defaults:** 10 BTC per channel and about 0.168 BTC of HTLCs in
+  flight. They are not configurable here yet.
+- **Fee-bumping a pending splice** has not been run with MPC.
+- **Kits run out.** A kit covers a fixed number of channel states and must be refilled by
+  the ceremony before it does.
+
+Next, in this order: configurable VLS limits, the wallet behind the parties, share rotation,
+a signet run on separate machines. Further out: reusing oblivious transfers across
+signatures (roughly half the signing cost, needs a cryptographer), and dropping the seed for
+peers that support independent per-commitment secrets, if that reaches upstream lnd and
+Core Lightning.
+
+Details are in [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md).
 
 ## Where things are
 
@@ -108,7 +147,8 @@ Details, diagrams and the threat model are in
 - [`ldk-server/src/mpc_signer.rs`](ldk-server/src/mpc_signer.rs): LDK Server's signer;
   `[mpc]` config in [`docs/configuration.md`](docs/configuration.md).
 - [`contrib/patches/`](contrib/patches/): the ldk-node patch (`ExternalChannelSigner`,
-  separate wallet entropy, `signer_unblocked` poke) and the cb-mpc derivation patch. The
+  separate wallet entropy, `signer_unblocked` poke, commitment details for the signer) and
+  the two cb-mpc patches (key derivation on shares, optional threaded oblivious transfers). The
   workspace `Cargo.toml` expects the patched ldk-node at `../ldk-node` and cb-mpc at
   `../cb-mpc`.
 
