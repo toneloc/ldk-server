@@ -889,9 +889,6 @@ mod revocation {
 		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
 		ch.update(TOP);
 
-		// The latest state may be signed for broadcast.
-		ch.sign_holder_commitment(TOP - 1).unwrap();
-
 		// Party 3 misses the update that revokes TOP - 1, so its record still says TOP - 1 is
 		// the latest state.
 		ch.cluster.down(3);
@@ -916,6 +913,37 @@ mod revocation {
 		assert!(denied(err).contains("older than validated"));
 		// The current state can still be signed.
 		ch.sign_holder_commitment(TOP - 2).unwrap();
+	}
+
+	#[test]
+	fn a_state_signed_for_broadcast_is_never_revoked() {
+		let ch = channel("signedstate", 1, 12);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.update(TOP);
+
+		// The latest state is signed for broadcast, as for a force close.
+		ch.sign_holder_commitment(TOP - 1).unwrap();
+
+		// A compromised host keeps the channel going instead and asks for that state's
+		// secret: with it, the counterparty could take the whole channel once the signed
+		// commitment is broadcast. The parties accept the next state but keep the secret.
+		ch.sign_counterparty_commitment(TOP - 2);
+		ch.validate(TOP - 2);
+		let msg = denied(ch.release(TOP - 1).unwrap_err());
+		assert!(msg.contains("signed for broadcast"), "{msg}");
+		for i in 0..4 {
+			let msg = denied(
+				ch.cluster
+					.client_of(i)
+					.release_commitment_secret(&ch.id, TOP - 1, None)
+					.unwrap_err(),
+			);
+			assert!(msg.contains("signed for broadcast"), "party {i}: {msg}");
+		}
+		// Nor that of any later state.
+		ch.sign_counterparty_commitment(TOP - 3);
+		ch.validate(TOP - 3);
+		assert!(ch.release(TOP - 2).is_err());
 	}
 
 	#[test]

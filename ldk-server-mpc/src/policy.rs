@@ -195,6 +195,10 @@ pub struct ChannelState {
 	/// Splice transactions this party saw signed (or was shown the parties' signature on).
 	/// A new funding output is accepted only if one of them creates it.
 	pub splices: Vec<Splice>,
+	/// The newest holder commitment this party signed for broadcast. Its secret, and that of
+	/// any later state, is never released: a state that can reach the chain must not be
+	/// revocable.
+	pub signed_holder_commitment: Option<u64>,
 }
 
 /// A funding output of a channel.
@@ -344,6 +348,7 @@ impl ChannelState {
 			w.u64(splice.commitment_number);
 			w.opt_u64(splice.min_balance_sat);
 		}
+		w.opt_u64(self.signed_holder_commitment);
 		w.0
 	}
 
@@ -422,6 +427,7 @@ impl ChannelState {
 						min_balance_sat: r.opt_u64()?,
 					});
 				}
+				st.signed_holder_commitment = r.opt_u64()?;
 			}
 			Ok(())
 		})()
@@ -468,6 +474,8 @@ impl ChannelState {
 		for splice in &newer.splices {
 			self.add_splice(splice.clone());
 		}
+		self.signed_holder_commitment =
+			min_opt(self.signed_holder_commitment, newer.signed_holder_commitment);
 		if self.counterparty_keys.is_none() {
 			self.counterparty_keys = newer.counterparty_keys.clone();
 		}
@@ -730,6 +738,14 @@ impl ChannelPolicy {
 					"refusing to release secret {idx}: no holder commitment validated yet"
 				))
 			},
+		}
+		if let Some(signed) = st.signed_holder_commitment {
+			if idx <= signed {
+				return deny(format!(
+					"refusing to release secret {idx}: holder commitment {signed} was signed for \
+					 broadcast"
+				));
+			}
 		}
 		let entry = self.kit_entry(channel, idx)?;
 		st.released_secrets += 1;
@@ -994,6 +1010,7 @@ impl ChannelPolicy {
 					}
 				}
 				let funding = Self::spent_funding(&st, ctx)?;
+				st.signed_holder_commitment = min_opt(st.signed_holder_commitment, Some(number));
 				let tx = tx.as_ref().unwrap();
 				if let Some(balance) =
 					self.holder_balance_in_holder_commitment(channel, &st, keys, tx, item, number)?
@@ -2077,9 +2094,9 @@ mod tests {
 		let mut st = ChannelState { validated_holder_commitment: Some(7), ..Default::default() };
 		let mut v1 = st.encode();
 		v1[0] = 1;
-		// Version 1 had no kit field (1 byte), no pinned parameters (4 + 1 + 1 bytes) and no
-		// splices (4 bytes).
-		v1.truncate(v1.len() - 11);
+		// Version 1 had no kit field (1 byte), no pinned parameters (4 + 1 + 1 bytes), no
+		// splices (4 bytes) and no signed holder commitment (1 byte).
+		v1.truncate(v1.len() - 12);
 		assert_eq!(ChannelState::decode(&v1).unwrap(), st);
 		st.kit_id = Some(KIT);
 		assert_eq!(ChannelState::decode(&st.encode()).unwrap(), st);
