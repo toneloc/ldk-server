@@ -57,6 +57,156 @@ there the host can spend them. Do not use this with real funds.
 Details, diagrams and the threat model are in
 [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md).
 
+## Which secrets exist, and where
+
+"The seed" below means one thing only: the seed of the revocation secrets. The channel keys
+have no seed and are never whole anywhere.
+
+| Secret | What it is for | Where it lives | Ever whole on one machine? |
+|---|---|---|---|
+| Channel keys (funding, payment, delayed-payment, HTLC, revocation basepoint) | Signing everything a channel signs | One share per party, made jointly when the channel opens | **No, never.** There is no seed and no backup phrase for them |
+| Revocation secrets (per-commitment secrets) | Revoking our old channel states, one secret per state | Encrypted in the kit files every party holds; three parties must agree to decrypt one | Only as the **master seed**, on the offline ceremony machine, for the length of a ceremony run |
+| Master seed pieces | Rebuilding the master seed for a ceremony | One piece per custodian, offline | A piece alone reveals nothing; any `threshold` of them rebuild the seed |
+| TDH2 key | Decrypting revocation secrets | One share per party, made jointly | No |
+| On-chain wallet mnemonic | The node's on-chain wallet, where closes and sweeps pay | The LDK Server host | **Yes, on the host.** Not yet behind the parties |
+| Node identity key | The node's Lightning identity (gossip, invoices, onion) | The LDK Server host | Yes, on the host. It cannot move channel funds |
+| Party identity keys, share keys, client key | Links between the parties and LDK Server; encrypting shares at rest | Each party's own files | Each on its own party |
+
+So the ceremony, and the seed, are about revocation secrets and nothing else. BOLT 3 makes
+those come from a hash chain, which cannot be computed on shares the way a signature can;
+that is why they need a seed at all, and why it is kept offline and split.
+
+## Getting started
+
+In the order things have to happen. For a trial everything can run on one machine; for the
+split to mean anything, each party needs its own machine and its own operator.
+
+**You need:** four machines for the parties (called a, b, c, d here), the LDK Server host,
+an offline machine for the ceremony, and a **fresh node**. MPC cannot be switched on for a
+node that already has channels.
+
+### 1. Build
+
+Build cb-mpc, the patched ldk-node, and this repository. The commands are in
+[`ldk-server-mpc/README.md`](ldk-server-mpc/README.md#building). The result is three
+binaries besides LDK Server: `ldk-server-mpc-party`, `ldk-server-mpc-ceremony` and
+`ldk-server-mpc-bench`.
+
+### 2. Each party makes its identity
+
+On each party's machine:
+
+```bash
+ldk-server-mpc-party --keystore mpc/a --share-key-file keys/share-a.key --print-identity
+```
+
+It prints the party's public identity key. The operators exchange these four keys; they are
+what the parties recognize each other by. Together with the addresses they form the
+*roster*, which is the same on every party, in the same order:
+
+```bash
+ROSTER="--threshold 3 --party a=10.0.0.1:7711=<id a> --party b=10.0.0.2:7711=<id b> \
+  --party c=10.0.0.3:7711=<id c> --party d=10.0.0.4:7711=<id d>"
+```
+
+### 3. Start one party, then LDK Server
+
+LDK Server needs to reach a party to start, and the parties need LDK Server's wallet
+address list to know where channel funds may be paid. So one party goes first:
+
+```bash
+ldk-server-mpc-party --name a --listen 10.0.0.1:7701 --keystore mpc/a $ROSTER \
+  --auth-key-file keys/client.psk --share-key-file keys/share-a.key --network bitcoin
+```
+
+`keys/client.psk` is created here. Copy it to the LDK Server host and to the other parties:
+it is the key of the link between LDK Server and the parties.
+
+Then LDK Server, on a fresh storage directory, with this in its config:
+
+```toml
+[node]
+onchain_wallet_mnemonic_path = "/path/to/onchain_wallet_mnemonic"
+
+[mpc]
+party_address = "10.0.0.1:7701,10.0.0.2:7701,10.0.0.3:7701,10.0.0.4:7701"
+coverage = "all"
+auth_key_path = "/path/to/client.psk"
+```
+
+On its first start it writes `<storage>/onchain_wallet_xpub`: the public key of its
+on-chain wallet.
+
+### 4. Start all four parties
+
+Stop party a, and start all four with the wallet's public key and the limits you want:
+
+```bash
+ldk-server-mpc-party --name a --listen 10.0.0.1:7701 --keystore mpc/a $ROSTER \
+  --auth-key-file keys/client.psk --share-key-file keys/share-a.key --network bitcoin \
+  --payout-xpub "$(cat onchain_wallet_xpub)" \
+  --max-outflow-sat-per-day 5000000
+```
+
+- `--payout-xpub` is the only place closes, sweeps and splice-outs may pay.
+- `--max-outflow-sat-per-day` is the most that may leave the channel balances in a day.
+  Leave it out and there is no limit.
+
+Once all four are up they generate their joint TDH2 key by themselves, and each writes its
+public half to `<keystore>/tdh2.pub`. No channel keys exist yet.
+
+### 5. The ceremony: revocation secrets (offline)
+
+On the offline machine, with `tdh2.pub` carried over. The first time only, create the
+master seed and split it among custodians (here any 3 of 5):
+
+```bash
+ldk-server-mpc-ceremony new-seed --threshold 3 --pieces 5 --out-dir pieces
+```
+
+Hand one piece file to each custodian and note the fingerprint it prints. The seed itself is
+not stored. Then, with three custodians present, make kits, one per channel you expect to
+open:
+
+```bash
+ldk-server-mpc-ceremony new-kits --piece piece-1.txt --piece piece-2.txt --piece piece-3.txt \
+  --fingerprint <from new-seed> --tdh2-public-key tdh2.pub \
+  --kits 10 --states 50000 --out-dir kits
+```
+
+During this command the seed is whole in that machine's memory. That is the one moment it
+is. The kit files that come out hold only public points and ciphertexts: carry them back and
+copy every one to every party's `<keystore>/kits/` directory.
+
+### 6. Open a channel
+
+With **all four parties up**, open a channel through LDK Server as usual. The parties
+generate the channel's five keys among themselves and bind one kit to the channel. A
+channel cannot open with a party down, or with no unused kit left.
+
+### 7. Run
+
+From here any three parties are enough: payments, forwards, closes and force closes all
+work with one party down, including the one LDK Server happens to be talking to. A splice
+makes a new funding key, so like a channel open it needs all four. Each party refuses what
+its own policy does not allow, whatever LDK Server says.
+
+### 8. Keep it running
+
+- **Refill kits before they run out.** A kit covers the number of states it was made with;
+  a channel stops when its kit is used up. The leading party warns below 256 states left.
+  A refill is another ceremony run with the custodians: `ldk-server-mpc-ceremony refill`.
+- **Make kits before opening more channels.** One unused kit per new channel.
+- **Back up each party's keystore, each on its own.** A party that loses its keystore
+  cannot rejoin: the others will not regenerate a key. With two keystores lost, the channel
+  keys are gone.
+- **Allow-list an address before splicing out to it** (`--payout-address` on every party).
+- **Set the outflow limit above what the node really sends.** At the limit the parties stop
+  signing and the channel waits until the window has room.
+
+The full reference, with the architecture and the threat model, is
+[`ldk-server-mpc/README.md`](ldk-server-mpc/README.md).
+
 ## Status (2026-11-10, branch `mpc`)
 
 What is built, in the order it went in:
@@ -111,9 +261,10 @@ Theft paths still open:
   (`--max-outflow-sat-per-day`) bounds both alike, and it is off unless set.
 - **The on-chain wallet** is still a key on the LDK Server host. Channel funds can only be
   paid into it, and then the host can spend them.
-- **The seed.** The revocation secrets come from one seed. It is split among custodians, but
-  whole on the ceremony machine for every run, refills included. With it, a counterparty
-  can take a channel the moment we force-close.
+- **The seed of the revocation secrets.** Only those come from a seed; the channel keys do
+  not. It is split among custodians, but whole on the offline ceremony machine for every
+  run, refills included. With it, a counterparty can take a channel the moment we
+  force-close.
 - **One operator, one codebase.** Four parties running the same software under one
   administrator are one target. They are a trust boundary only on separate infrastructure
   with separate operators.
@@ -151,17 +302,6 @@ Details are in [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md).
   the two cb-mpc patches (key derivation on shares, optional threaded oblivious transfers). The
   workspace `Cargo.toml` expects the patched ldk-node at `../ldk-node` and cb-mpc at
   `../cb-mpc`.
-
-## Build and run
-
-See [`ldk-server-mpc/README.md`](ldk-server-mpc/README.md#building) for building cb-mpc and
-the patched ldk-node, then:
-
-```bash
-cargo build --release -p ldk-server -p ldk-server-cli -p ldk-server-mpc
-```
-
-The same README walks through starting four parties, LDK Server and the ceremony.
 
 ## Upstream
 
