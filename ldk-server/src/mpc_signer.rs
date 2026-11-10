@@ -2,8 +2,9 @@
 //! (`ldk-server-mpc`).
 //!
 //! With `coverage = "all"` every channel key (funding, payment, delayed-payment, HTLC and
-//! revocation basepoints) is a distributed key and the per-commitment secrets live on MPC
-//! Party B. With `coverage = "funding"` only the funding key is distributed. See
+//! revocation basepoints) is a distributed key, and the per-commitment secrets exist online only
+//! as threshold-encrypted kit entries that both MPC parties must agree to decrypt. With
+//! `coverage = "funding"` only the funding key is distributed. See
 //! `ldk-server-mpc/README.md`.
 
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ use std::time::Duration;
 use ldk_node::bitcoin::hashes::{sha256, Hash, HashEngine};
 use ldk_node::bitcoin::secp256k1::ecdsa::Signature;
 use ldk_node::bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
-use ldk_node::bitcoin::{EcdsaSighashType, Txid};
+use ldk_node::bitcoin::{EcdsaSighashType, Transaction, Txid};
 use ldk_node::lightning::ln::chan_utils::ChannelPublicKeys;
 use ldk_node::lightning::util::ser::Writeable;
 use ldk_node::signer::{
@@ -22,7 +23,8 @@ use ldk_node::signer::{
 use ldk_server_mpc::client::{ClientError, MpcClient};
 use ldk_server_mpc::policy::{bolt3_tweak, revocation_tweaks};
 use ldk_server_mpc::protocol::{
-	ChannelId, CounterpartyKeys, Derivation, KeyId, KeyKind, SignItem, SigningContext, SigningOp,
+	ChannelId, CounterpartyKeys, Derivation, HolderProof, KeyId, KeyKind, SignItem, SigningContext,
+	SigningOp,
 };
 use log::{debug, error, info};
 
@@ -45,7 +47,7 @@ pub(crate) struct MpcChannelSigner {
 
 #[derive(Clone, Debug)]
 enum PendingNotice {
-	HolderCommitmentValidated { channel: ChannelId, commitment_number: u64 },
+	HolderCommitmentValidated { channel: ChannelId, commitment_number: u64, proof: HolderProof },
 	CounterpartyRevocationValidated { channel: ChannelId, idx: u64, secret: [u8; 32] },
 }
 
@@ -80,9 +82,9 @@ impl MpcChannelSigner {
 
 	fn deliver(&self, notice: &PendingNotice) -> Result<(), ClientError> {
 		match notice {
-			PendingNotice::HolderCommitmentValidated { channel, commitment_number } => {
-				self.client.holder_commitment_validated(channel, *commitment_number)
-			},
+			PendingNotice::HolderCommitmentValidated { channel, commitment_number, proof } => self
+				.client
+				.holder_commitment_validated(channel, *commitment_number, Some(proof.clone())),
 			PendingNotice::CounterpartyRevocationValidated { channel, idx, secret } => {
 				self.client.counterparty_revocation_validated(channel, *idx, *secret)
 			},
@@ -396,11 +398,18 @@ impl ExternalChannelSigner for MpcChannelSigner {
 	}
 
 	fn holder_commitment_validated(
-		&self, channel_keys_id: [u8; 32], commitment_number: u64,
+		&self, channel_keys_id: [u8; 32], commitment_number: u64, commitment_tx: &Transaction,
+		counterparty_sig: &Signature,
 	) -> Result<(), ()> {
+		// The parties do not take our word for it: they check the counterparty's signature on
+		// the commitment transaction themselves before any older state can be revoked.
 		self.notify(PendingNotice::HolderCommitmentValidated {
 			channel: Self::channel_id(channel_keys_id),
 			commitment_number,
+			proof: HolderProof {
+				transaction: ldk_node::bitcoin::consensus::encode::serialize(commitment_tx),
+				counterparty_sig: counterparty_sig.serialize_compact(),
+			},
 		});
 		Ok(())
 	}

@@ -44,6 +44,7 @@ fn start_party(
 		client_psk: None,
 		peer_psk: None,
 		share_key: None,
+		kit_dir: None,
 	};
 	let svc = PartyService::new(cfg).unwrap();
 	let s = Arc::clone(&svc);
@@ -251,6 +252,7 @@ fn psk_secured_links_and_encrypted_shares() {
 			client_psk: Some(client_psk),
 			peer_psk: Some(peer_psk),
 			share_key: Some(share_key),
+			kit_dir: None,
 		};
 		let svc = PartyService::new(cfg).unwrap();
 		let s = Arc::clone(&svc);
@@ -258,7 +260,8 @@ fn psk_secured_links_and_encrypted_shares() {
 		(svc, addr)
 	};
 	let (_p2, p2_addr) = start(Party::P2, None, ks_b.clone());
-	let (_p1, p1_addr) = start(Party::P1, Some(p2_addr), ks_a.clone());
+	let (p1, p1_addr) = start(Party::P1, Some(p2_addr), ks_a.clone());
+	p1.ensure_tdh2().unwrap();
 	let secp = Secp256k1::new();
 
 	// Correct PSK: works end to end.
@@ -268,11 +271,12 @@ fn psk_secured_links_and_encrypted_shares() {
 	let sig = client.sign(&secp, &key_id, &[0x62u8; 32], None, Some(&pk)).unwrap();
 	secp.verify_ecdsa(&Message::from_digest([0x62u8; 32]), &sig, &pk).unwrap();
 
-	// Shares and the master secret are encrypted on disk.
+	// Key shares, including the TDH2 share, are encrypted on disk.
 	for dir in [&ks_a, &ks_b] {
+		assert!(dir.join("tdh2.keyshare").exists());
 		for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
 			let name = entry.file_name().to_string_lossy().to_string();
-			if name.ends_with(".share") || name == "master.secret" {
+			if name.ends_with(".share") || name == "tdh2.keyshare" {
 				let bytes = std::fs::read(entry.path()).unwrap();
 				assert!(AtRestKey::is_encrypted(&bytes), "{name} not encrypted");
 				assert!(AtRestKey::new(&share_key).open(&bytes).is_ok());
@@ -301,6 +305,377 @@ fn psk_secured_links_and_encrypted_shares() {
 		client_psk: None,
 		peer_psk: Some(peer_psk),
 		share_key: Some([0x00u8; 32]),
+		kit_dir: None,
 	};
-	assert!(PartyService::new(cfg).is_err(), "wrong share key must fail to open the master secret");
+	assert!(PartyService::new(cfg).is_err(), "wrong share key must fail to open the TDH2 share");
+}
+
+// ---------------------------------------------------------------------------
+// Revocation secrets: kits, joint release, and a compromised Party A
+// ---------------------------------------------------------------------------
+
+mod revocation {
+	use std::net::TcpStream;
+
+	use ldk_server_mpc::bitcoin::absolute::LockTime;
+	use ldk_server_mpc::bitcoin::consensus::encode::serialize;
+	use ldk_server_mpc::bitcoin::hashes::Hash;
+	use ldk_server_mpc::bitcoin::secp256k1::{PublicKey, SecretKey};
+	use ldk_server_mpc::bitcoin::transaction::Version;
+	use ldk_server_mpc::bitcoin::{
+		sighash, Amount, EcdsaSighashType, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+		Txid, Witness,
+	};
+	use ldk_server_mpc::kit::{
+		combine_seed, generate_segment, segment_file_name, split_seed, INITIAL_COMMITMENT_NUMBER,
+	};
+	use ldk_server_mpc::protocol::{
+		CounterpartyKeys, Derivation, HolderProof, KeyKind, SessionAck, SessionOp, SessionStart,
+		SignItem,
+	};
+	use ldk_server_mpc::secure::Conn;
+	use lightning::ln::chan_utils::{self, CounterpartyCommitmentSecrets};
+	use lightning::types::features::ChannelTypeFeatures;
+	use lightning::util::ser::Writeable;
+
+	use super::*;
+
+	const TOP: u64 = INITIAL_COMMITMENT_NUMBER;
+	const VALUE: u64 = 100_000;
+
+	struct Channel {
+		pair: Pair,
+		client: MpcClient,
+		id: [u8; 32],
+		funding: PublicKey,
+		payment: PublicKey,
+		cp_funding: SecretKey,
+		cp_payment: PublicKey,
+	}
+
+	impl Channel {
+		fn funding_script(&self) -> ScriptBuf {
+			let secp = Secp256k1::new();
+			chan_utils::make_funding_redeemscript(
+				&self.funding,
+				&PublicKey::from_secret_key(&secp, &self.cp_funding),
+			)
+		}
+
+		fn counterparty_keys(&self) -> CounterpartyKeys {
+			let secp = Secp256k1::new();
+			let other =
+				PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[9u8; 32]).unwrap());
+			CounterpartyKeys {
+				funding_pubkey: PublicKey::from_secret_key(&secp, &self.cp_funding).serialize(),
+				revocation_basepoint: other.serialize(),
+				payment_point: self.cp_payment.serialize(),
+				delayed_payment_basepoint: other.serialize(),
+				htlc_basepoint: other.serialize(),
+			}
+		}
+
+		fn commitment_tx(&self, number: u64, outputs: Vec<TxOut>) -> Transaction {
+			let factor = chan_utils::get_commitment_transaction_number_obscure_factor(
+				&self.payment,
+				&self.cp_payment,
+				true,
+			);
+			let obscured = factor ^ (TOP - number);
+			Transaction {
+				version: Version::TWO,
+				lock_time: LockTime::from_consensus((0x20 << 24) | (obscured & 0xff_ffff) as u32),
+				input: vec![TxIn {
+					previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+					script_sig: ScriptBuf::new(),
+					sequence: Sequence((0x80 << 24) | (obscured >> 24) as u32),
+					witness: Witness::new(),
+				}],
+				output: outputs,
+			}
+		}
+
+		fn sighash(&self, tx: &Transaction) -> [u8; 32] {
+			sighash::SighashCache::new(tx)
+				.p2wsh_signature_hash(
+					0,
+					&self.funding_script(),
+					Amount::from_sat(VALUE),
+					EcdsaSighashType::All,
+				)
+				.unwrap()
+				.to_byte_array()
+		}
+
+		/// Has the parties sign the counterparty's commitment, as LDK does on every update.
+		fn sign_counterparty_commitment(&self, number: u64) {
+			let features = ChannelTypeFeatures::only_static_remote_key();
+			let to_us = chan_utils::get_countersigner_payment_script(&features, &self.payment);
+			let tx = self.commitment_tx(
+				number,
+				vec![TxOut { value: Amount::from_sat(60_000), script_pubkey: to_us }],
+			);
+			let context = SigningContext {
+				op: Some(SigningOp::CounterpartyCommitment),
+				channel_keys_id: Some([1u8; 32]),
+				channel_value_satoshis: Some(VALUE),
+				commitment_number: Some(number),
+				channel_type_features: Some(features.encode()),
+				counterparty_keys: Some(self.counterparty_keys()),
+				holder_selected_contest_delay: Some(144),
+				counterparty_selected_contest_delay: Some(144),
+				transaction: Some(serialize(&tx)),
+				input_index: 0,
+				input_value_sat: VALUE,
+				witness_script: Some(self.funding_script().to_bytes()),
+				sighash_type: 0x01,
+				per_commitment_point: Some(self.cp_payment.serialize()),
+				..Default::default()
+			};
+			let item = SignItem {
+				key_id: [0xf1; 32],
+				derivation: Derivation::None,
+				digest: self.sighash(&tx),
+				context,
+			};
+			self.client
+				.sign_batch(&Secp256k1::new(), Some(self.id), vec![item], Some(&[self.funding]))
+				.unwrap();
+		}
+
+		/// Our commitment `number` as the counterparty would sign it.
+		fn holder_proof(&self, number: u64, signer: &SecretKey) -> HolderProof {
+			let tx = self.commitment_tx(
+				number,
+				vec![TxOut {
+					value: Amount::from_sat(60_000),
+					script_pubkey: ScriptBuf::new_op_return([1u8]),
+				}],
+			);
+			let msg = Message::from_digest(self.sighash(&tx));
+			HolderProof {
+				transaction: serialize(&tx),
+				counterparty_sig: Secp256k1::new().sign_ecdsa(&msg, signer).serialize_compact(),
+			}
+		}
+
+		fn validate(&self, number: u64) {
+			let proof = self.holder_proof(number, &self.cp_funding);
+			self.client.holder_commitment_validated(&self.id, number, Some(proof)).unwrap();
+		}
+	}
+
+	/// Starts both parties, runs the ceremony for `kits` kits of `states` states each, and
+	/// creates the channel's keys.
+	fn channel(name: &str, kits: u8, states: u32) -> Channel {
+		let ks_a = tmp_dir(&format!("{name}-a"));
+		let ks_b = tmp_dir(&format!("{name}-b"));
+		let pair = start_pair(ks_a.clone(), ks_b.clone());
+		let client = MpcClient::new(pair.p1_addr);
+
+		// The parties generate their joint TDH2 key; Party A publishes the public key.
+		pair.p1.ensure_tdh2().unwrap();
+		let tdh2_pub = pair.p1.tdh2_public_key().unwrap();
+		assert_eq!(pair.p2.tdh2_public_key().unwrap(), tdh2_pub);
+		let published = std::fs::read_to_string(ks_a.join("tdh2.pub")).unwrap();
+		assert_eq!(published, hex(&tdh2_pub));
+
+		// The offline ceremony: custodians rebuild the master seed and make the kits. Both
+		// parties get a copy of every kit file.
+		let pieces = split_seed(&[0x5eu8; 32], 2, 3, |b| b.fill(0x17)).unwrap();
+		let seed = combine_seed(&pieces[1..]).unwrap();
+		for k in 0..kits {
+			let kit_id = [0xa0 + k; 32];
+			let segment = generate_segment(&seed, &kit_id, &tdh2_pub, TOP, states).unwrap();
+			for ks in [&ks_a, &ks_b] {
+				std::fs::write(ks.join("kits").join(segment_file_name(&kit_id, TOP)), &segment)
+					.unwrap();
+			}
+		}
+
+		let id = [0xc1u8; 32];
+		let key = |n: u8, kind: KeyKind| client.ensure_channel_key(&[n; 32], &id, kind).unwrap();
+		let funding = key(0xf1, KeyKind::Funding);
+		let payment = key(0xf2, KeyKind::Payment);
+		key(0xf3, KeyKind::DelayedPayment);
+		let secp = Secp256k1::new();
+		Channel {
+			pair,
+			client,
+			id,
+			funding,
+			payment,
+			cp_funding: SecretKey::from_slice(&[0x66u8; 32]).unwrap(),
+			cp_payment: PublicKey::from_secret_key(
+				&secp,
+				&SecretKey::from_slice(&[0x55u8; 32]).unwrap(),
+			),
+		}
+	}
+
+	fn hex(bytes: &[u8]) -> String {
+		bytes.iter().map(|b| format!("{b:02x}")).collect()
+	}
+
+	fn point_of(secret: &[u8; 32]) -> PublicKey {
+		PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(secret).unwrap())
+	}
+
+	fn denied(err: ClientError) -> String {
+		match err {
+			ClientError::Remote { code: ErrorCode::PolicyDenied, message } => message,
+			other => panic!("expected a policy denial, got {other}"),
+		}
+	}
+
+	/// What Party B answers when asked directly, as a compromised Party A would.
+	fn ask_party_b(pair: &Pair, op: SessionOp) -> SessionAck {
+		let addr = pair.p2.config().listen_addr;
+		let stream = TcpStream::connect(addr).unwrap();
+		let mut conn = Conn::new(stream, None, true).unwrap();
+		conn.write_frame(&SessionStart { op }.encode()).unwrap();
+		SessionAck::decode(&conn.read_frame().unwrap()).unwrap()
+	}
+
+	#[test]
+	fn secrets_are_released_in_order_and_fit_the_shachain() {
+		let ch = channel("release", 1, 12);
+		// No party stores a seed or a secret.
+		for dir in
+			[ch.pair.p1.config().keystore_dir.clone(), ch.pair.p2.config().keystore_dir.clone()]
+		{
+			assert!(!dir.join("master.secret").exists());
+		}
+
+		let p0 = ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		assert_eq!(ch.client.per_commitment_point(&ch.id, TOP).unwrap(), p0, "stable");
+		// Both parties bound the same kit to the channel.
+		let kit = ch.pair.p1.policy().kit_of(&ch.id).unwrap().unwrap();
+		assert_eq!(ch.pair.p2.policy().kit_of(&ch.id).unwrap(), Some(kit));
+
+		// Nothing is releasable before a newer state is validated.
+		assert!(denied(ch.client.release_commitment_secret(&ch.id, TOP).unwrap_err())
+			.contains("no holder commitment validated"));
+		ch.client.holder_commitment_validated(&ch.id, TOP, None).unwrap();
+		assert!(ch.client.release_commitment_secret(&ch.id, TOP).is_err());
+
+		// Ten channel updates: the counterparty signs our new state, then we revoke the old
+		// one. The counterparty's shachain store accepts every secret.
+		let mut peer = CounterpartyCommitmentSecrets::new();
+		for i in 0..10u64 {
+			let old = TOP - i;
+			ch.sign_counterparty_commitment(old - 1);
+			let point = ch.client.per_commitment_point(&ch.id, old).unwrap();
+			ch.validate(old - 1);
+			let secret = ch.client.release_commitment_secret(&ch.id, old).unwrap();
+			assert_eq!(point_of(&secret), point);
+			assert_eq!(ch.client.release_commitment_secret(&ch.id, old).unwrap(), secret, "retry");
+			peer.provide_secret(old, secret).expect("fits the shachain");
+			// The state that is now current, and every later one, stay sealed.
+			assert!(ch.client.release_commitment_secret(&ch.id, old - 1).is_err());
+			assert!(ch.client.release_commitment_secret(&ch.id, old - 2).is_err());
+		}
+	}
+
+	#[test]
+	fn the_hosts_word_does_not_release_a_secret() {
+		let ch = channel("hostword", 1, 6);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.sign_counterparty_commitment(TOP - 1);
+
+		// A compromised host claims the next state was validated: with no proof, with a
+		// signature that is not the counterparty's, and with a real signature on another state.
+		let msg = denied(ch.client.holder_commitment_validated(&ch.id, TOP - 1, None).unwrap_err());
+		assert!(msg.contains("needs the counterparty's signature"), "{msg}");
+		let forged = ch.holder_proof(TOP - 1, &SecretKey::from_slice(&[0x99u8; 32]).unwrap());
+		let msg = denied(
+			ch.client.holder_commitment_validated(&ch.id, TOP - 1, Some(forged)).unwrap_err(),
+		);
+		assert!(msg.contains("not signed by the counterparty"), "{msg}");
+		let other_state = ch.holder_proof(TOP - 1, &ch.cp_funding);
+		let msg = denied(
+			ch.client.holder_commitment_validated(&ch.id, TOP - 2, Some(other_state)).unwrap_err(),
+		);
+		assert!(msg.contains("is not holder commitment"), "{msg}");
+
+		// So the current state's secret stays sealed.
+		assert!(ch.client.release_commitment_secret(&ch.id, TOP).is_err());
+	}
+
+	#[test]
+	fn party_b_decides_for_itself() {
+		let ch = channel("rogue-a", 1, 6);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.sign_counterparty_commitment(TOP - 1);
+		ch.validate(TOP - 1);
+
+		// A compromised Party A skips its own policy and asks Party B directly for the
+		// current state, a future state, and a validation without proof.
+		for idx in [TOP - 1, TOP - 3] {
+			match ask_party_b(&ch.pair, SessionOp::ReleaseSecret { channel: ch.id, idx }) {
+				SessionAck::Error { code, .. } => assert_eq!(code, ErrorCode::PolicyDenied),
+				SessionAck::Ok { .. } => panic!("Party B released secret {idx}"),
+			}
+		}
+		let claim = SessionOp::HolderCommitmentValidated {
+			channel: ch.id,
+			commitment_number: TOP - 2,
+			proof: None,
+		};
+		assert!(matches!(ask_party_b(&ch.pair, claim), SessionAck::Error { .. }));
+		// It may not swap the channel's kit for another either.
+		let swap = SessionOp::BindKit { channel: ch.id, kit_id: [0xee; 32] };
+		assert!(matches!(ask_party_b(&ch.pair, swap), SessionAck::Error { .. }));
+
+		// For the one state that may be released, Party B's answer alone is not the secret:
+		// Party A needs its own share to finish the decryption.
+		let partial =
+			match ask_party_b(&ch.pair, SessionOp::ReleaseSecret { channel: ch.id, idx: TOP }) {
+				SessionAck::Ok { payload } => payload,
+				SessionAck::Error { message, .. } => panic!("{message}"),
+			};
+		let secret = ch.client.release_commitment_secret(&ch.id, TOP).unwrap();
+		assert!(!partial.windows(32).any(|w| w == secret));
+	}
+
+	#[test]
+	fn a_channel_cannot_open_without_a_kit_or_run_past_one() {
+		// No kits: the first point request fails, and nothing was bound.
+		let ch = channel("nokit", 0, 1);
+		assert!(ch.client.per_commitment_point(&ch.id, TOP).is_err());
+		assert_eq!(ch.pair.p1.policy().kit_of(&ch.id).unwrap(), None);
+
+		// A kit of three states serves three points and then asks for a refill.
+		let ch = channel("short", 1, 3);
+		for i in 0..3 {
+			ch.client.per_commitment_point(&ch.id, TOP - i).unwrap();
+		}
+		let err = ch.client.per_commitment_point(&ch.id, TOP - 3).unwrap_err();
+		assert!(err.to_string().contains("refill"), "{err}");
+
+		// The refill ceremony adds a segment to both parties; the channel carries on.
+		let kit = ch.pair.p1.policy().kit_of(&ch.id).unwrap().unwrap();
+		let tdh2_pub = ch.pair.p1.tdh2_public_key().unwrap();
+		let pieces = split_seed(&[0x5eu8; 32], 2, 3, |b| b.fill(0x17)).unwrap();
+		let seed = combine_seed(&pieces[..2]).unwrap();
+		let segment = generate_segment(&seed, &kit, &tdh2_pub, TOP - 3, 3).unwrap();
+		for svc in [&ch.pair.p1, &ch.pair.p2] {
+			std::fs::write(svc.kits().dir().join(segment_file_name(&kit, TOP - 3)), &segment)
+				.unwrap();
+		}
+		ch.client.per_commitment_point(&ch.id, TOP - 3).unwrap();
+	}
+
+	#[test]
+	fn two_channels_get_different_kits() {
+		let ch = channel("two", 2, 2);
+		let other = [0xc2u8; 32];
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.client.per_commitment_point(&other, TOP).unwrap();
+		let a = ch.pair.p1.policy().kit_of(&ch.id).unwrap().unwrap();
+		let b = ch.pair.p1.policy().kit_of(&other).unwrap().unwrap();
+		assert_ne!(a, b);
+		// A third channel finds the pool empty.
+		assert!(ch.client.per_commitment_point(&[0xc3u8; 32], TOP).is_err());
+	}
 }

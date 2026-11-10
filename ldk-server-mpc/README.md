@@ -2,8 +2,9 @@
 
 Puts **every Lightning channel key** of an LDK Server node under Coinbase's
 [`cb-mpc`](https://github.com/coinbase/cb-mpc) two-party ECDSA (ECDSA-2P): the funding key,
-the payment, delayed-payment, HTLC and revocation basepoints, and the per-commitment secrets.
-Two independent MPC processes each hold one share of every key; the complete private keys are
+the payment, delayed-payment, HTLC and revocation basepoints. The per-commitment (revocation)
+secrets are threshold-encrypted under a joint cb-mpc TDH2 key and decrypted only when both
+parties agree (see [Revocation secrets](#revocation-secrets)). Two independent MPC processes each hold one share of every key; the complete private keys are
 never assembled anywhere. Party B enforces a signing policy (recomputed sighashes, key-kind
 binding, BOLT 3 derivation checks, monotonic commitment numbers, ordered secret release,
 balance tracking, payout allow-list). All Lightning channel state stays in LDK Server / LDK
@@ -34,13 +35,13 @@ flowchart TB
 
     subgraph pa["MPC Party A process (cb-mpc P1)"]
         P1["ldk-server-mpc-party --role p1<br/>policy (first line)"]
-        KA[("shares A (encrypted)<br/>5 per channel")]
+        KA[("shares A (encrypted)<br/>5 per channel<br/>+ TDH2 key share A<br/>+ channel kits (ciphertexts)")]
         P1 --> KA
     end
 
     subgraph pb["MPC Party B process (cb-mpc P2)"]
-        P2["ldk-server-mpc-party --role p2<br/>policy (authoritative)<br/>commitment seed"]
-        KB[("shares B (encrypted)<br/>+ master secret<br/>+ per-channel policy state")]
+        P2["ldk-server-mpc-party --role p2<br/>policy (authoritative)"]
+        KB[("shares B (encrypted)<br/>+ TDH2 key share B<br/>+ channel kits (ciphertexts)<br/>+ per-channel policy state")]
         P2 --> KB
     end
 
@@ -58,8 +59,8 @@ flowchart TB
 - **Party A (P1)** is the only endpoint LDK Server talks to and the only party that
   obtains the final signature (a property of cb-mpc ECDSA-2P). It holds the A shares and
   runs the policy as a first line.
-- **Party B (P2)** only accepts protocol sessions from Party A, holds the B shares, the
-  commitment-seed master secret and the per-channel policy counters, and is the authoritative
+- **Party B (P2)** only accepts protocol sessions from Party A, holds the B shares, its share
+  of the TDH2 key, a copy of the channel kits and the per-channel policy counters, and is the authoritative
   policy. It never sees LDK's database; everything it checks it recomputes from the
   transaction bytes in the request.
 
@@ -88,7 +89,12 @@ flowchart TB
  ◀─ (funding sig, HTLC sigs) ──┘
  ...
  validate_holder_commitment(n) ──▶ HolderCommitmentValidated{n} ──▶ (mirror) ──▶ record n
- release_commitment_secret(n+1) ─▶ ReleaseSecret{n+1} ──▶ forward ──▶ seed: allowed iff n+1 > validated(n)
+ validate_holder_commitment(n) carries the commitment tx and the counterparty's signature;
+ each party verifies them itself before recording n.
+ release_commitment_secret(n+1) ─▶ ReleaseSecret{n+1} ──▶ policy ✓, partial decryption A
+                                                          ──▶ ReleaseSecret ──▶ policy: n+1 > validated(n) ✓
+                                                          ◀── partial decryption B (own kit copy)
+                                   ◀── secret ◀── combine, check against the per-commitment point
 ```
 
 
@@ -103,7 +109,7 @@ With `coverage = "all"` (default):
 | Delayed-payment basepoint and per-commitment keys      | MPC; per-commitment key = share + BOLT 3 tweak |
 | HTLC basepoint and per-commitment keys                 | MPC; same                                 |
 | Revocation basepoint and revocation keys               | MPC; `share * H1 + secret * H2` on shares |
-| Per-commitment secrets / points (`commitment_seed`)    | **Party B only**, released under policy   |
+| Per-commitment secrets / points                        | Offline ceremony; secrets TDH2-encrypted, both parties decrypt under policy |
 | Commitment, closing, anchor, announcement, splice sigs | MPC                                       |
 | HTLC signatures (commitment updates, HTLC txs, claims) | MPC (one session per HTLC, in parallel)   |
 | Justice transactions                                   | MPC                                       |
@@ -121,6 +127,9 @@ database, process) cannot, without Party B:
 
 - sign any new commitment, closing, splice, anchor or announcement (funding key);
 - sign HTLC or justice transactions, or sweep channel outputs (all other keys);
+- make the parties believe a holder commitment was validated: each party checks the
+  counterparty's signature on the commitment transaction, and the commitment number it
+  encodes, against the funding script and counterparty keys it pinned for the channel;
 - obtain a per-commitment secret ahead of its state being superseded (Party B releases a
   secret only after LDK has validated a newer holder commitment);
 - get Party B to sign an old holder commitment (monotonic commitment numbers), a commitment
@@ -162,8 +171,14 @@ is still on the host; see remaining work).
   commitment / balance state. It verifies, for every signature: the recomputed sighash, the
   key kind for the operation, the BOLT 3 derivation, commitment-number monotonicity, our
   balance (located by script, not by metadata) against `--max-balance-decrease-sat`, and
-  payout destinations (`--payout-xpub`, `--payout-address`) for closes and sweeps. Party B
-  also holds the commitment-seed master secret and serves per-commitment points and secrets.
+  payout destinations (`--payout-xpub`, `--payout-address`) for closes and sweeps. It
+  also verifies holder-commitment proofs and decides when this party contributes to releasing
+  a per-commitment secret.
+- `src/tdh2.rs` – safe wrappers for cb-mpc's TDH2 threshold decryption (key generation,
+  encrypt, verify, partial decrypt, combine).
+- `src/kit.rs` – channel kits: the file format, the kit store with its kit-to-channel
+  bindings, kit generation for the ceremony, and Shamir splitting of the master seed.
+- `src/bin/ceremony.rs` – `ldk-server-mpc-ceremony new-seed | new-kits | refill`.
 - `src/secure.rs` – PSK-authenticated, forward-secret encrypted framing (X25519 +
   HKDF-SHA256 + AES-256-GCM) for both links, and AES-256-GCM encryption of shares and the
   master secret at rest.
@@ -258,9 +273,48 @@ ldk-server-mpc-party --role p2 --listen 127.0.0.1:7702 --keystore mpc/b \
   --peer-auth-key-file mpc/peer.psk --share-key-file mpc/share-b.key \
   --payout-xpub "$(cat <storage>/onchain_wallet_xpub)" --max-balance-decrease-sat 100000
 # 4: key shares are generated on first channel open (five DKGs per channel, in parallel)
+# 5: offline ceremony, once Party A has written mpc/a/tdh2.pub (see "Revocation secrets")
+ldk-server-mpc-ceremony new-seed --threshold 3 --pieces 5 --out-dir pieces
+ldk-server-mpc-ceremony new-kits --piece pieces/piece-1.txt --piece pieces/piece-2.txt \
+  --piece pieces/piece-3.txt --fingerprint <from new-seed> --tdh2-public-key mpc/a/tdh2.pub \
+  --kits 10 --states 50000 --out-dir kits
+cp kits/*.kit mpc/a/kits/ && cp kits/*.kit mpc/b/kits/
 ```
 
 `contrib/mpc-signet/run-mpc-parties.sh` starts both parties on one machine for a demo.
+
+## Revocation secrets
+
+BOLT 3 derives a channel's per-commitment secrets from one seed through a SHA-256 hash tree,
+and the counterparty checks every secret against that tree. Hashes cannot be computed on key
+shares, so whoever holds the seed holds every future secret of the channel. Here no online
+machine does:
+
+- **Joint TDH2 key.** When both parties are up they run cb-mpc's TDH2 key generation once.
+  Each keeps a share (`tdh2.keyshare`, encrypted at rest); Party A writes the public key to
+  `<keystore>/tdh2.pub`. It is a dedicated key, never a signing key.
+- **Offline ceremony** (`ldk-server-mpc-ceremony`, on an air-gapped machine). `new-seed`
+  creates the master seed and splits it into custodian pieces (Shamir, any `threshold` of
+  `pieces`); the seed itself is not stored. `new-kits` rebuilds it from the pieces, checks its
+  fingerprint, and for each kit derives a channel seed, computes the secrets and their public
+  points, and encrypts each secret to the TDH2 public key under a label naming the kit and
+  the commitment number. `refill` adds further states to an existing kit.
+- **Kits.** A `.kit` file holds only public points and ciphertexts. Both parties need a copy
+  in their kit directory (`--kit-dir`, default `<keystore>/kits`). A kit is bound to a channel
+  on its first use, on both parties, for good; a channel cannot open if no unused kit is left,
+  and stops when its kit runs out, so refill before then (Party A logs a warning below 256
+  states left).
+- **Release.** For `release_commitment_secret(n)`, Party A's policy and then Party B's must
+  each find a newer holder commitment validated. Each party then partially decrypts **its own
+  copy** of the kit entry (never a ciphertext handed to it), Party A combines the two parts
+  and checks the result against the entry's point. The label stops a ciphertext for one
+  commitment being passed off as another's.
+- **Validation is checked, not reported.** `validate_holder_commitment` forwards the
+  commitment transaction and the counterparty's signature. Each party verifies the signature
+  under a funding script it pinned when it first signed for the channel, and that the
+  transaction's locktime and sequence encode the claimed commitment number. A compromised
+  host that merely claims "validated" gets no secret. The first commitment of a channel needs
+  no proof, since nothing can be released on its strength.
 
 Enable MPC only on a fresh node. Existing channels were created with locally derived
 funding keys; `derive_channel_signer` would hand them an MPC pubkey that does not match
@@ -282,7 +336,12 @@ cd e2e-tests && cargo test --test mpc -- --test-threads=1   # regtest, downloads
   restoration, invalid key id, MPC process unavailable (client and P2), bounded signing
   timeout, repeated and concurrent requests, P2 refusing DKG for an existing key id.
 - `tests/service.rs` also covers PSK-secured links (correct, wrong and missing PSK) and
-  encrypted shares / master secret.
+  encrypted shares, and the revocation secrets end to end: kits made by the ceremony code,
+  ten updates whose released secrets LDK's own shachain store accepts, a host claiming
+  validation without proof / with a forged signature / with another state's signature, a
+  compromised Party A asking Party B directly, kit exhaustion and refill, and kit pooling.
+- `src/kit.rs` and `src/tdh2.rs` unit tests: BOLT 3 Appendix D vectors, label binding, seed
+  splitting, kit segments and bindings.
 - `src/policy.rs` unit tests: sighash mismatch, key-kind mismatch, HTLC and revocation
   derivation checks, commitment monotonicity with the balance cap, secret release ordering,
   closing allow-list with balance, sweep destinations.
@@ -313,3 +372,11 @@ cd e2e-tests && cargo test --test mpc -- --test-threads=1   # regtest, downloads
   Party B. Signatures that fail while the MPC is unreachable are retried via the periodic
   `signer_unblocked`; state notices are queued and replayed in order.
 - Key refresh (`cbmpc_ecdsa_2p_refresh`) is wrapped but not exposed through the service.
+- **Revocation secrets.** The master seed is whole on the ceremony machine for the length of
+  a run. A kit covers a fixed number of states; without a refill the channel stops. cb-mpc's
+  public API has no refresh for TDH2 key shares, so that share cannot be rotated yet.
+  Released entries are not deleted from kit files.
+- **Pinning is trust on first use.** The funding script and counterparty basepoints a party
+  checks holder commitments against are the ones in the first counterparty commitment it
+  signed for that funding. A splice's new funding is therefore trusted when first signed for,
+  and splice transactions themselves are signed without output checks.

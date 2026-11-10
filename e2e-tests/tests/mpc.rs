@@ -7,9 +7,10 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! End-to-end tests of LDK Server with Coinbase cb-mpc 2-of-2 MPC-backed channel funding
-//! keys, on regtest. Two MPC party processes are started; server A is configured with
-//! `[mpc]` and opens a channel to a plain server B.
+//! End-to-end tests of LDK Server with Coinbase cb-mpc 2-of-2 MPC-backed channel keys, on
+//! regtest. Two MPC party processes are started and the offline ceremony tool makes their
+//! channel kits (threshold-encrypted revocation secrets); server A is configured with `[mpc]`
+//! and opens a channel to a plain server B.
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
@@ -18,9 +19,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use e2e_tests::{
-	close_channel, find_available_port, mine_and_sync, mpc_party_binary_path, run_cli,
-	send_bolt11_payment, setup_funded_channel, wait_for_channels, wait_for_force_close_claims,
-	LdkServerHandle, TestBitcoind, TestConfigBuilder,
+	close_channel, find_available_port, mine_and_sync, mpc_ceremony_binary_path,
+	mpc_party_binary_path, run_cli, send_bolt11_payment, setup_funded_channel, wait_for_channels,
+	wait_for_force_close_claims, LdkServerHandle, TestBitcoind, TestConfigBuilder,
 };
 use hex_conservative::FromHex;
 use ldk_node::bitcoin::consensus::encode::deserialize;
@@ -142,6 +143,79 @@ impl MpcParties {
 		self.spawn_a();
 	}
 
+	/// Runs the offline ceremony with the real tool: a master seed split among three
+	/// custodians, two of whom then make `kits` channel kits. Both parties get a copy.
+	fn run_ceremony(&self, kits: u32, states: u32) {
+		let tdh2_pub = self.keystore_a.join("tdh2.pub");
+		let start = Instant::now();
+		while !tdh2_pub.exists() {
+			assert!(
+				start.elapsed() < Duration::from_secs(60),
+				"the parties did not generate their TDH2 key"
+			);
+			std::thread::sleep(Duration::from_millis(200));
+		}
+		let dir = self.keys_dir.join("ceremony");
+		let ceremony = |args: &[&str]| {
+			let out = Command::new(mpc_ceremony_binary_path()).args(args).output().unwrap();
+			assert!(
+				out.status.success(),
+				"ceremony {args:?} failed: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+			String::from_utf8(out.stdout).unwrap()
+		};
+		let pieces = dir.join("pieces");
+		let out = ceremony(&[
+			"new-seed",
+			"--threshold",
+			"2",
+			"--pieces",
+			"3",
+			"--out-dir",
+			pieces.to_str().unwrap(),
+		]);
+		let fingerprint = out
+			.lines()
+			.find_map(|l| l.strip_prefix("seed fingerprint: "))
+			.expect("fingerprint printed")
+			.to_string();
+		let kit_dir = dir.join("kits");
+		ceremony(&[
+			"new-kits",
+			"--piece",
+			pieces.join("piece-1.txt").to_str().unwrap(),
+			"--piece",
+			pieces.join("piece-3.txt").to_str().unwrap(),
+			"--fingerprint",
+			&fingerprint,
+			"--tdh2-public-key",
+			tdh2_pub.to_str().unwrap(),
+			"--kits",
+			&kits.to_string(),
+			"--states",
+			&states.to_string(),
+			"--out-dir",
+			kit_dir.to_str().unwrap(),
+		]);
+		for keystore in [&self.keystore_a, &self.keystore_b] {
+			let dest = keystore.join("kits");
+			std::fs::create_dir_all(&dest).unwrap();
+			for entry in std::fs::read_dir(&kit_dir).unwrap().filter_map(|e| e.ok()) {
+				std::fs::copy(entry.path(), dest.join(entry.file_name())).unwrap();
+			}
+		}
+	}
+
+	/// How many kits a party has bound to a channel.
+	fn bound_kits(keystore: &Path) -> usize {
+		std::fs::read_dir(keystore.join("kits"))
+			.unwrap()
+			.filter_map(|e| e.ok())
+			.filter(|e| e.path().extension().map(|x| x == "bound").unwrap_or(false))
+			.count()
+	}
+
 	fn client_psk_path(&self) -> PathBuf {
 		self.keys_dir.join("client.psk")
 	}
@@ -222,6 +296,9 @@ async fn start_mpc_server(bitcoind: &TestBitcoind, parties: &mut MpcParties) -> 
 	.await;
 	let xpub = std::fs::read_to_string(server.storage_dir.join("onchain_wallet_xpub")).unwrap();
 	parties.start_b(xpub.trim());
+	// With both parties up they generate their joint TDH2 key; the ceremony then makes the
+	// kits a channel needs before it can open.
+	parties.run_ceremony(2, 400);
 	server
 }
 
@@ -297,6 +374,12 @@ async fn test_mpc_channel_open_pay_and_coop_close() {
 	assert_eq!(MpcParties::share_count(&parties.keystore_b), 5);
 	let mpc_pubkeys = parties.party_a_pubkeys();
 	assert_eq!(mpc_pubkeys.len(), 5);
+	// The channel took one of the two kits, on both parties, and neither party holds a seed
+	// for the revocation secrets.
+	for keystore in [&parties.keystore_a, &parties.keystore_b] {
+		assert_eq!(MpcParties::bound_kits(keystore), 1);
+		assert!(!keystore.join("master.secret").exists());
+	}
 
 	// Payments in both directions (each commitment update is signed via MPC on server A).
 	send_bolt11_payment(&server_a, &server_b, 10_000_000).await;

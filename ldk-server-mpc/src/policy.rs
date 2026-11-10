@@ -12,10 +12,16 @@
 //!    revocation derivations must match the revealed counterparty secret;
 //! 4. enforces monotonic commitment numbers (counterparty commitments only move forward; holder
 //!    commitments may only be signed for the latest validated state);
-//! 5. releases a per-commitment secret only once a newer holder commitment has been validated;
-//! 6. tracks our balance in every commitment it signs (located by script, not by metadata) and
+//! 5. treats a holder commitment as validated only after checking the counterparty's signature
+//!    on it itself, against a funding script and counterparty keys it pinned when it first
+//!    signed for the channel, and checking that the transaction encodes the claimed commitment
+//!    number (the host's word is not enough);
+//! 6. contributes to releasing a per-commitment secret only once a newer holder commitment has
+//!    been validated, and only for the channel's own kit (see [`crate::kit`]); no party holds the
+//!    secrets or their seed;
+//! 7. tracks our balance in every commitment it signs (located by script, not by metadata) and
 //!    optionally caps how much it may drop per update;
-//! 7. requires cooperative-close and sweep outputs to pay an allow-listed script (an xpub's
+//! 8. requires cooperative-close and sweep outputs to pay an allow-listed script (an xpub's
 //!    addresses or explicit scripts) and, for closes, to carry our last tracked balance minus a
 //!    bounded fee.
 //!
@@ -33,7 +39,8 @@ use std::sync::{Arc, Mutex};
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpub};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
+use bitcoin::secp256k1::ecdsa::Signature;
+use bitcoin::secp256k1::{All, Message, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::{
 	sighash, Address, Amount, CompressedPublicKey, EcdsaSighashType, Network, ScriptBuf,
 	Transaction,
@@ -46,7 +53,11 @@ use lightning::ln::channel_keys::{
 use lightning::types::features::ChannelTypeFeatures;
 use lightning::util::ser::Readable;
 
-use crate::protocol::{ChannelId, Derivation, KeyId, KeyKind, Reader, SignItem, SigningOp, Writer};
+use crate::kit::{KitId, KitRecord, KitStore};
+use crate::protocol::{
+	ChannelId, CounterpartyKeys, Derivation, HolderProof, KeyId, KeyKind, Reader, SignItem,
+	SigningOp, Writer,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyError(pub String);
@@ -164,12 +175,58 @@ pub struct ChannelState {
 	/// Highest (oldest) per-commitment secret index not yet releasable; secrets with index
 	/// greater than `validated_holder_commitment` may be released.
 	pub released_secrets: u64,
+	/// The kit holding this channel's encrypted per-commitment secrets. Set once.
+	pub kit_id: Option<KitId>,
+	/// Funding outputs (2-of-2 witness script and value) this party has signed counterparty
+	/// commitments for. A holder commitment counts as validated only with the counterparty's
+	/// signature under one of them.
+	pub fundings: Vec<Funding>,
+	/// The counterparty's basepoints and the delay on our own outputs, pinned the first time
+	/// this party signed a counterparty commitment. They never change during a channel's life
+	/// (only the funding key does, on a splice).
+	pub counterparty_keys: Option<CounterpartyKeys>,
+	pub counterparty_selected_contest_delay: Option<u16>,
+}
+
+/// A funding output of a channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Funding {
+	pub witness_script: Vec<u8>,
+	pub value_sat: u64,
+}
+
+/// How many funding outputs to remember per channel (the original plus splices).
+const MAX_FUNDINGS: usize = 16;
+
+/// The two keys of a `2 <key> <key> 2 OP_CHECKMULTISIG` funding script.
+fn funding_script_keys(script: &[u8]) -> Option<(PublicKey, PublicKey)> {
+	if script.len() != 71
+		|| script[0] != 0x52
+		|| script[1] != 0x21
+		|| script[35] != 0x21
+		|| script[69] != 0x52
+		|| script[70] != 0xae
+	{
+		return None;
+	}
+	Some((
+		PublicKey::from_slice(&script[2..35]).ok()?,
+		PublicKey::from_slice(&script[36..69]).ok()?,
+	))
+}
+
+/// Whether two sets of counterparty keys agree on everything but the funding key.
+fn same_basepoints(a: &CounterpartyKeys, b: &CounterpartyKeys) -> bool {
+	a.revocation_basepoint == b.revocation_basepoint
+		&& a.payment_point == b.payment_point
+		&& a.delayed_payment_basepoint == b.delayed_payment_basepoint
+		&& a.htlc_basepoint == b.htlc_basepoint
 }
 
 impl ChannelState {
 	fn encode(&self) -> Vec<u8> {
 		let mut w = Writer::new();
-		w.u8(1); // version
+		w.u8(3); // version
 		w.u32(self.keys.len() as u32);
 		let mut keys: Vec<_> = self.keys.iter().collect();
 		keys.sort();
@@ -186,6 +243,24 @@ impl ChannelState {
 		w.opt_u64(self.last_holder_balance_sat);
 		w.opt_u64(self.last_holder_balance_commitment);
 		w.u64(self.released_secrets);
+		w.opt_fixed32(self.kit_id.as_ref());
+		w.u32(self.fundings.len() as u32);
+		for f in &self.fundings {
+			w.bytes(&f.witness_script);
+			w.u64(f.value_sat);
+		}
+		match &self.counterparty_keys {
+			Some(k) => {
+				w.u8(1);
+				w.fixed(&k.funding_pubkey);
+				w.fixed(&k.revocation_basepoint);
+				w.fixed(&k.payment_point);
+				w.fixed(&k.delayed_payment_basepoint);
+				w.fixed(&k.htlc_basepoint);
+			},
+			None => w.u8(0),
+		}
+		w.opt_u16(self.counterparty_selected_contest_delay);
 		w.0
 	}
 
@@ -193,7 +268,8 @@ impl ChannelState {
 		let mut r = Reader::new(buf);
 		let mut st = ChannelState::default();
 		(|| -> Result<(), crate::protocol::DecodeError> {
-			if r.u8()? != 1 {
+			let version = r.u8()?;
+			if !(1..=3).contains(&version) {
 				return Err(crate::protocol::DecodeError("unknown policy state version"));
 			}
 			let n = r.u32()?;
@@ -210,6 +286,25 @@ impl ChannelState {
 			st.last_holder_balance_sat = r.opt_u64()?;
 			st.last_holder_balance_commitment = r.opt_u64()?;
 			st.released_secrets = r.u64()?;
+			if version >= 2 {
+				st.kit_id = r.opt_fixed32()?;
+			}
+			if version >= 3 {
+				let n = r.u32()?;
+				for _ in 0..n {
+					st.fundings.push(Funding { witness_script: r.bytes()?, value_sat: r.u64()? });
+				}
+				if r.u8()? == 1 {
+					st.counterparty_keys = Some(CounterpartyKeys {
+						funding_pubkey: r.fixed33()?,
+						revocation_basepoint: r.fixed33()?,
+						payment_point: r.fixed33()?,
+						delayed_payment_basepoint: r.fixed33()?,
+						htlc_basepoint: r.fixed33()?,
+					});
+				}
+				st.counterparty_selected_contest_delay = r.opt_u16()?;
+			}
 			Ok(())
 		})()
 		.map_err(|e| e.to_string())?;
@@ -244,6 +339,27 @@ impl ChannelState {
 			_ => {},
 		}
 		self.released_secrets = self.released_secrets.max(newer.released_secrets);
+		if self.kit_id.is_none() {
+			self.kit_id = newer.kit_id;
+		}
+		for f in &newer.fundings {
+			self.pin_funding(f.clone());
+		}
+		if self.counterparty_keys.is_none() {
+			self.counterparty_keys = newer.counterparty_keys.clone();
+		}
+		if self.counterparty_selected_contest_delay.is_none() {
+			self.counterparty_selected_contest_delay = newer.counterparty_selected_contest_delay;
+		}
+	}
+
+	fn pin_funding(&mut self, funding: Funding) {
+		if !self.fundings.contains(&funding) {
+			if self.fundings.len() == MAX_FUNDINGS {
+				self.fundings.remove(0);
+			}
+			self.fundings.push(funding);
+		}
 	}
 
 	pub fn kind_of(&self, key_id: &KeyId) -> Option<KeyKind> {
@@ -271,13 +387,13 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 	}
 }
 
-/// The commitment-secret seed and policy state for all channels of one party.
+/// The policy state for all channels of one party.
 pub struct ChannelPolicy {
 	dir: PathBuf,
 	config: PolicyConfig,
-	/// 32-byte master secret from which per-channel commitment seeds are derived. Only Party
-	/// B has one; Party A runs the policy without it (no secret / point service).
-	master_secret: Option<[u8; 32]>,
+	/// This party's channel kits: per-commitment points and encrypted secrets. Without kits the
+	/// party serves no points and takes no part in releasing secrets.
+	kits: Option<Arc<KitStore>>,
 	states: Mutex<HashMap<ChannelId, ChannelState>>,
 	locks: Mutex<HashMap<ChannelId, Arc<Mutex<()>>>>,
 	tmp_counter: AtomicU64,
@@ -298,14 +414,12 @@ pub struct Authorized {
 }
 
 impl ChannelPolicy {
-	pub fn open(
-		dir: &Path, config: PolicyConfig, master_secret: Option<[u8; 32]>,
-	) -> io::Result<Self> {
+	pub fn open(dir: &Path, config: PolicyConfig, kits: Option<Arc<KitStore>>) -> io::Result<Self> {
 		fs::create_dir_all(dir)?;
 		Ok(ChannelPolicy {
 			dir: dir.to_path_buf(),
 			config,
-			master_secret,
+			kits,
 			states: Mutex::new(HashMap::new()),
 			locks: Mutex::new(HashMap::new()),
 			tmp_counter: AtomicU64::new(0),
@@ -322,8 +436,8 @@ impl ChannelPolicy {
 		&self.config
 	}
 
-	pub fn has_seed(&self) -> bool {
-		self.master_secret.is_some()
+	pub fn has_kits(&self) -> bool {
+		self.kits.is_some()
 	}
 
 	fn state_path(&self, channel: &ChannelId) -> PathBuf {
@@ -388,38 +502,66 @@ impl ChannelPolicy {
 	}
 
 	// -----------------------------------------------------------------------
-	// Commitment seed (Party B)
+	// Per-commitment points and secret release (channel kits)
 	// -----------------------------------------------------------------------
 
-	fn commitment_seed(&self, channel: &ChannelId) -> Result<[u8; 32], PolicyError> {
-		let master = self
-			.master_secret
-			.ok_or_else(|| PolicyError("this party holds no commitment seed".into()))?;
-		let mut engine = sha256::Hash::engine();
-		engine.input(b"ldk-server-mpc/commitment-seed/v1");
-		engine.input(&master);
-		engine.input(channel);
-		Ok(sha256::Hash::from_engine(engine).to_byte_array())
+	fn kits(&self) -> Result<&KitStore, PolicyError> {
+		self.kits.as_deref().ok_or_else(|| PolicyError("this party has no channel kits".into()))
 	}
 
-	fn per_commitment_secret(
-		&self, channel: &ChannelId, idx: u64,
-	) -> Result<SecretKey, PolicyError> {
-		let seed = self.commitment_seed(channel)?;
-		let secret = chan_utils::build_commitment_secret(&seed, idx);
-		SecretKey::from_slice(&secret).map_err(|e| PolicyError(e.to_string()))
+	/// Records `kit_id` as the kit of `channel`. A channel keeps its kit for life and a kit
+	/// serves one channel, so neither side of the binding can be changed afterwards.
+	pub fn bind_kit(&self, channel: &ChannelId, kit_id: &KitId) -> Result<(), PolicyError> {
+		let lock = self.lock(channel);
+		let _guard = lock.lock().unwrap();
+		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
+		match st.kit_id {
+			Some(existing) if &existing == kit_id => return Ok(()),
+			Some(_) => return deny("channel already has a different kit"),
+			None => {},
+		}
+		self.kits()?
+			.bind(kit_id, channel)
+			.map_err(|e| PolicyError(format!("cannot bind kit: {e}")))?;
+		st.kit_id = Some(*kit_id);
+		self.store(channel, st).map_err(|e| PolicyError(e.to_string()))
+	}
+
+	/// The kit bound to `channel`, if any.
+	pub fn kit_of(&self, channel: &ChannelId) -> Result<Option<KitId>, PolicyError> {
+		Ok(self.load(channel).map_err(|e| PolicyError(e.to_string()))?.kit_id)
+	}
+
+	fn kit_record(&self, channel: &ChannelId, idx: u64) -> Result<(KitId, KitRecord), PolicyError> {
+		let kit_id =
+			self.kit_of(channel)?.ok_or_else(|| PolicyError("channel has no kit bound".into()))?;
+		let record = self
+			.kits()?
+			.record(&kit_id, idx)
+			.map_err(|e| PolicyError(format!("kit read failed: {e}")))?
+			.ok_or_else(|| {
+				PolicyError(format!(
+					"kit has no entry for commitment {idx}: run the refill ceremony"
+				))
+			})?;
+		Ok((kit_id, record))
 	}
 
 	pub fn per_commitment_point(
 		&self, channel: &ChannelId, idx: u64,
 	) -> Result<PublicKey, PolicyError> {
-		Ok(PublicKey::from_secret_key(&self.secp, &self.per_commitment_secret(channel, idx)?))
+		Ok(self.kit_record(channel, idx)?.1.point)
 	}
 
-	/// Releases the secret for `idx` only if a newer holder commitment has been validated.
-	pub fn release_commitment_secret(
+	/// Allows this party's contribution to releasing the secret for `idx`, which is given only
+	/// if a newer holder commitment has been validated. Returns the kit entry to decrypt.
+	///
+	/// Together with the rule that holder commitments are only signed for the latest validated
+	/// state, this keeps a released state from ever being signed for broadcast, and a state
+	/// that may still be broadcast from ever being revoked.
+	pub fn authorize_release(
 		&self, channel: &ChannelId, idx: u64,
-	) -> Result<[u8; 32], PolicyError> {
+	) -> Result<(KitId, KitRecord), PolicyError> {
 		let lock = self.lock(channel);
 		let _guard = lock.lock().unwrap();
 		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
@@ -436,14 +578,20 @@ impl ChannelPolicy {
 				))
 			},
 		}
-		let secret = self.per_commitment_secret(channel, idx)?;
+		let entry = self.kit_record(channel, idx)?;
 		st.released_secrets += 1;
 		self.store(channel, st).map_err(|e| PolicyError(e.to_string()))?;
-		Ok(secret.secret_bytes())
+		Ok(entry)
 	}
 
+	/// Records holder commitment `number` as validated, which makes older states releasable.
+	///
+	/// The first commitment of a channel is accepted as is: nothing can be released on its
+	/// strength. Every later one needs `proof`, the commitment transaction with the
+	/// counterparty's signature, which is checked here against what this party pinned when it
+	/// signed for the channel. A host that only claims a commitment was validated gets nowhere.
 	pub fn holder_commitment_validated(
-		&self, channel: &ChannelId, number: u64,
+		&self, channel: &ChannelId, number: u64, proof: Option<&HolderProof>, keys: &dyn KeyLookup,
 	) -> Result<(), PolicyError> {
 		let lock = self.lock(channel);
 		let _guard = lock.lock().unwrap();
@@ -453,8 +601,138 @@ impl ChannelPolicy {
 				return deny(format!("holder commitment {number} is older than validated {v}"));
 			}
 		}
+		if number != crate::kit::INITIAL_COMMITMENT_NUMBER {
+			let proof = proof.ok_or_else(|| {
+				PolicyError(format!(
+					"holder commitment {number} needs the counterparty's signature"
+				))
+			})?;
+			let tx = self.verify_holder_proof(&st, keys, number, proof)?;
+			if let Some(balance) =
+				self.holder_balance_in_validated_commitment(channel, &st, keys, &tx, number)?
+			{
+				self.check_balance_decrease(&st, balance)?;
+				st.last_holder_balance_sat = Some(balance);
+				st.last_holder_balance_commitment = Some(number);
+			}
+		}
 		st.validated_holder_commitment = Some(number);
 		self.store(channel, st).map_err(|e| PolicyError(e.to_string()))
+	}
+
+	/// Checks that `proof` is holder commitment `number` of this channel, signed by the
+	/// counterparty: its funding input must verify under a pinned funding script that contains
+	/// one of our funding keys, and its locktime and sequence must encode `number`.
+	fn verify_holder_proof(
+		&self, st: &ChannelState, keys: &dyn KeyLookup, number: u64, proof: &HolderProof,
+	) -> Result<Transaction, PolicyError> {
+		let tx: Transaction = deserialize(&proof.transaction)
+			.map_err(|e| PolicyError(format!("bad holder commitment transaction: {e}")))?;
+		if tx.input.len() != 1 {
+			return deny("a commitment transaction has exactly one input");
+		}
+		let sig = Signature::from_compact(&proof.counterparty_sig)
+			.map_err(|e| PolicyError(format!("bad counterparty signature: {e}")))?;
+		let mut ours: Vec<PublicKey> = Vec::new();
+		for id in st.key(KeyKind::Funding).into_iter().chain(st.spliced_funding_keys.iter()) {
+			if let Some(pk) = keys.public_key(id) {
+				ours.push(pk);
+			}
+		}
+		let signed = st.fundings.iter().any(|funding| {
+			let Some((a, b)) = funding_script_keys(&funding.witness_script) else { return false };
+			let theirs = match (ours.contains(&a), ours.contains(&b)) {
+				(true, false) => b,
+				(false, true) => a,
+				_ => return false,
+			};
+			sighash::SighashCache::new(&tx)
+				.p2wsh_signature_hash(
+					0,
+					&ScriptBuf::from_bytes(funding.witness_script.clone()),
+					Amount::from_sat(funding.value_sat),
+					EcdsaSighashType::All,
+				)
+				.map(|h| {
+					let msg = Message::from_digest(h.to_byte_array());
+					self.secp.verify_ecdsa(&msg, &sig, &theirs).is_ok()
+				})
+				.unwrap_or(false)
+		});
+		if !signed {
+			return deny("holder commitment is not signed by the counterparty for a known funding");
+		}
+
+		// BOLT 3 hides the commitment number in the locktime and sequence, XORed with a value
+		// derived from both payment basepoints. Check it against both possible channel openers.
+		let cp = st
+			.counterparty_keys
+			.as_ref()
+			.ok_or_else(|| PolicyError("counterparty keys are not pinned yet".into()))?;
+		let cp_payment =
+			PublicKey::from_slice(&cp.payment_point).map_err(|e| PolicyError(e.to_string()))?;
+		let our_payment = st
+			.key(KeyKind::Payment)
+			.and_then(|id| keys.public_key(id))
+			.ok_or_else(|| PolicyError("payment key missing".into()))?;
+		let obscured = ((tx.input[0].sequence.0 as u64 & 0xff_ffff) << 24)
+			| (tx.lock_time.to_consensus_u32() as u64 & 0xff_ffff);
+		let matches = [true, false].iter().any(|outbound| {
+			let factor = chan_utils::get_commitment_transaction_number_obscure_factor(
+				&our_payment,
+				&cp_payment,
+				*outbound,
+			);
+			obscured ^ factor == crate::kit::INITIAL_COMMITMENT_NUMBER - number
+		});
+		if !matches {
+			return deny(format!("transaction is not holder commitment {number}"));
+		}
+		Ok(tx)
+	}
+
+	/// Our `to_local` balance in a validated holder commitment, from pinned parameters.
+	fn holder_balance_in_validated_commitment(
+		&self, channel: &ChannelId, st: &ChannelState, keys: &dyn KeyLookup, tx: &Transaction,
+		number: u64,
+	) -> Result<Option<u64>, PolicyError> {
+		let (Some(delayed_key), Some(cp), Some(delay)) = (
+			st.key(KeyKind::DelayedPayment),
+			st.counterparty_keys.as_ref(),
+			st.counterparty_selected_contest_delay,
+		) else {
+			return Ok(None);
+		};
+		if !self.has_kits() {
+			return Ok(None);
+		}
+		let delayed_base = keys
+			.public_key(delayed_key)
+			.ok_or_else(|| PolicyError("delayed key missing".into()))?;
+		let pcp = self.per_commitment_point(channel, number)?;
+		let cp_rev = PublicKey::from_slice(&cp.revocation_basepoint)
+			.map_err(|e| PolicyError(e.to_string()))?;
+		Ok(Some(self.to_local_value(tx, &cp_rev, delay, &delayed_base, &pcp)))
+	}
+
+	fn to_local_value(
+		&self, tx: &Transaction, cp_revocation_basepoint: &PublicKey, delay: u16,
+		delayed_basepoint: &PublicKey, pcp: &PublicKey,
+	) -> u64 {
+		let revocation_key = RevocationKey::from_basepoint(
+			&self.secp,
+			&RevocationBasepoint(*cp_revocation_basepoint),
+			pcp,
+		);
+		let delayed_pubkey = DelayedPaymentKey::from_basepoint(
+			&self.secp,
+			&DelayedPaymentBasepoint(*delayed_basepoint),
+			pcp,
+		);
+		let script =
+			chan_utils::get_revokeable_redeemscript(&revocation_key, delay, &delayed_pubkey)
+				.to_p2wsh();
+		tx.output.iter().filter(|o| o.script_pubkey == script).map(|o| o.value.to_sat()).sum()
 	}
 
 	pub fn counterparty_revocation_validated(
@@ -536,6 +814,7 @@ impl ChannelPolicy {
 					}
 				}
 				if op == SigningOp::CounterpartyCommitment {
+					self.pin_channel_parameters(&mut st, &base_pubkey, item)?;
 					let tx = tx.as_ref().unwrap();
 					if let Some(balance) =
 						self.holder_balance_in_counterparty_commitment(&st, keys, tx, item)?
@@ -586,6 +865,45 @@ impl ChannelPolicy {
 		}
 
 		Ok(Authorized { channel: Some(*channel), state: Some(st) })
+	}
+
+	/// Pins what a counterparty commitment signature tells us about the channel: the funding
+	/// script and value it spends, the counterparty's basepoints and the delay on our outputs.
+	/// The first signature for a channel sets them; later ones must agree on the basepoints.
+	fn pin_channel_parameters(
+		&self, st: &mut ChannelState, our_funding_key: &PublicKey, item: &SignItem,
+	) -> Result<(), PolicyError> {
+		let ctx = &item.context;
+		let script = ctx
+			.witness_script
+			.as_ref()
+			.ok_or_else(|| PolicyError("missing witness script".into()))?;
+		match funding_script_keys(script) {
+			Some((a, b)) if (&a == our_funding_key) != (&b == our_funding_key) => {},
+			_ => return deny("funding script is not a 2-of-2 with our funding key"),
+		}
+		if let Some(cp) = &ctx.counterparty_keys {
+			match &st.counterparty_keys {
+				Some(pinned) if !same_basepoints(pinned, cp) => {
+					return deny(
+						"counterparty basepoints differ from the ones pinned for this channel",
+					);
+				},
+				Some(_) => {},
+				None => st.counterparty_keys = Some(cp.clone()),
+			}
+		}
+		if let Some(delay) = ctx.counterparty_selected_contest_delay {
+			match st.counterparty_selected_contest_delay {
+				Some(pinned) if pinned != delay => {
+					return deny("contest delay differs from the one pinned for this channel");
+				},
+				Some(_) => {},
+				None => st.counterparty_selected_contest_delay = Some(delay),
+			}
+		}
+		st.pin_funding(Funding { witness_script: script.clone(), value_sat: ctx.input_value_sat });
+		Ok(())
 	}
 
 	/// Persists the state changes of a successful authorization.
@@ -712,8 +1030,8 @@ impl ChannelPolicy {
 			.per_commitment_point
 			.ok_or_else(|| PolicyError("missing per-commitment point".into()))?;
 		let pcp = PublicKey::from_slice(&pcp_claimed).map_err(|e| PolicyError(e.to_string()))?;
-		if self.has_seed() && self.per_commitment_point(channel, number)? != pcp {
-			return deny("per-commitment point does not match our seed for this commitment number");
+		if self.has_kits() && self.per_commitment_point(channel, number)? != pcp {
+			return deny("per-commitment point does not match our kit for this commitment number");
 		}
 		let cp = ctx
 			.counterparty_keys
@@ -724,19 +1042,7 @@ impl ChannelPolicy {
 		let delay = ctx
 			.counterparty_selected_contest_delay
 			.ok_or_else(|| PolicyError("missing contest delay".into()))?;
-		let revocation_key =
-			RevocationKey::from_basepoint(&self.secp, &RevocationBasepoint(cp_rev), &pcp);
-		let delayed_pubkey = DelayedPaymentKey::from_basepoint(
-			&self.secp,
-			&DelayedPaymentBasepoint(delayed_base),
-			&pcp,
-		);
-		let script =
-			chan_utils::get_revokeable_redeemscript(&revocation_key, delay, &delayed_pubkey)
-				.to_p2wsh();
-		Ok(Some(
-			tx.output.iter().filter(|o| o.script_pubkey == script).map(|o| o.value.to_sat()).sum(),
-		))
+		Ok(Some(self.to_local_value(tx, &cp_rev, delay, &delayed_base, &pcp)))
 	}
 
 	fn check_balance_decrease(
@@ -823,7 +1129,8 @@ mod tests {
 	use lightning::util::ser::Writeable;
 
 	use super::*;
-	use crate::protocol::{CounterpartyKeys, SigningContext};
+	use crate::kit::INITIAL_COMMITMENT_NUMBER as START;
+	use crate::protocol::SigningContext;
 
 	struct Keys {
 		secrets: HashMap<KeyId, SecretKey>,
@@ -862,17 +1169,22 @@ mod tests {
 		htlc: KeyId,
 		revocation: KeyId,
 		cp_rev: SecretKey,
+		cp_funding: SecretKey,
 		_dir: PathBuf,
 	}
+
+	const KIT: KitId = [0x4bu8; 32];
 
 	fn fixture(config: PolicyConfig) -> Fixture {
 		let mut dir = std::env::temp_dir();
 		let nanos =
 			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
 		dir.push(format!("ldk-mpc-policy-test-{nanos}"));
-		let policy = ChannelPolicy::open(&dir, config, Some([0x42u8; 32])).unwrap();
+		let (kits, _, _) = crate::kit::test_util::store_with_kit(&KIT, 3);
+		let policy = ChannelPolicy::open(&dir, config, Some(Arc::new(kits))).unwrap();
 		let mut keys = Keys::new();
 		let channel = [0xccu8; 32];
+		policy.bind_kit(&channel, &KIT).unwrap();
 		let funding = keys.add(1);
 		let payment = keys.add(2);
 		let delayed = keys.add(3);
@@ -894,6 +1206,7 @@ mod tests {
 			htlc,
 			revocation,
 			cp_rev,
+			cp_funding: SecretKey::from_slice(&[0x66u8; 32]).unwrap(),
 			_dir: dir,
 		}
 	}
@@ -927,9 +1240,9 @@ mod tests {
 		let secp = Secp256k1::new();
 		let cp_rev_pk = PublicKey::from_secret_key(&secp, &f.cp_rev);
 		CounterpartyKeys {
-			funding_pubkey: [2u8; 33],
+			funding_pubkey: cp_funding_pk(f).serialize(),
 			revocation_basepoint: cp_rev_pk.serialize(),
-			payment_point: [2u8; 33],
+			payment_point: cp_payment_pk().serialize(),
 			delayed_payment_basepoint: [3u8; 33],
 			htlc_basepoint: [2u8; 33],
 		}
@@ -962,6 +1275,66 @@ mod tests {
 	}
 
 	/// A counterparty commitment paying `ours` sats to our payment point.
+	fn cp_funding_pk(f: &Fixture) -> PublicKey {
+		PublicKey::from_secret_key(&Secp256k1::new(), &f.cp_funding)
+	}
+
+	fn cp_payment_pk() -> PublicKey {
+		PublicKey::from_secret_key(
+			&Secp256k1::new(),
+			&SecretKey::from_slice(&[0x55u8; 32]).unwrap(),
+		)
+	}
+
+	fn funding_script(f: &Fixture) -> ScriptBuf {
+		chan_utils::make_funding_redeemscript(
+			&f.keys.public_key(&f.funding).unwrap(),
+			&cp_funding_pk(f),
+		)
+	}
+
+	/// Our holder commitment `number` with `ours` sats to us, signed by `signer` as the
+	/// counterparty's funding key.
+	fn holder_proof(f: &Fixture, number: u64, ours: u64, signer: &SecretKey) -> HolderProof {
+		let secp = Secp256k1::new();
+		let factor = chan_utils::get_commitment_transaction_number_obscure_factor(
+			&f.keys.public_key(&f.payment).unwrap(),
+			&cp_payment_pk(),
+			true,
+		);
+		let obscured = factor ^ (START - number);
+		let pcp = f.policy.per_commitment_point(&f.channel, number).unwrap();
+		let cp_rev = PublicKey::from_secret_key(&secp, &f.cp_rev);
+		let revocation_key =
+			RevocationKey::from_basepoint(&secp, &RevocationBasepoint(cp_rev), &pcp);
+		let delayed = DelayedPaymentKey::from_basepoint(
+			&secp,
+			&DelayedPaymentBasepoint(f.keys.public_key(&f.delayed).unwrap()),
+			&pcp,
+		);
+		let to_local =
+			chan_utils::get_revokeable_redeemscript(&revocation_key, 144, &delayed).to_p2wsh();
+		let mut tx =
+			tx_with_outputs(vec![TxOut { value: Amount::from_sat(ours), script_pubkey: to_local }]);
+		tx.input[0].sequence = Sequence((0x80 << 24) | (obscured >> 24) as u32);
+		tx.lock_time = LockTime::from_consensus((0x20 << 24) | (obscured & 0xff_ffff) as u32);
+		let msg =
+			Message::from_digest(digest(&tx, &funding_script(f), 100_000, EcdsaSighashType::All));
+		HolderProof {
+			transaction: serialize(&tx),
+			counterparty_sig: secp.sign_ecdsa(&msg, signer).serialize_compact(),
+		}
+	}
+
+	/// Signs a counterparty commitment (which pins the channel) and validates holder
+	/// commitment `number` with a genuine proof.
+	fn validate(f: &Fixture, number: u64) -> Result<(), PolicyError> {
+		let item = counterparty_commitment(f, 100, 60_000);
+		f.policy.commit(f.policy.authorize(Some(&f.channel), &item, &f.keys)?)?;
+		let proof = holder_proof(f, number, 60_000, &f.cp_funding);
+		f.policy.holder_commitment_validated(&f.channel, number, Some(&proof), &f.keys)
+	}
+
 	fn counterparty_commitment(f: &Fixture, number: u64, ours: u64) -> SignItem {
 		let payment_point = f.keys.public_key(&f.payment).unwrap();
 		let script = chan_utils::get_countersigner_payment_script(&features(), &payment_point);
@@ -972,7 +1345,7 @@ mod tests {
 				script_pubkey: ScriptBuf::new_op_return([1u8]),
 			},
 		]);
-		let redeem = ScriptBuf::from_bytes(vec![0x52; 71]);
+		let redeem = funding_script(f);
 		let mut ctx = base_context(f, SigningOp::CounterpartyCommitment, &tx, &redeem, 100_000);
 		ctx.commitment_number = Some(number);
 		ctx.per_commitment_point = Some([2u8; 33]);
@@ -1139,31 +1512,151 @@ mod tests {
 	fn secrets_release_only_after_newer_holder_commitment_validated() {
 		let f = fixture(PolicyConfig::default());
 		let start = 281474976710655u64;
-		assert!(f.policy.release_commitment_secret(&f.channel, start).is_err());
-		f.policy.holder_commitment_validated(&f.channel, start - 1).unwrap();
-		let s1 = f.policy.release_commitment_secret(&f.channel, start).unwrap();
+		assert!(f.policy.authorize_release(&f.channel, start).is_err());
+		validate(&f, start - 1).unwrap();
+		let (kit, entry) = f.policy.authorize_release(&f.channel, start).unwrap();
+		assert_eq!(kit, KIT);
 		assert_eq!(
-			s1,
-			f.policy.release_commitment_secret(&f.channel, start).unwrap(),
+			entry,
+			f.policy.authorize_release(&f.channel, start).unwrap().1,
 			"re-release is stable"
 		);
 		assert!(
-			f.policy.release_commitment_secret(&f.channel, start - 1).is_err(),
+			f.policy.authorize_release(&f.channel, start - 1).is_err(),
 			"current state not releasable"
 		);
-		assert!(f.policy.release_commitment_secret(&f.channel, start - 2).is_err());
-		// The point for a commitment matches the secret.
-		let secp = Secp256k1::new();
-		let pk = f.policy.per_commitment_point(&f.channel, start).unwrap();
-		assert_eq!(pk, PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&s1).unwrap()));
+		assert!(f.policy.authorize_release(&f.channel, start - 2).is_err());
+		// The point served for a commitment is the one stored beside its encrypted secret.
+		assert_eq!(f.policy.per_commitment_point(&f.channel, start).unwrap(), entry.point);
 		// Holder commitments only sign for the latest validated state or newer.
 		let mut st = f.policy.channel_state(&f.channel).unwrap();
 		assert_eq!(st.validated_holder_commitment, Some(start - 1));
 		st.released_secrets = 0;
 		assert!(
-			f.policy.holder_commitment_validated(&f.channel, start).is_err(),
+			f.policy.holder_commitment_validated(&f.channel, start, None, &f.keys).is_err(),
 			"cannot go backwards"
 		);
+	}
+
+	#[test]
+	fn validation_needs_the_counterpartys_signature() {
+		let f = fixture(PolicyConfig::default());
+		let claim = |number: u64, proof: Option<&HolderProof>| {
+			f.policy.holder_commitment_validated(&f.channel, number, proof, &f.keys)
+		};
+		// The first commitment needs no proof, and makes nothing releasable.
+		claim(START, None).unwrap();
+		assert!(f.policy.authorize_release(&f.channel, START).is_err());
+
+		// A host that only says "validated" is refused, so the current state stays unreleasable.
+		let err = claim(START - 1, None).unwrap_err();
+		assert!(err.0.contains("signature"), "{err}");
+		assert!(f.policy.authorize_release(&f.channel, START).is_err());
+
+		// Before this party has signed for the channel there is no funding to check against.
+		let genuine = holder_proof(&f, START - 1, 60_000, &f.cp_funding);
+		assert!(claim(START - 1, Some(&genuine)).is_err());
+		let item = counterparty_commitment(&f, 100, 60_000);
+		f.policy.commit(f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap()).unwrap();
+
+		// Signed by someone other than the counterparty.
+		let forged =
+			holder_proof(&f, START - 1, 60_000, &SecretKey::from_slice(&[0x99u8; 32]).unwrap());
+		let err = claim(START - 1, Some(&forged)).unwrap_err();
+		assert!(err.0.contains("not signed by the counterparty"), "{err}");
+
+		// A genuine signature on commitment START - 1 passed off as START - 2.
+		let err = claim(START - 2, Some(&genuine)).unwrap_err();
+		assert!(err.0.contains("is not holder commitment"), "{err}");
+		assert!(f.policy.authorize_release(&f.channel, START).is_err());
+
+		// The real thing.
+		claim(START - 1, Some(&genuine)).unwrap();
+		assert!(f.policy.authorize_release(&f.channel, START).is_ok());
+		assert!(f.policy.authorize_release(&f.channel, START - 1).is_err());
+	}
+
+	#[test]
+	fn validated_commitments_respect_the_balance_cap() {
+		let f = fixture(PolicyConfig {
+			max_holder_balance_decrease_sat: Some(10_000),
+			..Default::default()
+		});
+		let item = counterparty_commitment(&f, 100, 60_000);
+		f.policy.commit(f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap()).unwrap();
+		// The counterparty signs a state that takes 40k from us: not accepted as validated, so
+		// the state before it cannot be revoked.
+		let drained = holder_proof(&f, START - 1, 20_000, &f.cp_funding);
+		let err = f
+			.policy
+			.holder_commitment_validated(&f.channel, START - 1, Some(&drained), &f.keys)
+			.unwrap_err();
+		assert!(err.0.contains("drop"), "{err}");
+		assert!(f.policy.authorize_release(&f.channel, START).is_err());
+		let fair = holder_proof(&f, START - 1, 55_000, &f.cp_funding);
+		f.policy.holder_commitment_validated(&f.channel, START - 1, Some(&fair), &f.keys).unwrap();
+	}
+
+	#[test]
+	fn pinned_channel_parameters_cannot_change() {
+		let f = fixture(PolicyConfig::default());
+		let item = counterparty_commitment(&f, 100, 60_000);
+		f.policy.commit(f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap()).unwrap();
+		let st = f.policy.channel_state(&f.channel).unwrap();
+		assert_eq!(st.fundings.len(), 1);
+		assert_eq!(ChannelState::decode(&st.encode()).unwrap(), st);
+
+		let mut other = counterparty_commitment(&f, 99, 60_000);
+		other.context.counterparty_keys.as_mut().unwrap().payment_point = [3u8; 33];
+		let err = f.policy.authorize(Some(&f.channel), &other, &f.keys).unwrap_err();
+		assert!(err.0.contains("basepoints differ"), "{err}");
+
+		// A funding script without our key is not a funding of this channel.
+		let mut foreign = counterparty_commitment(&f, 99, 60_000);
+		let script = chan_utils::make_funding_redeemscript(&cp_payment_pk(), &cp_funding_pk(&f));
+		let tx: Transaction = deserialize(foreign.context.transaction.as_ref().unwrap()).unwrap();
+		foreign.context.witness_script = Some(script.to_bytes());
+		foreign.digest = digest(&tx, &script, 100_000, EcdsaSighashType::All);
+		let err = f.policy.authorize(Some(&f.channel), &foreign, &f.keys).unwrap_err();
+		assert!(err.0.contains("2-of-2"), "{err}");
+	}
+
+	#[test]
+	fn a_channel_keeps_its_kit() {
+		let f = fixture(PolicyConfig::default());
+		f.policy.bind_kit(&f.channel, &KIT).unwrap();
+		assert!(f.policy.bind_kit(&f.channel, &[1u8; 32]).is_err(), "kit cannot be swapped");
+		assert!(f.policy.bind_kit(&[0xddu8; 32], &KIT).is_err(), "kit serves one channel");
+		assert!(f.policy.bind_kit(&[0xddu8; 32], &[1u8; 32]).is_err(), "unknown kit");
+		assert_eq!(f.policy.kit_of(&f.channel).unwrap(), Some(KIT));
+		assert_eq!(f.policy.kit_of(&[0xddu8; 32]).unwrap(), None);
+		assert!(f.policy.per_commitment_point(&[0xddu8; 32], 5).is_err());
+	}
+
+	#[test]
+	fn release_stops_where_the_kit_ends() {
+		let f = fixture(PolicyConfig::default());
+		let start = 281474976710655u64;
+		// The fixture kit covers three commitment numbers.
+		assert!(f.policy.per_commitment_point(&f.channel, start - 2).is_ok());
+		let err = f.policy.per_commitment_point(&f.channel, start - 3).unwrap_err();
+		assert!(err.0.contains("refill"), "{err}");
+		validate(&f, start - 2).unwrap();
+		assert!(f.policy.authorize_release(&f.channel, start - 1).is_ok());
+		// The newest covered state is still current, so it stays unreleasable.
+		assert!(f.policy.authorize_release(&f.channel, start - 2).is_err());
+	}
+
+	#[test]
+	fn state_written_before_kits_still_loads() {
+		let mut st = ChannelState { validated_holder_commitment: Some(7), ..Default::default() };
+		let mut v1 = st.encode();
+		v1[0] = 1;
+		// Version 1 had no kit field (1 byte) and no pinned parameters (4 + 1 + 1 bytes).
+		v1.truncate(v1.len() - 7);
+		assert_eq!(ChannelState::decode(&v1).unwrap(), st);
+		st.kit_id = Some(KIT);
+		assert_eq!(ChannelState::decode(&st.encode()).unwrap(), st);
 	}
 
 	#[test]

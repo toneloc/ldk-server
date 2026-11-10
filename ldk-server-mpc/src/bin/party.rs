@@ -74,10 +74,15 @@ struct Args {
 	/// Created if missing; must have the same content on both parties.
 	#[arg(long, env = "LDK_MPC_PEER_AUTH_KEY_FILE")]
 	peer_auth_key_file: Option<PathBuf>,
-	/// 32-byte key file encrypting key shares and the master secret at rest. Created if
-	/// missing. Keep it separate from the keystore.
+	/// 32-byte key file encrypting key shares at rest. Created if missing. Keep it separate
+	/// from the keystore.
 	#[arg(long, env = "LDK_MPC_SHARE_KEY_FILE")]
 	share_key_file: Option<PathBuf>,
+	/// Directory of channel kits (encrypted revocation secrets) made by
+	/// `ldk-server-mpc-ceremony`. Both parties need a copy of every kit. Defaults to
+	/// `<keystore>/kits`.
+	#[arg(long, env = "LDK_MPC_KIT_DIR")]
+	kit_dir: Option<PathBuf>,
 }
 
 struct StderrLogger;
@@ -155,6 +160,7 @@ fn main() {
 		client_psk,
 		peer_psk,
 		share_key,
+		kit_dir: args.kit_dir,
 	};
 	let service = match PartyService::new(cfg) {
 		Ok(s) => s,
@@ -163,6 +169,26 @@ fn main() {
 			std::process::exit(1);
 		},
 	};
+	if service.config().party == Party::P1 && service.tdh2_public_key().is_none() {
+		// The offline ceremony needs the joint TDH2 public key (`<keystore>/tdh2.pub`) before it
+		// can make kits, so generate it as soon as Party B is reachable.
+		let service = std::sync::Arc::clone(&service);
+		std::thread::spawn(move || loop {
+			match service.ensure_tdh2() {
+				Ok(_) => break,
+				Err(e) => log::warn!("TDH2 key generation not done yet: {}", e.message),
+			}
+			std::thread::sleep(Duration::from_secs(2));
+		});
+	}
+	match service.kits().unbound_count() {
+		Ok(0) => log::warn!(
+			"no unused channel kits in {}: new channels cannot open until the ceremony adds some",
+			service.kits().dir().display()
+		),
+		Ok(n) => log::info!("{n} unused channel kits available"),
+		Err(e) => log::warn!("cannot read the kit directory: {e}"),
+	}
 	if let Err(e) = service.serve() {
 		eprintln!("party service failed: {e}");
 		std::process::exit(1);

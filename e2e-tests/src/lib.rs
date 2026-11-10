@@ -692,6 +692,11 @@ pub fn mpc_party_binary_path() -> PathBuf {
 	PathBuf::from(env!("LDK_SERVER_MPC_PARTY_BIN"))
 }
 
+/// Path to the `ldk-server-mpc-ceremony` binary built alongside the server.
+pub fn mpc_ceremony_binary_path() -> PathBuf {
+	PathBuf::from(env!("LDK_SERVER_MPC_CEREMONY_BIN"))
+}
+
 /// Handle to a running ldk-server-mcp child process.
 pub struct McpHandle {
 	child: Option<Child>,

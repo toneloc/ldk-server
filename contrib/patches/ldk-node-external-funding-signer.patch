@@ -2338,3 +2338,57 @@ index bac23e8..5f1fb66 100644
 -- 
 2.50.1 (Apple Git-155)
 
+From ea996761e0cb9101497f6f7af1d424350455e90b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 00:42:57 +0000
+Subject: [PATCH] signer: pass the holder commitment and counterparty signature
+ to the external signer
+
+holder_commitment_validated now carries the commitment transaction and the
+counterparty's signature on its funding input, so an external signer can
+check that the counterparty really signed that state before it lets an
+older state be revoked, instead of trusting this node's claim.
+
+Written with AI assistance (Claude).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FEFPxoVaygFeJXwvZUffGz
+---
+ src/signer.rs | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/signer.rs b/src/signer.rs
+index d1784de..f1759bd 100644
+--- a/src/signer.rs
++++ b/src/signer.rs
+@@ -237,8 +237,13 @@ pub trait ExternalChannelSigner: Send + Sync {
+ 
+ 	/// Informs the signer that LDK validated the counterparty's signatures on holder commitment
+ 	/// `commitment_number`. Only for [`KeyCoverage::AllChannelKeys`].
++	///
++	/// `commitment_tx` is that commitment transaction and `counterparty_sig` the counterparty's
++	/// signature on its funding input, so the signer can check the claim itself instead of
++	/// taking this node's word for it.
+ 	fn holder_commitment_validated(
+-		&self, channel_keys_id: [u8; 32], commitment_number: u64,
++		&self, channel_keys_id: [u8; 32], commitment_number: u64, commitment_tx: &Transaction,
++		counterparty_sig: &Signature,
+ 	) -> Result<(), ()>;
+ 
+ 	/// Informs the signer that the counterparty revoked commitment `idx` with `secret`.
+@@ -509,9 +514,12 @@ impl ChannelSigner for NodeChannelSigner {
+ 		outbound_htlc_preimages: Vec<PaymentPreimage>,
+ 	) -> Result<(), ()> {
+ 		if let Some(ext) = self.all_external() {
++			let trusted = holder_tx.trust();
+ 			ext.signer.holder_commitment_validated(
+ 				self.inner.channel_keys_id(),
+ 				holder_tx.commitment_number(),
++				&trusted.built_transaction().transaction,
++				&holder_tx.counterparty_sig,
+ 			)?;
+ 		}
+ 		self.inner.validate_holder_commitment(holder_tx, outbound_htlc_preimages)
+-- 
+2.43.0
+

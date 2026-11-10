@@ -1,7 +1,7 @@
 //! Raw FFI declarations for the subset of the Coinbase `cb-mpc` public C API
 //! (`include/cbmpc/c_api/{common,cmem,job,ecdsa_2p}.h`) used by this crate.
 //!
-//! Only ECDSA-2P (two-party ECDSA) entry points are declared. All functions are
+//! ECDSA-2P (two-party ECDSA) and TDH2 (threshold decryption) entry points are declared. All functions are
 //! synchronous: the library drives the interactive protocol on the calling thread and
 //! invokes the supplied transport callbacks to exchange messages with the other party.
 
@@ -95,10 +95,40 @@ pub struct cbmpc_2pc_job_t {
 	pub transport: *const cbmpc_transport_t,
 }
 
+/// Execution context for multi-party protocols (`include/cbmpc/c_api/job.h`).
+#[repr(C)]
+pub struct cbmpc_mp_job_t {
+	pub self_: i32,
+	pub party_names: *const *const c_char,
+	pub party_names_count: c_int,
+	pub transport: *const cbmpc_transport_t,
+}
+
 extern "C" {
 	pub fn cbmpc_malloc(size: usize) -> *mut c_void;
 	pub fn cbmpc_free(ptr: *mut c_void);
 	pub fn cbmpc_cmem_free(mem: cmem_t);
+	pub fn cbmpc_cmems_free(mems: cmems_t);
+
+	// TDH2 threshold decryption (`include/cbmpc/c_api/tdh2.h`), additive sharing.
+	pub fn cbmpc_tdh2_dkg_additive(
+		job: *const cbmpc_mp_job_t, curve: cbmpc_curve_id_t, out_public_key: *mut cmem_t,
+		out_public_shares: *mut cmems_t, out_private_share: *mut cmem_t, out_sid: *mut cmem_t,
+	) -> cbmpc_error_t;
+	pub fn cbmpc_tdh2_encrypt(
+		public_key: cmem_t, plaintext: cmem_t, label: cmem_t, out_ciphertext: *mut cmem_t,
+	) -> cbmpc_error_t;
+	pub fn cbmpc_tdh2_verify(
+		public_key: cmem_t, ciphertext: cmem_t, label: cmem_t,
+	) -> cbmpc_error_t;
+	pub fn cbmpc_tdh2_partial_decrypt(
+		private_share: cmem_t, ciphertext: cmem_t, label: cmem_t,
+		out_partial_decryption: *mut cmem_t,
+	) -> cbmpc_error_t;
+	pub fn cbmpc_tdh2_combine_additive(
+		public_key: cmem_t, public_shares: cmems_t, label: cmem_t, partial_decryptions: cmems_t,
+		ciphertext: cmem_t, out_plaintext: *mut cmem_t,
+	) -> cbmpc_error_t;
 
 	pub fn cbmpc_ecdsa_2p_dkg(
 		job: *const cbmpc_2pc_job_t, curve: cbmpc_curve_id_t, out_key_blob: *mut cmem_t,

@@ -12,8 +12,8 @@ use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, Verification};
 
 use crate::protocol::{
-	ChannelId, Derivation, ErrorCode, KeyId, KeyKind, Request, Response, SignItem, SigningContext,
-	SigningOp,
+	ChannelId, Derivation, ErrorCode, HolderProof, KeyId, KeyKind, Request, Response, SignItem,
+	SigningContext, SigningOp,
 };
 use crate::secure::Conn;
 
@@ -178,11 +178,14 @@ impl MpcClient {
 		}
 	}
 
+	/// Reports that LDK validated holder commitment `commitment_number`. `proof` is the
+	/// commitment transaction and the counterparty's signature on it; the parties check it
+	/// themselves and require it for every commitment after a channel's first.
 	pub fn holder_commitment_validated(
-		&self, channel: &ChannelId, commitment_number: u64,
+		&self, channel: &ChannelId, commitment_number: u64, proof: Option<HolderProof>,
 	) -> Result<(), ClientError> {
 		Self::expect_ack(self.call(
-			&Request::HolderCommitmentValidated { channel: *channel, commitment_number },
+			&Request::HolderCommitmentValidated { channel: *channel, commitment_number, proof },
 			self.request_timeout,
 		)?)
 	}

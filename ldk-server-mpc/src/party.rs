@@ -1,14 +1,16 @@
 //! The MPC party service (v2).
 //!
 //! One process runs as P1 (Party A) or P2 (Party B). Each party holds only its own cb-mpc
-//! key-share blobs plus the policy state; Party B additionally holds the master secret from
-//! which per-channel commitment seeds are derived. No Lightning channel state beyond the
-//! policy counters is stored.
+//! key-share blobs, its share of the joint TDH2 decryption key, the channel kits (public
+//! per-commitment points and encrypted per-commitment secrets, see [`crate::kit`]) and the
+//! policy state. Neither party holds a per-commitment secret or the seed they come from. No
+//! Lightning channel state beyond the policy counters is stored.
 //!
 //! - **Party A (P1)** accepts client [`Request`]s. For `Sign` it runs the policy itself,
 //!   derives the signing share locally (additive / mul-add tweaks), opens one session per item
 //!   to Party B in parallel and drives the cb-mpc protocol as the P1 role (the only role that
-//!   obtains signatures). Requests that need the commitment seed are forwarded to Party B.
+//!   obtains signatures). To release a per-commitment secret it asks Party B for a partial
+//!   decryption and combines it with its own; each party contributes only if its policy allows.
 //! - **Party B (P2)** accepts sessions from Party A only, runs the policy independently, and
 //!   plays the P2 role.
 //!
@@ -30,12 +32,14 @@ use bitcoin::secp256k1::{All, Message, PublicKey, Scalar, Secp256k1};
 use hex_conservative::DisplayHex;
 
 use crate::cbmpc::{Job, KeyBlob, Party, ProtocolError};
+use crate::kit::{self, KitId, KitStore};
 use crate::policy::{ChannelPolicy, KeyLookup, PolicyConfig, PolicyError};
 use crate::protocol::{
 	frame_kind, ChannelId, Derivation, ErrorCode, FrameKind, KeyId, KeyKind, Reader, Request,
 	Response, SessionAck, SessionDone, SessionOp, SessionStart, SignItem, Writer,
 };
 use crate::secure::{AtRestKey, Conn};
+use crate::tdh2::{self, Tdh2Key, TwoParty};
 use crate::transport::TcpTransport;
 
 #[derive(Clone, Debug)]
@@ -57,8 +61,10 @@ pub struct PartyConfig {
 	pub client_psk: Option<[u8; 32]>,
 	/// Pre-shared key authenticating and encrypting the Party A ⇄ Party B link.
 	pub peer_psk: Option<[u8; 32]>,
-	/// Key encrypting share blobs and the master secret at rest.
+	/// Key encrypting key shares at rest.
 	pub share_key: Option<[u8; 32]>,
+	/// Directory of channel kits made by the offline ceremony. Defaults to `<keystore>/kits`.
+	pub kit_dir: Option<PathBuf>,
 }
 
 /// On-disk key-share store: one file per key, `<hex key_id>.share`.
@@ -76,7 +82,7 @@ impl KeyStore {
 		Self::open_with_key(dir, None)
 	}
 
-	/// With a share key, blobs and the master secret are AES-256-GCM encrypted at rest; the
+	/// With a share key, key shares are AES-256-GCM encrypted at rest; the
 	/// share key itself should live on a different medium (or a KMS/HSM) than the shares.
 	pub fn open_with_key(dir: &Path, share_key: Option<[u8; 32]>) -> io::Result<Self> {
 		fs::create_dir_all(dir)?;
@@ -154,41 +160,41 @@ impl KeyStore {
 			.count())
 	}
 
-	/// Loads or creates the 32-byte master secret file (Party B's commitment-seed root).
-	pub fn load_or_create_master_secret(&self) -> io::Result<[u8; 32]> {
-		let path = self.dir.join("master.secret");
-		match fs::read(&path) {
+	/// This party's share of the joint TDH2 key, if the key generation has run.
+	pub fn load_tdh2(&self) -> io::Result<Option<Tdh2Key>> {
+		match fs::read(self.dir.join("tdh2.keyshare")) {
 			Ok(bytes) => {
-				let bytes = self.unseal(bytes, "master secret")?;
-				if bytes.len() != 32 {
-					return Err(io::Error::new(
-						io::ErrorKind::InvalidData,
-						"master.secret must be 32 bytes",
-					));
-				}
-				Ok(bytes.try_into().unwrap())
+				let bytes = self.unseal(bytes, "TDH2 key share")?;
+				Tdh2Key::decode(&bytes)
+					.map(Some)
+					.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 			},
-			Err(e) if e.kind() == io::ErrorKind::NotFound => {
-				use bitcoin::secp256k1::rand::RngCore;
-				let mut secret = [0u8; 32];
-				bitcoin::secp256k1::rand::thread_rng().fill_bytes(&mut secret);
-				let tmp = self.dir.join("master.secret.tmp");
-				{
-					use std::io::Write;
-					let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-					#[cfg(unix)]
-					{
-						use std::os::unix::fs::PermissionsExt;
-						f.set_permissions(fs::Permissions::from_mode(0o600))?;
-					}
-					f.write_all(&self.seal(&secret)?)?;
-					f.sync_all()?;
-				}
-				fs::rename(&tmp, &path)?;
-				Ok(secret)
-			},
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
 			Err(e) => Err(e),
 		}
+	}
+
+	/// Persists this party's TDH2 key share, and the joint public key in `tdh2.pub` for the
+	/// offline ceremony to encrypt to. Refuses to overwrite an existing share.
+	pub fn insert_tdh2(&self, key: &Tdh2Key) -> io::Result<()> {
+		let path = self.dir.join("tdh2.keyshare");
+		if path.exists() {
+			return Err(io::Error::new(io::ErrorKind::AlreadyExists, "TDH2 share already exists"));
+		}
+		let tmp = self.dir.join("tdh2.keyshare.tmp");
+		{
+			use std::io::Write;
+			let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::PermissionsExt;
+				f.set_permissions(fs::Permissions::from_mode(0o600))?;
+			}
+			f.write_all(&self.seal(&key.encode())?)?;
+			f.sync_all()?;
+		}
+		fs::write(self.dir.join("tdh2.pub"), key.public_key.as_hex().to_string())?;
+		fs::rename(&tmp, &path)
 	}
 }
 
@@ -203,6 +209,8 @@ pub struct PartyService {
 	cfg: PartyConfig,
 	store: KeyStore,
 	policy: ChannelPolicy,
+	kits: Arc<KitStore>,
+	tdh2: Mutex<Option<Arc<Tdh2Key>>>,
 	key_locks: Mutex<HashMap<KeyId, Arc<Mutex<()>>>>,
 	secp: Secp256k1<All>,
 	shutdown: AtomicBool,
@@ -261,14 +269,17 @@ impl PartyService {
 		if cfg.peer_psk.is_none() {
 			log::warn!("no peer pre-shared key configured: the party link is plain TCP");
 		}
-		// Only Party B holds the commitment-seed master secret.
-		let master =
-			if cfg.party == Party::P2 { Some(store.load_or_create_master_secret()?) } else { None };
-		let policy = ChannelPolicy::open(&cfg.keystore_dir, cfg.policy.clone(), master)?;
+		let kit_dir = cfg.kit_dir.clone().unwrap_or_else(|| cfg.keystore_dir.join("kits"));
+		let kits = Arc::new(KitStore::open(&kit_dir)?);
+		let policy =
+			ChannelPolicy::open(&cfg.keystore_dir, cfg.policy.clone(), Some(Arc::clone(&kits)))?;
+		let tdh2 = store.load_tdh2()?.map(Arc::new);
 		Ok(Arc::new(PartyService {
 			cfg,
 			store,
 			policy,
+			kits,
+			tdh2: Mutex::new(tdh2),
 			key_locks: Mutex::new(HashMap::new()),
 			secp: Secp256k1::new(),
 			shutdown: AtomicBool::new(false),
@@ -285,6 +296,114 @@ impl PartyService {
 
 	pub fn policy(&self) -> &ChannelPolicy {
 		&self.policy
+	}
+
+	pub fn kits(&self) -> &KitStore {
+		&self.kits
+	}
+
+	fn party_names(&self) -> [&str; 2] {
+		[&self.cfg.p1_name, &self.cfg.p2_name]
+	}
+
+	fn tdh2_key(&self) -> Option<Arc<Tdh2Key>> {
+		self.tdh2.lock().unwrap().clone()
+	}
+
+	/// The joint TDH2 public key, if the key generation has run.
+	pub fn tdh2_public_key(&self) -> Option<Vec<u8>> {
+		self.tdh2_key().map(|k| k.public_key.clone())
+	}
+
+	/// Party A: returns this party's TDH2 key share, running the key generation with Party B
+	/// first if there is none yet.
+	pub fn ensure_tdh2(&self) -> Result<Arc<Tdh2Key>, ServiceError> {
+		let mut slot = self.tdh2.lock().unwrap();
+		if let Some(key) = slot.as_ref() {
+			return Ok(Arc::clone(key));
+		}
+		log::info!("running the TDH2 key generation for revocation secrets");
+		let (conn, _) = self.open_session(&SessionStart { op: SessionOp::Tdh2Dkg })?;
+		let transport = TcpTransport::new(conn, self.cfg.protocol_timeout)?;
+		let key = tdh2::dkg(&self.party_names(), 0, &TwoParty(&transport))?;
+		let mut conn = transport.into_inner();
+		let frame = conn
+			.read_frame()
+			.map_err(|e| ServiceError::new(ErrorCode::PeerUnavailable, e.to_string()))?;
+		let done = SessionDone::decode(&frame)
+			.map_err(|e| ServiceError::new(ErrorCode::ProtocolFailed, e.to_string()))?;
+		if done.pubkey != key.public_key {
+			return Err(ServiceError::new(
+				ErrorCode::KeyMismatch,
+				"TDH2 public key mismatch between parties",
+			));
+		}
+		self.store.insert_tdh2(&key)?;
+		log::info!("TDH2 key generation complete: {}", key.public_key.as_hex());
+		let key = Arc::new(key);
+		*slot = Some(Arc::clone(&key));
+		Ok(key)
+	}
+
+	/// Party A: the kit of `channel`, taking an unused one from the pool on first use and
+	/// having Party B bind the same kit.
+	fn kit_for(&self, channel: &ChannelId) -> Result<KitId, ServiceError> {
+		if let Some(kit_id) = self.policy.kit_of(channel)? {
+			return Ok(kit_id);
+		}
+		let key = self.ensure_tdh2()?;
+		let kit_id = self.kits.bind_unbound(channel, &key.public_key).map_err(|e| {
+			ServiceError::new(ErrorCode::KeyNotFound, format!("no kit for this channel: {e}"))
+		})?;
+		self.forward(SessionOp::BindKit { channel: *channel, kit_id })?;
+		self.policy.bind_kit(channel, &kit_id)?;
+		log::info!("bound kit {} to channel {}", kit_id.as_hex(), channel.as_hex());
+		Ok(kit_id)
+	}
+
+	/// Party A: the per-commitment point for `idx`, from the channel's kit.
+	fn per_commitment_point(
+		&self, channel: &ChannelId, idx: u64,
+	) -> Result<PublicKey, ServiceError> {
+		let kit_id = self.kit_for(channel)?;
+		let point = self.policy.per_commitment_point(channel, idx)?;
+		if let Ok(left) = self.kits.remaining(&kit_id, idx) {
+			if left <= LOW_KIT_WARNING && left % 16 == 0 {
+				log::warn!(
+					"kit {} of channel {} has {left} commitment numbers left: run the refill ceremony",
+					kit_id.as_hex(),
+					channel.as_hex()
+				);
+			}
+		}
+		Ok(point)
+	}
+
+	/// Party A: recovers the per-commitment secret for `idx`. Both parties' policies must allow
+	/// the release; each then contributes a partial decryption of its own copy of the kit
+	/// entry. The result is checked against the per-commitment point before it is returned.
+	fn release_commitment_secret(
+		&self, channel: &ChannelId, idx: u64,
+	) -> Result<[u8; 32], ServiceError> {
+		let key = self.ensure_tdh2()?;
+		let (kit_id, entry) = self.policy.authorize_release(channel, idx)?;
+		let label = kit::label(&kit_id, idx);
+		let ours = key.partial_decrypt(&entry.ciphertext, &label)?;
+		let theirs = self.forward(SessionOp::ReleaseSecret { channel: *channel, idx })?;
+		let secret: [u8; 32] = key
+			.combine(&entry.ciphertext, &label, &[ours, theirs])?
+			.try_into()
+			.map_err(|_| ServiceError::new(ErrorCode::ProtocolFailed, "bad secret length"))?;
+		let point = bitcoin::secp256k1::SecretKey::from_slice(&secret)
+			.map(|sk| PublicKey::from_secret_key(&self.secp, &sk))
+			.map_err(|e| ServiceError::new(ErrorCode::ProtocolFailed, e.to_string()))?;
+		if point != entry.point {
+			return Err(ServiceError::new(
+				ErrorCode::ProtocolFailed,
+				"decrypted secret does not match its per-commitment point",
+			));
+		}
+		Ok(secret)
 	}
 
 	fn key_lock(&self, key_id: &KeyId) -> Arc<Mutex<()>> {
@@ -387,26 +506,26 @@ impl PartyService {
 				.public_key(&key_id)
 				.map(|pk| Response::PublicKey { pubkey: pk.serialize().to_vec() }),
 			Request::GetPerCommitmentPoint { channel, idx } => self
-				.forward(SessionOp::PerCommitmentPoint { channel, idx })
-				.and_then(|payload| parse_pubkey(&payload))
+				.per_commitment_point(&channel, idx)
 				.map(|pk| Response::PublicKey { pubkey: pk.serialize().to_vec() }),
-			Request::ReleaseCommitmentSecret { channel, idx } => {
-				self.forward(SessionOp::ReleaseSecret { channel, idx }).and_then(|payload| {
-					let secret: [u8; 32] = payload
-						.try_into()
-						.map_err(|_| ServiceError::new(ErrorCode::ProtocolFailed, "bad secret"))?;
-					Ok(Response::Secret { secret })
-				})
-			},
-			Request::HolderCommitmentValidated { channel, commitment_number } => {
-				// Mirror the state on both parties.
+			Request::ReleaseCommitmentSecret { channel, idx } => self
+				.release_commitment_secret(&channel, idx)
+				.map(|secret| Response::Secret { secret }),
+			Request::HolderCommitmentValidated { channel, commitment_number, proof } => {
+				// Each party checks the proof itself and keeps its own record.
 				self.policy
-					.holder_commitment_validated(&channel, commitment_number)
+					.holder_commitment_validated(
+						&channel,
+						commitment_number,
+						proof.as_ref(),
+						&self.store,
+					)
 					.map_err(ServiceError::from)
 					.and_then(|_| {
 						self.forward(SessionOp::HolderCommitmentValidated {
 							channel,
 							commitment_number,
+							proof,
 						})
 					})
 					.map(|_| Response::Ack)
@@ -657,13 +776,32 @@ impl PartyService {
 				Self::reply(conn, res)
 			},
 			SessionOp::ReleaseSecret { channel, idx } => {
-				let res = self.policy.release_commitment_secret(&channel, idx).map(|s| s.to_vec());
+				// Decrypt only our own copy of the entry we authorized, never a ciphertext
+				// supplied by the other party.
+				let res =
+					self.policy.authorize_release(&channel, idx).and_then(|(kit_id, entry)| {
+						let key = self
+							.tdh2_key()
+							.ok_or_else(|| PolicyError("no TDH2 key share on this party".into()))?;
+						key.partial_decrypt(&entry.ciphertext, &kit::label(&kit_id, idx))
+							.map_err(|e| PolicyError(format!("partial decryption failed: {e}")))
+					});
 				Self::reply(conn, res)
 			},
-			SessionOp::HolderCommitmentValidated { channel, commitment_number } => {
+			SessionOp::Tdh2Dkg => self.session_tdh2_dkg(conn),
+			SessionOp::BindKit { channel, kit_id } => {
+				let res = self.bind_kit_as_peer(&channel, &kit_id).map(|_| Vec::new());
+				Self::reply(conn, res)
+			},
+			SessionOp::HolderCommitmentValidated { channel, commitment_number, proof } => {
 				let res = self
 					.policy
-					.holder_commitment_validated(&channel, commitment_number)
+					.holder_commitment_validated(
+						&channel,
+						commitment_number,
+						proof.as_ref(),
+						&self.store,
+					)
 					.map(|_| Vec::new());
 				Self::reply(conn, res)
 			},
@@ -686,6 +824,44 @@ impl PartyService {
 			},
 		};
 		conn.write_frame(&ack.encode())
+	}
+
+	/// Party B: binds a kit Party A chose, provided our copy exists and was encrypted to the
+	/// TDH2 key we hold a share of.
+	fn bind_kit_as_peer(&self, channel: &ChannelId, kit_id: &KitId) -> Result<(), PolicyError> {
+		let key =
+			self.tdh2_key().ok_or_else(|| PolicyError("no TDH2 key share on this party".into()))?;
+		let kit_key = self
+			.kits
+			.public_key_id(kit_id, kit::INITIAL_COMMITMENT_NUMBER)
+			.map_err(|e| PolicyError(format!("kit read failed: {e}")))?
+			.ok_or_else(|| PolicyError("this party has no copy of that kit".into()))?;
+		if kit_key != kit::public_key_id(&key.public_key) {
+			return deny_policy("kit was not encrypted to this party's TDH2 key");
+		}
+		self.policy.bind_kit(channel, kit_id)
+	}
+
+	fn session_tdh2_dkg(&self, mut conn: Conn) -> io::Result<()> {
+		let mut slot = self.tdh2.lock().unwrap();
+		if slot.is_some() {
+			// Party A lost its share but we still have ours: refuse rather than generate a
+			// different key, which would orphan every kit encrypted to the old one.
+			let ack = SessionAck::Error {
+				code: ErrorCode::KeyMismatch,
+				message: "P2 already holds a TDH2 key share".into(),
+			};
+			return conn.write_frame(&ack.encode());
+		}
+		conn.write_frame(&SessionAck::ok().encode())?;
+		let transport = TcpTransport::new(conn, self.cfg.protocol_timeout)?;
+		let key = tdh2::dkg(&self.party_names(), 1, &TwoParty(&transport))
+			.map_err(|e| io::Error::other(e.to_string()))?;
+		self.store.insert_tdh2(&key)?;
+		log::info!("TDH2 key generation complete: {}", key.public_key.as_hex());
+		let done = SessionDone { pubkey: key.public_key.clone() };
+		*slot = Some(Arc::new(key));
+		transport.into_inner().write_frame(&done.encode())
 	}
 
 	fn session_dkg(
@@ -762,10 +938,12 @@ impl PartyService {
 	}
 }
 
-fn parse_pubkey(bytes: &[u8]) -> Result<PublicKey, ServiceError> {
-	PublicKey::from_slice(bytes)
-		.map_err(|e| ServiceError::new(ErrorCode::ProtocolFailed, format!("bad pubkey: {e}")))
+fn deny_policy<T>(msg: &str) -> Result<T, PolicyError> {
+	Err(PolicyError(msg.into()))
 }
+
+/// Warn when a channel's kit has this many commitment numbers left.
+const LOW_KIT_WARNING: u64 = 256;
 
 // Keep the (unused here) protocol helpers referenced so they stay public API.
 #[allow(dead_code)]

@@ -262,8 +262,10 @@ Two resolution methods are supported via the `mode` field:
 
 Enables 2-of-2 MPC-backed channel keys via the Coinbase cb-mpc party service
 (`ldk-server-mpc`). `party_address` is the address of MPC Party A (the cb-mpc P1 service,
-the only party LDK Server talks to). `coverage` is `"all"` (default: every channel key and the
-per-commitment secrets are distributed) or `"funding"` (funding key only). `auth_key_path`
+the only party LDK Server talks to). `coverage` is `"all"` (default: every channel key is
+distributed, and the per-commitment secrets are threshold-encrypted channel kits made by the
+offline `ldk-server-mpc-ceremony`; a channel cannot open until the parties have an unused kit)
+or `"funding"` (funding key only). `auth_key_path`
 is the 32-byte pre-shared key file Party A was started with (`--auth-key-file`); it
 authenticates and encrypts the link. Optional `request_timeout_secs` (default 30) bounds
 signing requests and `dkg_timeout_secs` (default 120) bounds first-use key generation. Only

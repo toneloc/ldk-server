@@ -11,15 +11,20 @@
 //! - [`protocol`]: the small wire format between the client and P1 and between P1 and P2.
 //! - [`party`]: the party service (key-share store, DKG/sign session handling).
 //! - [`client`]: the blocking client used by LDK Server's signer.
-//! - [`policy`]: the `SigningPolicy` extension point (only `AllowAllPolicy` is implemented).
+//! - [`policy`]: the signing and secret-release policy both parties enforce.
+//! - [`tdh2`]: safe wrappers over cb-mpc's TDH2 threshold decryption.
+//! - [`kit`]: channel kits (threshold-encrypted per-commitment secrets) and the offline
+//!   ceremony's building blocks.
 
 pub mod cbmpc;
 pub mod client;
 pub mod ffi;
+pub mod kit;
 pub mod party;
 pub mod policy;
 pub mod protocol;
 pub mod secure;
+pub mod tdh2;
 pub mod transport;
 
 pub use bitcoin;

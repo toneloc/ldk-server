@@ -47,11 +47,13 @@ fn main() {
 	let cli_bin = bin_dir.join("ldk-server-cli");
 	let mcp_bin = bin_dir.join("ldk-server-mcp");
 	let mpc_party_bin = bin_dir.join("ldk-server-mpc-party");
+	let mpc_ceremony_bin = bin_dir.join("ldk-server-mpc-ceremony");
 
 	println!("cargo:rustc-env=LDK_SERVER_BIN={}", server_bin.display());
 	println!("cargo:rustc-env=LDK_SERVER_CLI_BIN={}", cli_bin.display());
 	println!("cargo:rustc-env=LDK_SERVER_MCP_BIN={}", mcp_bin.display());
 	println!("cargo:rustc-env=LDK_SERVER_MPC_PARTY_BIN={}", mpc_party_bin.display());
+	println!("cargo:rustc-env=LDK_SERVER_MPC_CEREMONY_BIN={}", mpc_ceremony_bin.display());
 
 	// Rebuild when server or CLI source changes
 	println!("cargo:rerun-if-changed=../ldk-server/src");

@@ -437,6 +437,41 @@ impl SigningContext {
 	}
 }
 
+/// Evidence that the counterparty signed one of our (holder) commitment transactions: the
+/// transaction and the counterparty's signature on its funding input. The parties verify it
+/// themselves before they treat the commitment as validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HolderProof {
+	/// Consensus-serialized holder commitment transaction.
+	pub transaction: Vec<u8>,
+	/// The counterparty's signature, 64-byte compact encoding.
+	pub counterparty_sig: [u8; 64],
+}
+
+impl HolderProof {
+	fn encode_opt(proof: Option<&HolderProof>, w: &mut Writer) {
+		match proof {
+			Some(p) => {
+				w.u8(1);
+				w.bytes(&p.transaction);
+				w.fixed(&p.counterparty_sig);
+			},
+			None => w.u8(0),
+		}
+	}
+
+	fn decode_opt(r: &mut Reader<'_>) -> Result<Option<HolderProof>, DecodeError> {
+		if r.u8()? == 0 {
+			return Ok(None);
+		}
+		let transaction = r.bytes()?;
+		let mut counterparty_sig = [0u8; 64];
+		counterparty_sig[..32].copy_from_slice(&r.fixed32()?);
+		counterparty_sig[32..].copy_from_slice(&r.fixed32()?);
+		Ok(Some(HolderProof { transaction, counterparty_sig }))
+	}
+}
+
 /// One signature within a batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignItem {
@@ -486,7 +521,7 @@ pub enum Request {
 	GetPublicKey {
 		key_id: KeyId,
 	},
-	/// Per-commitment point for commitment `idx` of `channel` (seed held by Party B).
+	/// Per-commitment point for commitment `idx` of `channel`, from the channel's kit.
 	GetPerCommitmentPoint {
 		channel: ChannelId,
 		idx: u64,
@@ -497,9 +532,12 @@ pub enum Request {
 		idx: u64,
 	},
 	/// LDK validated the counterparty's signatures on holder commitment `commitment_number`.
+	/// `proof` lets the parties check that for themselves; they require it for every
+	/// commitment after a channel's first.
 	HolderCommitmentValidated {
 		channel: ChannelId,
 		commitment_number: u64,
+		proof: Option<HolderProof>,
 	},
 	/// The counterparty revoked commitment `idx` with `secret`.
 	CounterpartyRevocationValidated {
@@ -547,10 +585,11 @@ impl Request {
 				w.fixed(channel);
 				w.u64(*idx);
 			},
-			Request::HolderCommitmentValidated { channel, commitment_number } => {
+			Request::HolderCommitmentValidated { channel, commitment_number, proof } => {
 				w.u8(6);
 				w.fixed(channel);
 				w.u64(*commitment_number);
+				HolderProof::encode_opt(proof.as_ref(), &mut w);
 			},
 			Request::CounterpartyRevocationValidated { channel, idx, secret } => {
 				w.u8(7);
@@ -595,6 +634,7 @@ impl Request {
 			6 => Request::HolderCommitmentValidated {
 				channel: r.fixed32()?,
 				commitment_number: r.u64()?,
+				proof: HolderProof::decode_opt(&mut r)?,
 			},
 			7 => Request::CounterpartyRevocationValidated {
 				channel: r.fixed32()?,
@@ -756,11 +796,13 @@ pub enum SessionOp {
 		channel: Option<ChannelId>,
 		item: SignItem,
 	},
-	/// Non-interactive requests served by Party B's policy / seed.
+	/// Party B's per-commitment point for `idx`, read from its copy of the channel's kit.
 	PerCommitmentPoint {
 		channel: ChannelId,
 		idx: u64,
 	},
+	/// Asks Party B for its partial decryption of the secret for `idx`. Party B answers only
+	/// if its own policy allows the release, and decrypts only its own copy of the kit entry.
 	ReleaseSecret {
 		channel: ChannelId,
 		idx: u64,
@@ -768,11 +810,19 @@ pub enum SessionOp {
 	HolderCommitmentValidated {
 		channel: ChannelId,
 		commitment_number: u64,
+		proof: Option<HolderProof>,
 	},
 	CounterpartyRevocationValidated {
 		channel: ChannelId,
 		idx: u64,
 		secret: [u8; 32],
+	},
+	/// Interactive key generation of the parties' joint TDH2 key (revocation secrets).
+	Tdh2Dkg,
+	/// Binds the kit `kit_id` to `channel` on Party B.
+	BindKit {
+		channel: ChannelId,
+		kit_id: [u8; 32],
 	},
 }
 
@@ -813,16 +863,23 @@ impl SessionStart {
 				w.fixed(channel);
 				w.u64(*idx);
 			},
-			SessionOp::HolderCommitmentValidated { channel, commitment_number } => {
+			SessionOp::HolderCommitmentValidated { channel, commitment_number, proof } => {
 				w.u8(5);
 				w.fixed(channel);
 				w.u64(*commitment_number);
+				HolderProof::encode_opt(proof.as_ref(), &mut w);
 			},
 			SessionOp::CounterpartyRevocationValidated { channel, idx, secret } => {
 				w.u8(6);
 				w.fixed(channel);
 				w.u64(*idx);
 				w.fixed(secret);
+			},
+			SessionOp::Tdh2Dkg => w.u8(7),
+			SessionOp::BindKit { channel, kit_id } => {
+				w.u8(8);
+				w.fixed(channel);
+				w.fixed(kit_id);
 			},
 		}
 		w.0
@@ -851,12 +908,15 @@ impl SessionStart {
 			5 => SessionOp::HolderCommitmentValidated {
 				channel: r.fixed32()?,
 				commitment_number: r.u64()?,
+				proof: HolderProof::decode_opt(&mut r)?,
 			},
 			6 => SessionOp::CounterpartyRevocationValidated {
 				channel: r.fixed32()?,
 				idx: r.u64()?,
 				secret: r.fixed32()?,
 			},
+			7 => SessionOp::Tdh2Dkg,
+			8 => SessionOp::BindKit { channel: r.fixed32()?, kit_id: r.fixed32()? },
 			_ => return Err(DecodeError("unknown session op")),
 		};
 		r.finish()?;
@@ -999,7 +1059,19 @@ mod tests {
 			Request::GetPublicKey { key_id: [2u8; 32] },
 			Request::GetPerCommitmentPoint { channel: [1u8; 32], idx: 42 },
 			Request::ReleaseCommitmentSecret { channel: [1u8; 32], idx: 42 },
-			Request::HolderCommitmentValidated { channel: [1u8; 32], commitment_number: 41 },
+			Request::HolderCommitmentValidated {
+				channel: [1u8; 32],
+				commitment_number: 41,
+				proof: None,
+			},
+			Request::HolderCommitmentValidated {
+				channel: [1u8; 32],
+				commitment_number: 40,
+				proof: Some(HolderProof {
+					transaction: vec![1, 2, 3],
+					counterparty_sig: [7u8; 64],
+				}),
+			},
 			Request::CounterpartyRevocationValidated {
 				channel: [1u8; 32],
 				idx: 42,
@@ -1057,7 +1129,13 @@ mod tests {
 			},
 			SessionOp::PerCommitmentPoint { channel: [2u8; 32], idx: 7 },
 			SessionOp::ReleaseSecret { channel: [2u8; 32], idx: 7 },
-			SessionOp::HolderCommitmentValidated { channel: [2u8; 32], commitment_number: 6 },
+			SessionOp::Tdh2Dkg,
+			SessionOp::BindKit { channel: [2u8; 32], kit_id: [3u8; 32] },
+			SessionOp::HolderCommitmentValidated {
+				channel: [2u8; 32],
+				commitment_number: 6,
+				proof: Some(HolderProof { transaction: vec![9], counterparty_sig: [8u8; 64] }),
+			},
 			SessionOp::CounterpartyRevocationValidated {
 				channel: [2u8; 32],
 				idx: 7,
