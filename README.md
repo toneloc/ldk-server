@@ -84,8 +84,10 @@ Details, diagrams and the threat model are in
   wallet mnemonic is still on the LDK Server host (separate from the node seed, and parties
   only pay out to its addresses).
 - **Key generation needs every party.** A channel cannot open while a party is down.
-- **Splices.** Splice transactions are signed without output checks, and a splice's new
-  funding is trusted when first signed for.
+- **Splices, partly.** The parties follow a channel only to a funding output created by a
+  splice transaction they signed, and refuse a splice that pays our balance anywhere but an
+  allow-listed address. Fee bumps of a pending splice have not been run with MPC, and a
+  splice the parties refuse midway stays pending (see `ldk-server-mpc/README.md`).
 - **Policy.** HTLC-level accounting is not enforced. The balance cap is a per-update delta
   and is off by default.
 - **Revocation kits.** A kit covers a fixed number of channel states and must be refilled by

@@ -42,8 +42,8 @@ use crate::mp::{self, KeyShare, MpTransport};
 use crate::policy::{Authorized, ChannelPolicy, KeyLookup, PolicyConfig, PolicyError};
 use crate::protocol::{
 	frame_kind, ChannelId, Derivation, ErrorCode, FrameKind, HolderProof, KeyId, KeyKind, MeshJoin,
-	Request, Response, SessionAck, SessionDone, SessionOp, SessionStart, SignItem, FRAME_COMMIT,
-	FRAME_GO,
+	Request, Response, SessionAck, SessionDone, SessionOp, SessionStart, SignItem, SigningOp,
+	FRAME_COMMIT, FRAME_GO,
 };
 use crate::secure::{AtRestKey, Conn, SecureStream};
 use crate::tdh2::{self, Tdh2Key};
@@ -490,6 +490,20 @@ impl PartyService {
 	fn handle_request(self: &Arc<Self>, req: Request) -> Response {
 		let res: Result<Response, ServiceError> = match req {
 			Request::Ping => Ok(Response::Pong),
+			Request::CheckPayout { script } => {
+				let script = bitcoin::ScriptBuf::from_bytes(script);
+				match &self.policy.config().payout {
+					Some(allow) if allow.contains(&script) => Ok(Response::Ack),
+					Some(_) => Err(ServiceError::new(
+						ErrorCode::PolicyDenied,
+						"the script is not on this party's payout allow-list",
+					)),
+					None => Err(ServiceError::new(
+						ErrorCode::PolicyDenied,
+						"this party has no payout allow-list",
+					)),
+				}
+			},
 			Request::EnsureKey { key_id, channel } => self
 				.ensure_key(&key_id, channel)
 				.map(|pk| Response::PublicKey { pubkey: pk.serialize().to_vec() }),
@@ -927,6 +941,13 @@ impl PartyService {
 			if self.store.get(&item.key_id)?.is_none() {
 				return Err(ServiceError::new(ErrorCode::KeyNotFound, "unknown key id"));
 			}
+			if let (Some(channel), Some(proof)) = (channel, &item.splice) {
+				// A splice this party may have missed. The proof stands on its own; if it
+				// does not hold, the commitment is judged without it.
+				if let Err(e) = self.policy.learn_splice(channel, proof, &self.store) {
+					log::warn!("ignoring a splice proof: {e}");
+				}
+			}
 			auths.push(self.policy.authorize(channel, item, &self.store)?);
 		}
 		Ok(auths)
@@ -970,6 +991,16 @@ impl PartyService {
 		if items.is_empty() {
 			return Err(ServiceError::new(ErrorCode::BadRequest, "empty sign request"));
 		}
+		// Commitments for a funding output that a splice created travel with the proof of
+		// that splice, so a party that missed it can follow.
+		let mut items = items;
+		if let Some(channel) = &channel {
+			for item in &mut items {
+				if item.splice.is_none() {
+					item.splice = self.policy.splice_proof_for(channel, item);
+				}
+			}
+		}
 		let auths = self.authorize_all(channel.as_ref(), &items)?;
 
 		// One signing session per key at a time on this leader (cb-mpc advises against many
@@ -1006,6 +1037,11 @@ impl PartyService {
 						self.policy.commit(auth)?;
 					}
 					if let Some(channel) = channel {
+						for (item, sig) in items.iter().zip(&sigs) {
+							if item.context.op == Some(SigningOp::SpliceSharedInput) {
+								self.policy.splice_signed(&channel, item, sig)?;
+							}
+						}
 						self.inform_observers(&quorum, channel, items);
 					}
 					return Ok(sigs);

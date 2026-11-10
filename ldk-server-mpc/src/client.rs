@@ -109,9 +109,8 @@ impl MpcClient {
 		&self.addrs
 	}
 
-	/// Sends `req` to a party, moving on to the next one when a party cannot be reached or
-	/// cannot reach a quorum itself. A party's refusal on policy grounds is final: the other
-	/// parties took part in that decision.
+	/// Sends `req` to a party, moving on to the next one when a party cannot be reached,
+	/// cannot reach a quorum itself, or refuses on policy grounds.
 	fn call(&self, req: &Request, read_timeout: Duration) -> Result<Response, ClientError> {
 		let first = self.preferred.load(Ordering::Relaxed);
 		let mut last = None;
@@ -122,6 +121,17 @@ impl MpcClient {
 					e @ (ClientError::Io(_)
 					| ClientError::Remote { code: ErrorCode::PeerUnavailable, .. }),
 				) => last = Some(e),
+				// A refusal may come from a party whose record of the channel lags (it was
+				// down for a while). Another party may know better, and brings it up to date
+				// in passing. If they all refuse, the first refusal is the answer.
+				Err(e @ ClientError::Remote { code: ErrorCode::PolicyDenied, .. }) => {
+					if !matches!(
+						last,
+						Some(ClientError::Remote { code: ErrorCode::PolicyDenied, .. })
+					) {
+						last = Some(e);
+					}
+				},
 				other => {
 					self.preferred.store(i, Ordering::Relaxed);
 					return other;
@@ -146,6 +156,16 @@ impl MpcClient {
 			return Err(ClientError::Remote { code, message });
 		}
 		Ok(resp)
+	}
+
+	/// Whether the parties' payout allow-list contains `script`. A refusal is a
+	/// [`ClientError::Remote`] with [`ErrorCode::PolicyDenied`].
+	pub fn check_payout(&self, script: &[u8]) -> Result<(), ClientError> {
+		let req = Request::CheckPayout { script: script.to_vec() };
+		match self.call(&req, self.request_timeout)? {
+			Response::Ack => Ok(()),
+			other => Err(ClientError::Protocol(format!("unexpected response {other:?}"))),
+		}
 	}
 
 	pub fn ping(&self) -> Result<(), ClientError> {
@@ -287,8 +307,13 @@ impl MpcClient {
 		if context.op.is_none() {
 			context.op = Some(SigningOp::Test);
 		}
-		let item =
-			SignItem { key_id: *key_id, derivation: Derivation::None, digest: *digest, context };
+		let item = SignItem {
+			key_id: *key_id,
+			derivation: Derivation::None,
+			digest: *digest,
+			context,
+			splice: None,
+		};
 		let mut sigs =
 			self.sign_batch(secp, None, vec![item], expected_pubkey.map(std::slice::from_ref))?;
 		Ok(sigs.remove(0))

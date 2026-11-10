@@ -16,6 +16,8 @@ use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper::{HeaderMap, Request, Response};
 use ldk_node::Node;
+
+use crate::mpc_signer::MpcChannelSigner;
 use ldk_server_grpc::endpoints::{
 	BOLT11_CLAIM_FOR_ID_PATH, BOLT11_FAIL_FOR_ID_PATH, BOLT11_RECEIVE_FOR_HASH_PATH,
 	BOLT11_RECEIVE_PATH, BOLT11_RECEIVE_VARIABLE_AMOUNT_VIA_JIT_CHANNEL_FOR_HASH_PATH,
@@ -124,17 +126,20 @@ pub(crate) struct NodeService {
 
 impl NodeService {
 	pub(crate) fn new(
-		node: Arc<Node>, macaroon_store: Arc<MacaroonStore>, metrics: Option<Arc<Metrics>>,
-		metrics_auth_header: Option<String>, event_sender: broadcast::Sender<EventEnvelope>,
+		node: Arc<Node>, mpc: Option<Arc<MpcChannelSigner>>, macaroon_store: Arc<MacaroonStore>,
+		metrics: Option<Arc<Metrics>>, metrics_auth_header: Option<String>,
+		event_sender: broadcast::Sender<EventEnvelope>,
 		shutdown_rx: tokio::sync::watch::Receiver<bool>,
 	) -> Self {
-		let context = Arc::new(Context { node });
+		let context = Arc::new(Context { node, mpc });
 		Self { context, macaroon_store, metrics, metrics_auth_header, event_sender, shutdown_rx }
 	}
 }
 
 pub(crate) struct Context {
 	pub(crate) node: Arc<Node>,
+	/// The channel signer, when channel keys are held by MPC parties.
+	pub(crate) mpc: Option<Arc<MpcChannelSigner>>,
 }
 
 impl Service<Request<Incoming>> for NodeService {

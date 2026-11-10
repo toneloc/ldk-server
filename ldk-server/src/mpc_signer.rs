@@ -129,6 +129,15 @@ impl MpcChannelSigner {
 		self.client.ping()
 	}
 
+	/// Whether the parties would let channel funds be paid to `script`. `Err` carries the
+	/// reason, for the user.
+	pub(crate) fn check_payout(&self, script: &ldk_node::bitcoin::Script) -> Result<(), String> {
+		self.client.check_payout(script.as_bytes()).map_err(|e| match e {
+			ClientError::Remote { message, .. } => message,
+			other => other.to_string(),
+		})
+	}
+
 	fn tagged(channel_keys_id: [u8; 32], label: &[u8], extra: Option<&[u8]>) -> [u8; 32] {
 		let mut engine = sha256::Hash::engine();
 		engine.input(KEY_ID_TAG);
@@ -308,7 +317,10 @@ impl MpcChannelSigner {
 			},
 		};
 		let context = Self::to_signing_context(&req.context, channel_keys_id, secret);
-		Ok((SignItem { key_id, derivation, digest: *req.msg.as_ref(), context }, expected))
+		Ok((
+			SignItem { key_id, derivation, digest: *req.msg.as_ref(), context, splice: None },
+			expected,
+		))
 	}
 }
 
@@ -443,6 +455,21 @@ impl ExternalChannelSigner for MpcChannelSigner {
 		self.flush_notices().map_err(|e| error!("MPC notice replay failed: {e}"))?;
 		let started = std::time::Instant::now();
 		let ops: Vec<ChannelSignOp> = requests.iter().map(|r| r.context.op).collect();
+		if ops.contains(&ChannelSignOp::SpliceSharedInput) {
+			// The parties let a splice through only against a balance the counterparty signed
+			// for. Show them the latest such commitment again: one that was validated before
+			// they had anything to check it against (the first of an inbound channel) counts
+			// only now.
+			let channel = Self::channel_id(channel_keys_id);
+			let latest = self.latest_proofs.lock().unwrap().get(&channel).cloned();
+			if let Some((number, proof)) = latest {
+				if let Err(e) =
+					self.client.holder_commitment_validated(&channel, number, Some(proof))
+				{
+					debug!("MPC did not take the latest holder commitment again: {e}");
+				}
+			}
+		}
 		let mut items = Vec::with_capacity(requests.len());
 		let mut expected = Vec::with_capacity(requests.len());
 		for req in &requests {

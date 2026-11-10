@@ -63,6 +63,25 @@ pub(crate) async fn handle_splice_out_request(
 			)
 		})?;
 
+	// With MPC-held channel keys the parties refuse a splice that pays our balance to an
+	// address they do not know as ours. Finding that out halfway leaves the splice pending,
+	// so ask first.
+	if let Some(mpc) = &context.mpc {
+		let (mpc, script) = (Arc::clone(mpc), address.script_pubkey());
+		let allowed = tokio::task::spawn_blocking(move || mpc.check_payout(&script))
+			.await
+			.unwrap_or_else(|e| Err(e.to_string()));
+		if let Err(reason) = allowed {
+			return Err(LdkServerError::new(
+				InvalidRequestError,
+				format!(
+					"The MPC parties do not allow splicing out to {address}: {reason}. \
+					 Add it to their payout allow-list (--payout-address) first."
+				),
+			));
+		}
+	}
+
 	context.node.splice_out(
 		&user_channel_id,
 		counterparty_node_id,

@@ -393,10 +393,31 @@ cd e2e-tests && cargo test --test mpc -- --test-threads=1   # regtest, downloads
 - **Policy scope.** The balance cap is a per-update delta, not a price-based rule, and off
   unless `--max-balance-decrease-sat` is set; HTLC accounting (which HTLCs may be settled)
   is not enforced. Counterparty revocation notices are recorded but not verified.
-- **Pinning is trust on first use.** The funding script and counterparty basepoints a party
-  checks holder commitments against are the ones in the first counterparty commitment it
-  signed for that funding. A splice's new funding is therefore trusted when first signed for,
-  and splice transactions themselves are signed without output checks.
+- **Pinning is trust on first use, once.** The funding script and counterparty basepoints a
+  party checks holder commitments against are the ones in the first counterparty commitment
+  it signed for the channel. That is the channel open, when the funds still come from the
+  host's wallet. Later funding outputs are not taken on trust (next point).
+- **Splices.** A party signs for a new funding output only if a splice transaction it saw
+  signed creates it. A party that was down for the splice is shown the splice transaction
+  with the parties' own signature on it, which exists only if a quorum agreed. What a splice
+  does to our balance shows in the first commitment on the new funding output: the parties
+  refuse it if our balance is less than in the last commitment the counterparty signed,
+  minus what the splice pays to allow-listed scripts, the fee the funding output pays, and
+  1,000 sat of slack. The counterparty does not sign a splice before it has that commitment,
+  so the refusal stops the splice. Consequences:
+  - Splicing out needs a payout allow-list on the parties (`--payout-xpub`,
+    `--payout-address`). LDK Server asks them before it starts a splice-out and turns it
+    down if they would refuse.
+  - A splice needs a commitment the counterparty signed. A channel that was opened towards
+    us and has never updated may have to see one payment first.
+  - A splice the parties refuse midway (only possible past the check above, that is with a
+    compromised host or parties whose allow-lists differ) stays pending in LDK and the
+    channel stops updating. The funds stay where they were. Getting the channel going
+    again has not been worked out; a force close is the fallback, and that path is
+    untested.
+  - Fee-bumping a pending splice has not been run with MPC.
+  - The check is as strong as the rest of the policy: without HTLC accounting, a compromised
+    host can still move our balance over Lightning.
 - **Outdated records.** A party that was down is told nothing on its return; it catches up
   on validated commitments from the proof in a release request, and on signed states the
   next time it takes part or is told of a signing. Until then requests that depend on its

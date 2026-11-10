@@ -272,6 +272,7 @@ fn remote(args: &Args) {
 						derivation: Derivation::None,
 						digest,
 						context: SigningContext { op: Some(SigningOp::Test), ..Default::default() },
+						splice: None,
 					}
 				})
 				.collect();

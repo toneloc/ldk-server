@@ -21,14 +21,15 @@ use std::time::{Duration, Instant};
 
 use e2e_tests::{
 	close_channel, find_available_port, mine_and_sync, mpc_ceremony_binary_path,
-	mpc_party_binary_path, run_cli, send_bolt11_payment, setup_funded_channel, wait_for_channels,
-	wait_for_force_close_claims, LdkServerHandle, TestBitcoind, TestConfigBuilder,
+	mpc_party_binary_path, run_cli, send_bolt11_payment, setup_funded_channel, splice_txid,
+	wait_for_channels, wait_for_force_close_claims, LdkServerHandle, TestBitcoind,
+	TestConfigBuilder,
 };
 use hex_conservative::FromHex;
 use ldk_node::bitcoin::consensus::encode::deserialize;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::Transaction;
-use ldk_server_client::ldk_server_grpc::api::GetBalancesRequest;
+use ldk_server_client::ldk_server_grpc::api::{GetBalancesRequest, SpliceOutRequest};
 use ldk_server_client::ldk_server_grpc::types::BalanceSource;
 
 const PARTIES: usize = 4;
@@ -47,6 +48,8 @@ struct MpcParties {
 	keys_dir: PathBuf,
 	/// BIP 84 account xpub of server A's on-chain wallet, allow-listed on every party.
 	payout_xpub: Option<String>,
+	/// An address allow-listed on one party only, as `(party, address)`.
+	rogue_payout: Option<(usize, String)>,
 }
 
 fn wait_for_port(addr: &str) {
@@ -91,6 +94,7 @@ impl MpcParties {
 			identities,
 			keys_dir,
 			payout_xpub: None,
+			rogue_payout: None,
 		};
 		// One party first: LDK Server only needs to reach a party at startup. The others
 		// start once the server has exported its wallet xpub (see `start_rest`), so every
@@ -114,6 +118,11 @@ impl MpcParties {
 			cmd.args(["--payout-xpub", xpub, "--payout-lookahead", "200"]);
 			// Pay-per-update cap generous enough for the test payments (10M msat max per hop).
 			cmd.args(["--max-balance-decrease-sat", "20000"]);
+		}
+		if let Some((party, address)) = &self.rogue_payout {
+			if *party == i {
+				cmd.args(["--payout-address", address]);
+			}
 		}
 		let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
 		let stderr = child.stderr.take().unwrap();
@@ -467,4 +476,88 @@ async fn test_mpc_channel_force_close() {
 	)
 	.await;
 	let _ = commitment_tx;
+}
+
+#[tokio::test]
+async fn test_mpc_splice() {
+	let bitcoind = TestBitcoind::new();
+	let mut parties = MpcParties::start();
+	let server_a = start_mpc_server(&bitcoind, &mut parties).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+
+	let user_channel_id = setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+	send_bolt11_payment(&server_a, &server_b, 10_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	let mut events = server_a.client().subscribe_events().await.unwrap();
+	let mut events_b = server_b.client().subscribe_events().await.unwrap();
+	let confirm = || async {
+		mine_and_sync(&bitcoind, &[&server_a, &server_b], 6).await;
+		tokio::time::sleep(Duration::from_secs(5)).await;
+	};
+
+	// We add funds: the parties sign the old funding output away and follow the channel to
+	// the new one, which holds a freshly generated distributed key.
+	run_cli(&server_a, &["splice-in", &user_channel_id, server_b.node_id(), "50000sat"]);
+	splice_txid(&mut events).await;
+	confirm().await;
+	for keystore in &parties.keystores {
+		assert_eq!(MpcParties::share_count(keystore), 6, "one more funding key");
+	}
+	send_bolt11_payment(&server_a, &server_b, 1_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// The counterparty adds funds: our balance does not change, so there is nothing to object to.
+	let channels_b = run_cli(&server_b, &["list-channels"]);
+	let user_channel_id_b = channels_b["channels"][0]["user_channel_id"].as_str().unwrap();
+	run_cli(&server_b, &["splice-in", user_channel_id_b, server_a.node_id(), "20000sat"]);
+	splice_txid(&mut events_b).await;
+	confirm().await;
+	send_bolt11_payment(&server_b, &server_a, 1_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// We take funds out to our own wallet, whose addresses the parties allow.
+	run_cli(&server_a, &["splice-out", &user_channel_id, server_b.node_id(), "10000sat"]);
+	splice_txid(&mut events).await;
+	confirm().await;
+	send_bolt11_payment(&server_a, &server_b, 1_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// A splice-out to an address the parties do not know as ours is turned down before it
+	// starts, and the channel carries on.
+	let foreign: String =
+		bitcoind.bitcoind.client.call("getnewaddress", &["".into(), "bech32".into()]).unwrap();
+	let splice_out_to_foreign = || async {
+		server_a
+			.client()
+			.splice_out(SpliceOutRequest {
+				user_channel_id: user_channel_id.clone(),
+				counterparty_node_id: server_b.node_id().to_string(),
+				address: Some(foreign.clone()),
+				splice_amount_sats: 10_000,
+			})
+			.await
+	};
+	let err = splice_out_to_foreign().await.unwrap_err();
+	assert!(err.to_string().contains("payout allow-list"), "{err}");
+	send_bolt11_payment(&server_a, &server_b, 1_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// Now what a compromised host would do, with one party on its side: that party has the
+	// address on its list, so the splice starts. The parties sign the splice transaction, but
+	// the other three refuse the first commitment on the new funding output, which would
+	// leave us 10,000 sat short. Without that commitment the counterparty never signs the
+	// splice, and nothing reaches the chain.
+	parties.rogue_payout = Some((0, foreign.clone()));
+	parties.kill(0);
+	parties.spawn(0);
+	let funding_before =
+		run_cli(&server_a, &["list-channels"])["channels"][0]["funding_txo"].clone();
+	splice_out_to_foreign().await.unwrap();
+	let negotiated = tokio::time::timeout(Duration::from_secs(8), splice_txid(&mut events)).await;
+	assert!(negotiated.is_err(), "a splice-out to a foreign address went through");
+	let mempool: Vec<String> = bitcoind.bitcoind.client.call("getrawmempool", &[]).unwrap();
+	assert!(mempool.is_empty(), "something was broadcast: {mempool:?}");
+	let funding_after =
+		run_cli(&server_a, &["list-channels"])["channels"][0]["funding_txo"].clone();
+	assert_eq!(funding_after, funding_before);
 }

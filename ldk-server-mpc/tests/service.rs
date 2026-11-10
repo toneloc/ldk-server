@@ -550,6 +550,7 @@ mod revocation {
 				derivation: Derivation::None,
 				digest: self.sighash(&tx),
 				context,
+				splice: None,
 			};
 			self.client
 				.sign_batch(&Secp256k1::new(), Some(self.id), vec![item], Some(&[self.funding]))
@@ -621,6 +622,7 @@ mod revocation {
 				derivation: Derivation::None,
 				digest: self.sighash(&tx),
 				context,
+				splice: None,
 			}
 		}
 
@@ -955,5 +957,177 @@ mod revocation {
 		assert_ne!(a, b);
 		// A third channel finds the pool empty.
 		assert!(ch.client.per_commitment_point(&[0xc3u8; 32], TOP).is_err());
+	}
+
+	/// A splice of the channel's funding output into `script`, and requests about it.
+	struct SpliceCase<'a> {
+		ch: &'a Channel,
+		key: PublicKey,
+		script: ScriptBuf,
+		tx: Transaction,
+	}
+
+	impl<'a> SpliceCase<'a> {
+		const NEW_VALUE: u64 = 150_000;
+
+		fn new(ch: &'a Channel) -> Self {
+			let key = ch.client.ensure_channel_key(&[0xf4; 32], &ch.id, KeyKind::SplicedFunding);
+			let key = key.unwrap();
+			// The counterparty's funding key changes with a splice as well.
+			let script = chan_utils::make_funding_redeemscript(&key, &ch.cp_payment);
+			let tx = Transaction {
+				version: Version::TWO,
+				lock_time: LockTime::ZERO,
+				input: vec![TxIn {
+					previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+					script_sig: ScriptBuf::new(),
+					sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+					witness: Witness::new(),
+				}],
+				output: vec![TxOut {
+					value: Amount::from_sat(Self::NEW_VALUE),
+					script_pubkey: script.to_p2wsh(),
+				}],
+			};
+			SpliceCase { ch, key, script, tx }
+		}
+
+		/// Our signature on the funding output the splice spends.
+		fn sign_splice(&self) -> Result<(), ClientError> {
+			let ch = self.ch;
+			let context = SigningContext {
+				op: Some(SigningOp::SpliceSharedInput),
+				channel_keys_id: Some([1u8; 32]),
+				transaction: Some(serialize(&self.tx)),
+				input_index: 0,
+				input_value_sat: VALUE,
+				witness_script: Some(ch.funding_script().to_bytes()),
+				sighash_type: 0x01,
+				..Default::default()
+			};
+			let item = SignItem {
+				key_id: [0xf1; 32],
+				derivation: Derivation::None,
+				digest: ch.sighash(&self.tx),
+				context,
+				splice: None,
+			};
+			ch.client
+				.sign_batch(&Secp256k1::new(), Some(ch.id), vec![item], Some(&[ch.funding]))
+				.map(|_| ())
+		}
+
+		/// The counterparty's commitment `number` on the new funding output.
+		fn sign_commitment(&self, number: u64) -> Result<(), ClientError> {
+			self.sign_commitment_via(&self.ch.client, number)
+		}
+
+		fn sign_commitment_via(&self, client: &MpcClient, number: u64) -> Result<(), ClientError> {
+			let ch = self.ch;
+			let features = ChannelTypeFeatures::only_static_remote_key();
+			let to_us = chan_utils::get_countersigner_payment_script(&features, &ch.payment);
+			let mut tx = ch.commitment_tx(
+				number,
+				vec![TxOut { value: Amount::from_sat(60_000), script_pubkey: to_us }],
+			);
+			tx.input[0].previous_output = OutPoint { txid: self.tx.compute_txid(), vout: 0 };
+			let mut counterparty_keys = ch.counterparty_keys();
+			counterparty_keys.funding_pubkey = ch.cp_payment.serialize();
+			let context = SigningContext {
+				op: Some(SigningOp::CounterpartyCommitment),
+				channel_keys_id: Some([1u8; 32]),
+				commitment_number: Some(number),
+				channel_type_features: Some(features.encode()),
+				counterparty_keys: Some(counterparty_keys),
+				holder_selected_contest_delay: Some(144),
+				counterparty_selected_contest_delay: Some(144),
+				transaction: Some(serialize(&tx)),
+				input_index: 0,
+				input_value_sat: Self::NEW_VALUE,
+				witness_script: Some(self.script.to_bytes()),
+				sighash_type: 0x01,
+				per_commitment_point: Some(ch.cp_payment.serialize()),
+				..Default::default()
+			};
+			let digest = sighash::SighashCache::new(&tx)
+				.p2wsh_signature_hash(
+					0,
+					&self.script,
+					Amount::from_sat(Self::NEW_VALUE),
+					EcdsaSighashType::All,
+				)
+				.unwrap()
+				.to_byte_array();
+			let item = SignItem {
+				key_id: [0xf4; 32],
+				derivation: Derivation::None,
+				digest,
+				context,
+				splice: None,
+			};
+			client
+				.sign_batch(&Secp256k1::new(), Some(ch.id), vec![item], Some(&[self.key]))
+				.map(|_| ())
+		}
+	}
+
+	#[test]
+	fn no_party_follows_a_channel_to_a_funding_output_without_a_splice() {
+		let ch = channel("nosplice", 1, 6);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.sign_counterparty_commitment(TOP - 1);
+		ch.validate(TOP - 1);
+		let splice = SpliceCase::new(&ch);
+		// A compromised host names a new funding output. Whichever party it asks, and
+		// whichever quorum that party tries, the answer is no.
+		let msg = denied(splice.sign_commitment(TOP - 1).unwrap_err());
+		assert!(msg.contains("no splice"), "{msg}");
+		for i in 0..4 {
+			let st = ch.cluster.party(i).policy().channel_state(&ch.id).unwrap();
+			assert_eq!(st.fundings.len(), 1, "party {i}");
+		}
+		// After the splice itself was signed, they do.
+		splice.sign_splice().unwrap();
+		splice.sign_commitment(TOP - 1).unwrap();
+	}
+
+	#[test]
+	fn a_party_that_missed_a_splice_is_shown_the_parties_signature() {
+		let mut ch = channel("splicelag", 1, 6);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.sign_counterparty_commitment(TOP - 1);
+		ch.validate(TOP - 1);
+		// Generating the new funding key needs every party; the splice does not.
+		let (key, script, tx) = {
+			let splice = SpliceCase::new(&ch);
+			(splice.key, splice.script.clone(), splice.tx.clone())
+		};
+		ch.cluster.down(3);
+		{
+			let splice = SpliceCase { ch: &ch, key, script: script.clone(), tx: tx.clone() };
+			splice.sign_splice().unwrap();
+			splice.sign_commitment(TOP - 1).unwrap();
+		}
+
+		// The party that was away comes back and another one leaves, so the next update needs
+		// it. It never saw the splice. Asked first, it refuses; the host moves on to the next
+		// party, which leads and shows it the splice transaction with the parties' own
+		// signature. Then it follows.
+		ch.cluster.up(3);
+		ch.cluster.down(1);
+		let fundings_known_to =
+			|i: usize| ch.cluster.party(i).policy().channel_state(&ch.id).unwrap().fundings.len();
+		// (The notice about the last signature may still reach it now that it is back, in
+		// which case it knows already and simply leads.)
+		let lagging_first = MpcClient::with_parties(vec![
+			ch.cluster.client_addrs[3],
+			ch.cluster.client_addrs[0],
+			ch.cluster.client_addrs[2],
+		]);
+		let splice = SpliceCase { ch: &ch, key, script, tx };
+		splice.sign_commitment_via(&lagging_first, TOP - 2).unwrap();
+		assert_eq!(fundings_known_to(3), 2);
+		// From here on it can lead as well.
+		splice.sign_commitment_via(&ch.cluster.client_of(3), TOP - 3).unwrap();
 	}
 }

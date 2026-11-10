@@ -276,6 +276,7 @@ fn main() {
 		std::process::exit(-1);
 	}
 
+	let mut mpc = None;
 	if let Some(mpc_config) = &config_file.mpc_config {
 		let mpc_signer = match crate::mpc_signer::MpcChannelSigner::new(mpc_config) {
 			Ok(signer) => signer,
@@ -292,7 +293,9 @@ fn main() {
 			"Channel keys are threshold MPC-backed via the parties at {:?} (coverage: {:?})",
 			mpc_config.party_addresses, mpc_config.coverage
 		);
-		builder.set_external_channel_signer(Arc::new(mpc_signer));
+		let mpc_signer = Arc::new(mpc_signer);
+		builder.set_external_channel_signer(Arc::clone(&mpc_signer) as _);
+		mpc = Some(mpc_signer);
 	}
 
 	if let Err(e) =
@@ -779,6 +782,7 @@ fn main() {
 						Ok((stream, _)) => {
 							let node_service = NodeService::new(
 								Arc::clone(&node),
+								mpc.clone(),
 								Arc::clone(&macaroon_store),
 								metrics.clone(),
 								metrics_auth_header.clone(),

@@ -23,7 +23,11 @@
 //!    optionally caps how much it may drop per update;
 //! 8. requires cooperative-close and sweep outputs to pay an allow-listed script (an xpub's
 //!    addresses or explicit scripts) and, for closes, to carry our last tracked balance minus a
-//!    bounded fee.
+//!    bounded fee;
+//! 9. follows a channel to a new funding output only through a splice transaction it saw being
+//!    signed (or that carries the parties' own signature), and refuses the splice's first
+//!    commitment if it leaves us with less than the counterparty last signed for, other than
+//!    what the splice pays to allow-listed scripts and a bounded fee.
 //!
 //! State is persisted per channel under the keystore directory.
 
@@ -43,7 +47,7 @@ use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::{All, Message, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::{
 	sighash, Address, Amount, CompressedPublicKey, EcdsaSighashType, Network, ScriptBuf,
-	Transaction,
+	Transaction, TxOut,
 };
 use hex_conservative::DisplayHex;
 use lightning::ln::chan_utils;
@@ -56,7 +60,7 @@ use lightning::util::ser::Readable;
 use crate::kit::{KitId, KitRecord, KitStore};
 use crate::protocol::{
 	ChannelId, CounterpartyKeys, Derivation, HolderProof, KeyId, KeyKind, Reader, SignItem,
-	SigningOp, Writer,
+	SigningOp, SpliceProof, Writer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +78,9 @@ fn deny<T>(msg: impl Into<String>) -> Result<T, PolicyError> {
 	Err(PolicyError(msg.into()))
 }
 
-/// Dust threshold below which a missing output is acceptable.
+/// Dust threshold below which a missing output is acceptable. Also the slack allowed when two
+/// commitments of the same state are compared (rounding, and fees that differ with the dust
+/// limits of the two sides).
 const DUST_SAT: u64 = 1_000;
 
 // ---------------------------------------------------------------------------
@@ -186,6 +192,9 @@ pub struct ChannelState {
 	/// (only the funding key does, on a splice).
 	pub counterparty_keys: Option<CounterpartyKeys>,
 	pub counterparty_selected_contest_delay: Option<u16>,
+	/// Splice transactions this party saw signed (or was shown the parties' signature on).
+	/// A new funding output is accepted only if one of them creates it.
+	pub splices: Vec<Splice>,
 }
 
 /// A funding output of a channel.
@@ -193,10 +202,65 @@ pub struct ChannelState {
 pub struct Funding {
 	pub witness_script: Vec<u8>,
 	pub value_sat: u64,
+	/// Our balance in the last commitment seen for this funding. While a splice is pending
+	/// there are commitments for both fundings, with different balances.
+	pub balance_sat: Option<u64>,
+	/// Our balance in the newest holder commitment for this funding that carried the
+	/// counterparty's signature. Unlike the balances taken from transactions LDK Server asks
+	/// us to sign, the host cannot make this one up. It is what a splice of this funding must
+	/// preserve.
+	pub validated_balance_sat: Option<u64>,
+	/// For a funding created by a splice: the least our balance may be in commitments with
+	/// the commitment number the splice was signed at.
+	pub floor: Option<SpliceFloor>,
+}
+
+impl Funding {
+	fn new(witness_script: Vec<u8>, value_sat: u64) -> Self {
+		Funding {
+			witness_script,
+			value_sat,
+			balance_sat: None,
+			validated_balance_sat: None,
+			floor: None,
+		}
+	}
+
+	fn is(&self, witness_script: &[u8], value_sat: u64) -> bool {
+		self.witness_script == witness_script && self.value_sat == value_sat
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpliceFloor {
+	pub commitment_number: u64,
+	pub min_balance_sat: u64,
+}
+
+/// A splice transaction of this channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Splice {
+	pub txid: [u8; 32],
+	/// Consensus-serialized, without witnesses.
+	pub transaction: Vec<u8>,
+	/// The input spending the funding output the splice replaces.
+	pub input_index: u32,
+	/// The parties' signature on that input, once known. With it another party can be shown
+	/// that a quorum agreed to this splice.
+	pub signature: Option<[u8; 64]>,
+	/// The newest counterparty commitment number when the splice was signed, and the least our
+	/// balance may be in the new funding's commitments with that number. `None` where this
+	/// party could not tell (it learned of the splice from the signature, or does not hold the
+	/// keys that locate our balance).
+	pub commitment_number: u64,
+	pub min_balance_sat: Option<u64>,
 }
 
 /// How many funding outputs to remember per channel (the original plus splices).
 const MAX_FUNDINGS: usize = 16;
+
+/// How many splice transactions to remember per channel (a splice and its fee bumps).
+const MAX_SPLICES: usize = 8;
 
 /// The two keys of a `2 <key> <key> 2 OP_CHECKMULTISIG` funding script.
 fn funding_script_keys(script: &[u8]) -> Option<(PublicKey, PublicKey)> {
@@ -226,7 +290,7 @@ fn same_basepoints(a: &CounterpartyKeys, b: &CounterpartyKeys) -> bool {
 impl ChannelState {
 	fn encode(&self) -> Vec<u8> {
 		let mut w = Writer::new();
-		w.u8(3); // version
+		w.u8(4); // version
 		w.u32(self.keys.len() as u32);
 		let mut keys: Vec<_> = self.keys.iter().collect();
 		keys.sort();
@@ -248,6 +312,10 @@ impl ChannelState {
 		for f in &self.fundings {
 			w.bytes(&f.witness_script);
 			w.u64(f.value_sat);
+			w.opt_u64(f.balance_sat);
+			w.opt_u64(f.validated_balance_sat);
+			w.opt_u64(f.floor.map(|f| f.commitment_number));
+			w.opt_u64(f.floor.map(|f| f.min_balance_sat));
 		}
 		match &self.counterparty_keys {
 			Some(k) => {
@@ -261,6 +329,21 @@ impl ChannelState {
 			None => w.u8(0),
 		}
 		w.opt_u16(self.counterparty_selected_contest_delay);
+		w.u32(self.splices.len() as u32);
+		for splice in &self.splices {
+			w.fixed(&splice.txid);
+			w.bytes(&splice.transaction);
+			w.u32(splice.input_index);
+			match &splice.signature {
+				Some(sig) => {
+					w.u8(1);
+					w.fixed(sig);
+				},
+				None => w.u8(0),
+			}
+			w.u64(splice.commitment_number);
+			w.opt_u64(splice.min_balance_sat);
+		}
 		w.0
 	}
 
@@ -269,7 +352,7 @@ impl ChannelState {
 		let mut st = ChannelState::default();
 		(|| -> Result<(), crate::protocol::DecodeError> {
 			let version = r.u8()?;
-			if !(1..=3).contains(&version) {
+			if !(1..=4).contains(&version) {
 				return Err(crate::protocol::DecodeError("unknown policy state version"));
 			}
 			let n = r.u32()?;
@@ -292,7 +375,18 @@ impl ChannelState {
 			if version >= 3 {
 				let n = r.u32()?;
 				for _ in 0..n {
-					st.fundings.push(Funding { witness_script: r.bytes()?, value_sat: r.u64()? });
+					let mut funding = Funding::new(r.bytes()?, r.u64()?);
+					if version >= 4 {
+						funding.balance_sat = r.opt_u64()?;
+						funding.validated_balance_sat = r.opt_u64()?;
+						funding.floor = match (r.opt_u64()?, r.opt_u64()?) {
+							(Some(commitment_number), Some(min_balance_sat)) => {
+								Some(SpliceFloor { commitment_number, min_balance_sat })
+							},
+							_ => None,
+						};
+					}
+					st.fundings.push(funding);
 				}
 				if r.u8()? == 1 {
 					st.counterparty_keys = Some(CounterpartyKeys {
@@ -304,6 +398,30 @@ impl ChannelState {
 					});
 				}
 				st.counterparty_selected_contest_delay = r.opt_u16()?;
+			}
+			if version >= 4 {
+				let n = r.u32()?;
+				for _ in 0..n {
+					let txid = r.fixed32()?;
+					let transaction = r.bytes()?;
+					let input_index = r.u32()?;
+					let signature = if r.u8()? == 1 {
+						let mut sig = [0u8; 64];
+						sig[..32].copy_from_slice(&r.fixed32()?);
+						sig[32..].copy_from_slice(&r.fixed32()?);
+						Some(sig)
+					} else {
+						None
+					};
+					st.splices.push(Splice {
+						txid,
+						transaction,
+						input_index,
+						signature,
+						commitment_number: r.u64()?,
+						min_balance_sat: r.opt_u64()?,
+					});
+				}
 			}
 			Ok(())
 		})()
@@ -342,8 +460,13 @@ impl ChannelState {
 		if self.kit_id.is_none() {
 			self.kit_id = newer.kit_id;
 		}
+		// Balances of known fundings are not merged here: `newer` may be a copy that predates
+		// the latest one. Whoever changed a balance applies it itself (see `Authorized`).
 		for f in &newer.fundings {
 			self.pin_funding(f.clone());
+		}
+		for splice in &newer.splices {
+			self.add_splice(splice.clone());
 		}
 		if self.counterparty_keys.is_none() {
 			self.counterparty_keys = newer.counterparty_keys.clone();
@@ -353,12 +476,36 @@ impl ChannelState {
 		}
 	}
 
-	fn pin_funding(&mut self, funding: Funding) {
-		if !self.fundings.contains(&funding) {
-			if self.fundings.len() == MAX_FUNDINGS {
-				self.fundings.remove(0);
-			}
-			self.fundings.push(funding);
+	/// Remembers `funding` unless it is known already. Returns its position.
+	fn pin_funding(&mut self, funding: Funding) -> usize {
+		if let Some(i) = self.funding_position(&funding.witness_script, funding.value_sat) {
+			return i;
+		}
+		if self.fundings.len() == MAX_FUNDINGS {
+			self.fundings.remove(0);
+		}
+		self.fundings.push(funding);
+		self.fundings.len() - 1
+	}
+
+	fn funding_position(&self, witness_script: &[u8], value_sat: u64) -> Option<usize> {
+		self.fundings.iter().position(|f| f.is(witness_script, value_sat))
+	}
+
+	/// Remembers `splice`, or completes what is known of it with the signature.
+	fn add_splice(&mut self, splice: Splice) {
+		match self.splices.iter_mut().find(|s| s.txid == splice.txid) {
+			Some(known) => {
+				if known.signature.is_none() {
+					known.signature = splice.signature;
+				}
+			},
+			None => {
+				if self.splices.len() == MAX_SPLICES {
+					self.splices.remove(0);
+				}
+				self.splices.push(splice);
+			},
 		}
 	}
 
@@ -411,6 +558,9 @@ pub trait KeyLookup {
 pub struct Authorized {
 	channel: Option<ChannelId>,
 	state: Option<ChannelState>,
+	/// The funding (witness script and value) whose balance this authorization moved, and
+	/// the new balance.
+	balance: Option<(Vec<u8>, u64, u64)>,
 }
 
 impl ChannelPolicy {
@@ -604,17 +754,22 @@ impl ChannelPolicy {
 				return deny(format!("holder commitment {number} is older than validated {v}"));
 			}
 		}
-		if number != crate::kit::INITIAL_COMMITMENT_NUMBER {
+		// The first commitment arrives before this party has signed anything for an inbound
+		// channel, so there may be nothing to check it against yet.
+		let first = number == crate::kit::INITIAL_COMMITMENT_NUMBER;
+		if !first || (proof.is_some() && !st.fundings.is_empty()) {
 			let proof = proof.ok_or_else(|| {
 				PolicyError(format!(
 					"holder commitment {number} needs the counterparty's signature"
 				))
 			})?;
-			let tx = self.verify_holder_proof(&st, keys, number, proof)?;
+			let (tx, funding) = self.verify_holder_proof(&st, keys, number, proof)?;
 			if let Some(balance) =
 				self.holder_balance_in_validated_commitment(channel, &st, keys, &tx, number)?
 			{
-				self.check_balance_decrease(&st, balance)?;
+				self.check_balance_decrease(st.fundings[funding].balance_sat, balance)?;
+				st.fundings[funding].balance_sat = Some(balance);
+				st.fundings[funding].validated_balance_sat = Some(balance);
 				st.last_holder_balance_sat = Some(balance);
 				st.last_holder_balance_commitment = Some(number);
 			}
@@ -628,7 +783,7 @@ impl ChannelPolicy {
 	/// one of our funding keys, and its locktime and sequence must encode `number`.
 	fn verify_holder_proof(
 		&self, st: &ChannelState, keys: &dyn KeyLookup, number: u64, proof: &HolderProof,
-	) -> Result<Transaction, PolicyError> {
+	) -> Result<(Transaction, usize), PolicyError> {
 		let tx: Transaction = deserialize(&proof.transaction)
 			.map_err(|e| PolicyError(format!("bad holder commitment transaction: {e}")))?;
 		if tx.input.len() != 1 {
@@ -636,13 +791,8 @@ impl ChannelPolicy {
 		}
 		let sig = Signature::from_compact(&proof.counterparty_sig)
 			.map_err(|e| PolicyError(format!("bad counterparty signature: {e}")))?;
-		let mut ours: Vec<PublicKey> = Vec::new();
-		for id in st.key(KeyKind::Funding).into_iter().chain(st.spliced_funding_keys.iter()) {
-			if let Some(pk) = keys.public_key(id) {
-				ours.push(pk);
-			}
-		}
-		let signed = st.fundings.iter().any(|funding| {
+		let ours = Self::our_funding_keys(st, keys);
+		let signed = st.fundings.iter().position(|funding| {
 			let Some((a, b)) = funding_script_keys(&funding.witness_script) else { return false };
 			let theirs = match (ours.contains(&a), ours.contains(&b)) {
 				(true, false) => b,
@@ -662,9 +812,9 @@ impl ChannelPolicy {
 				})
 				.unwrap_or(false)
 		});
-		if !signed {
+		let Some(funding) = signed else {
 			return deny("holder commitment is not signed by the counterparty for a known funding");
-		}
+		};
 
 		// BOLT 3 hides the commitment number in the locktime and sequence, XORed with a value
 		// derived from both payment basepoints. Check it against both possible channel openers.
@@ -691,7 +841,7 @@ impl ChannelPolicy {
 		if !matches {
 			return deny(format!("transaction is not holder commitment {number}"));
 		}
-		Ok(tx)
+		Ok((tx, funding))
 	}
 
 	/// Our `to_local` balance in a validated holder commitment, from pinned parameters.
@@ -768,7 +918,7 @@ impl ChannelPolicy {
 			if item.derivation != Derivation::None {
 				return deny("derivation requires a channel");
 			}
-			return Ok(Authorized { channel: None, state: None });
+			return Ok(Authorized { channel: None, state: None, balance: None });
 		};
 		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
 
@@ -803,7 +953,8 @@ impl ChannelPolicy {
 			},
 		};
 
-		// 4–7. Operation-specific checks.
+		// 4–9. Operation-specific checks.
+		let mut balance_moved = None;
 		match op {
 			SigningOp::CounterpartyCommitment | SigningOp::CounterpartyCommitmentHtlc => {
 				let number = ctx
@@ -817,12 +968,14 @@ impl ChannelPolicy {
 					}
 				}
 				if op == SigningOp::CounterpartyCommitment {
-					self.pin_channel_parameters(&mut st, &base_pubkey, item)?;
 					let tx = tx.as_ref().unwrap();
+					let funding = self.pin_channel_parameters(&mut st, &base_pubkey, item, tx)?;
 					if let Some(balance) =
 						self.holder_balance_in_counterparty_commitment(&st, keys, tx, item)?
 					{
-						self.check_balance_decrease(&st, balance)?;
+						Self::check_splice_floor(&st.fundings[funding], number, balance)?;
+						self.check_balance_decrease(st.fundings[funding].balance_sat, balance)?;
+						balance_moved = Some(Self::set_balance(&mut st, funding, balance));
 						st.last_holder_balance_sat = Some(balance);
 						st.last_holder_balance_commitment = Some(number);
 					}
@@ -840,25 +993,40 @@ impl ChannelPolicy {
 						));
 					}
 				}
+				let funding = Self::spent_funding(&st, ctx)?;
 				let tx = tx.as_ref().unwrap();
 				if let Some(balance) =
 					self.holder_balance_in_holder_commitment(channel, &st, keys, tx, item, number)?
 				{
-					self.check_balance_decrease(&st, balance)?;
+					let last = match funding {
+						Some(funding) => st.fundings[funding].balance_sat,
+						None => st.last_holder_balance_sat,
+					};
+					self.check_balance_decrease(last, balance)?;
+					if let Some(funding) = funding {
+						balance_moved = Some(Self::set_balance(&mut st, funding, balance));
+					}
 					st.last_holder_balance_sat = Some(balance);
 					st.last_holder_balance_commitment = Some(number);
 				}
 			},
 			SigningOp::ClosingTransaction => {
+				let funding = Self::spent_funding(&st, ctx)?;
 				let tx = tx.as_ref().unwrap();
-				self.check_closing(&st, tx, ctx.holder_balance_sat)?;
+				let tracked = funding
+					.and_then(|funding| st.fundings[funding].balance_sat)
+					.or(st.last_holder_balance_sat);
+				self.check_closing(tracked, tx, ctx.holder_balance_sat)?;
 			},
 			SigningOp::SweepStaticPayment | SigningOp::SweepDelayedPayment => {
 				let tx = tx.as_ref().unwrap();
 				self.check_sweep_outputs(tx)?;
 			},
+			SigningOp::SpliceSharedInput => {
+				let tx = tx.as_ref().unwrap();
+				self.check_splice(&mut st, tx, ctx)?;
+			},
 			SigningOp::HolderKeyedAnchorInput
-			| SigningOp::SpliceSharedInput
 			| SigningOp::ChannelAnnouncement
 			| SigningOp::JusticeRevokedOutput
 			| SigningOp::JusticeRevokedHtlc
@@ -867,15 +1035,228 @@ impl ChannelPolicy {
 			SigningOp::Test | SigningOp::Unknown => return deny("unsupported operation"),
 		}
 
-		Ok(Authorized { channel: Some(*channel), state: Some(st) })
+		Ok(Authorized { channel: Some(*channel), state: Some(st), balance: balance_moved })
+	}
+
+	fn set_balance(st: &mut ChannelState, funding: usize, balance: u64) -> (Vec<u8>, u64, u64) {
+		let funding = &mut st.fundings[funding];
+		funding.balance_sat = Some(balance);
+		(funding.witness_script.clone(), funding.value_sat, balance)
+	}
+
+	/// The funding output a commitment, closing or splice transaction spends, which must be
+	/// one this party knows. `None` only for a channel with no funding recorded yet (state
+	/// written by an earlier version).
+	fn spent_funding(
+		st: &ChannelState, ctx: &crate::protocol::SigningContext,
+	) -> Result<Option<usize>, PolicyError> {
+		if st.fundings.is_empty() {
+			return Ok(None);
+		}
+		let script = ctx
+			.witness_script
+			.as_ref()
+			.ok_or_else(|| PolicyError("missing witness script".into()))?;
+		match st.funding_position(script, ctx.input_value_sat) {
+			Some(funding) => Ok(Some(funding)),
+			None => deny("transaction does not spend a funding output of this channel"),
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Splices
+	// -----------------------------------------------------------------------
+
+	/// Checks a splice transaction before our signature on the funding output it spends, and
+	/// remembers it: its outputs are the only new funding outputs this party will follow the
+	/// channel to.
+	///
+	/// What the splice does to our balance is not visible here. The transaction does not say
+	/// which of its outputs and other inputs are ours and which the counterparty's, and the
+	/// new funding script is not known yet. So this records the least our balance may be
+	/// afterwards, and the check itself happens when the first commitment for the new funding
+	/// is signed ([`Self::check_splice_floor`]). The counterparty does not sign the splice
+	/// before it has that commitment signature, so refusing it there stops the splice.
+	fn check_splice(
+		&self, st: &mut ChannelState, tx: &Transaction, ctx: &crate::protocol::SigningContext,
+	) -> Result<(), PolicyError> {
+		let Some(spent) = Self::spent_funding(st, ctx)? else {
+			return deny("no funding output recorded for this channel yet");
+		};
+		let spent = &st.fundings[spent];
+		if !tx.output.iter().any(|o| o.script_pubkey.is_p2wsh()) {
+			return deny("splice transaction has no output that could fund the channel");
+		}
+		// Without the keys that locate our balance in a commitment (funding-only coverage)
+		// there is nothing to compare.
+		let tracks_balance =
+			st.key(KeyKind::Payment).is_some() && st.key(KeyKind::DelayedPayment).is_some();
+		let min_balance_sat = if tracks_balance {
+			let before = spent.validated_balance_sat.ok_or_else(|| {
+				PolicyError(
+					"cannot splice yet: no commitment with the counterparty's signature seen"
+						.into(),
+				)
+			})?;
+			let outputs: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+			let paid_out: u64 = match &self.config.payout {
+				Some(allow) => tx
+					.output
+					.iter()
+					.filter(|o| allow.contains(&o.script_pubkey))
+					.map(|o| o.value.to_sat())
+					.sum(),
+				None => 0,
+			};
+			// What the funding output loses to the miners. With no other inputs this is the
+			// whole fee; with other inputs it is the least the fee can be, and whoever added
+			// them pays the rest.
+			let fee = spent.value_sat.saturating_sub(outputs);
+			Some(before.saturating_sub(paid_out).saturating_sub(fee).saturating_sub(DUST_SAT))
+		} else {
+			None
+		};
+		let mut unsigned = tx.clone();
+		for input in &mut unsigned.input {
+			input.witness.clear();
+		}
+		st.add_splice(Splice {
+			txid: tx.compute_txid().to_byte_array(),
+			transaction: bitcoin::consensus::encode::serialize(&unsigned),
+			input_index: ctx.input_index,
+			signature: None,
+			commitment_number: st
+				.last_counterparty_commitment
+				.unwrap_or(crate::kit::INITIAL_COMMITMENT_NUMBER),
+			min_balance_sat,
+		});
+		Ok(())
+	}
+
+	/// The splice's first commitment must leave us at least what [`Self::check_splice`] worked
+	/// out. Later commitments are ordinary channel updates.
+	fn check_splice_floor(funding: &Funding, number: u64, balance: u64) -> Result<(), PolicyError> {
+		match funding.floor {
+			Some(floor) if number >= floor.commitment_number && balance < floor.min_balance_sat => {
+				deny(format!(
+					"splice would leave us {balance} sat, less than the {} sat it must: it pays \
+					 our balance to a script that is not allow-listed (or a fee out of proportion)",
+					floor.min_balance_sat
+				))
+			},
+			_ => Ok(()),
+		}
+	}
+
+	/// Records the parties' signature on a splice transaction this party authorized, so it can
+	/// later show other parties that the splice was agreed.
+	pub fn splice_signed(
+		&self, channel: &ChannelId, item: &SignItem, signature: &Signature,
+	) -> Result<(), PolicyError> {
+		let Some(bytes) = &item.context.transaction else { return Ok(()) };
+		let tx: Transaction =
+			deserialize(bytes).map_err(|e| PolicyError(format!("bad transaction: {e}")))?;
+		let txid = tx.compute_txid().to_byte_array();
+		let lock = self.lock(channel);
+		let _guard = lock.lock().unwrap();
+		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
+		match st.splices.iter_mut().find(|s| s.txid == txid) {
+			Some(splice) if splice.signature.is_none() => {
+				splice.signature = Some(signature.serialize_compact());
+			},
+			_ => return Ok(()),
+		}
+		self.store(channel, st).map_err(|e| PolicyError(e.to_string()))
+	}
+
+	/// The proof to send along with a commitment for a funding output created by a splice.
+	pub fn splice_proof_for(&self, channel: &ChannelId, item: &SignItem) -> Option<SpliceProof> {
+		if item.context.op != Some(SigningOp::CounterpartyCommitment) {
+			return None;
+		}
+		let tx: Transaction = deserialize(item.context.transaction.as_ref()?).ok()?;
+		let parent = tx.input.first()?.previous_output.txid.to_byte_array();
+		let st = self.load(channel).ok()?;
+		let splice = st.splices.iter().find(|s| s.txid == parent)?;
+		Some(SpliceProof {
+			transaction: splice.transaction.clone(),
+			input_index: splice.input_index,
+			signature: splice.signature?,
+		})
+	}
+
+	/// Takes note of a splice this party did not see being signed (it was down, or outside the
+	/// quorum and the notice got lost). The proof is the splice transaction with the parties'
+	/// own signature on the funding output it spends: that signature exists only if a quorum
+	/// agreed to the splice, each party by its own policy.
+	pub fn learn_splice(
+		&self, channel: &ChannelId, proof: &SpliceProof, keys: &dyn KeyLookup,
+	) -> Result<(), PolicyError> {
+		let tx: Transaction = deserialize(&proof.transaction)
+			.map_err(|e| PolicyError(format!("bad splice transaction: {e}")))?;
+		let txid = tx.compute_txid().to_byte_array();
+		let lock = self.lock(channel);
+		let _guard = lock.lock().unwrap();
+		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
+		if st.splices.iter().any(|s| s.txid == txid && s.signature.is_some()) {
+			return Ok(());
+		}
+		let sig = Signature::from_compact(&proof.signature)
+			.map_err(|e| PolicyError(format!("bad splice signature: {e}")))?;
+		let ours = Self::our_funding_keys(&st, keys);
+		let signed = st.fundings.iter().any(|funding| {
+			let Some((a, b)) = funding_script_keys(&funding.witness_script) else { return false };
+			let key = match (ours.contains(&a), ours.contains(&b)) {
+				(true, false) => a,
+				(false, true) => b,
+				_ => return false,
+			};
+			sighash::SighashCache::new(&tx)
+				.p2wsh_signature_hash(
+					proof.input_index as usize,
+					&ScriptBuf::from_bytes(funding.witness_script.clone()),
+					Amount::from_sat(funding.value_sat),
+					EcdsaSighashType::All,
+				)
+				.map(|h| {
+					let msg = Message::from_digest(h.to_byte_array());
+					self.secp.verify_ecdsa(&msg, &sig, &key).is_ok()
+				})
+				.unwrap_or(false)
+		});
+		if !signed {
+			return deny("splice transaction is not signed by the parties for a known funding");
+		}
+		let commitment_number =
+			st.last_counterparty_commitment.unwrap_or(crate::kit::INITIAL_COMMITMENT_NUMBER);
+		st.add_splice(Splice {
+			txid,
+			transaction: proof.transaction.clone(),
+			input_index: proof.input_index,
+			signature: Some(proof.signature),
+			commitment_number,
+			min_balance_sat: None,
+		});
+		self.store(channel, st).map_err(|e| PolicyError(e.to_string()))
+	}
+
+	fn our_funding_keys(st: &ChannelState, keys: &dyn KeyLookup) -> Vec<PublicKey> {
+		st.key(KeyKind::Funding)
+			.into_iter()
+			.chain(st.spliced_funding_keys.iter())
+			.filter_map(|id| keys.public_key(id))
+			.collect()
 	}
 
 	/// Pins what a counterparty commitment signature tells us about the channel: the funding
 	/// script and value it spends, the counterparty's basepoints and the delay on our outputs.
-	/// The first signature for a channel sets them; later ones must agree on the basepoints.
+	/// The first signature for a channel sets them; later ones must agree on the basepoints,
+	/// and may only move to a funding output that a known splice transaction creates. Returns
+	/// the position of the funding the commitment spends.
 	fn pin_channel_parameters(
 		&self, st: &mut ChannelState, our_funding_key: &PublicKey, item: &SignItem,
-	) -> Result<(), PolicyError> {
+		tx: &Transaction,
+	) -> Result<usize, PolicyError> {
 		let ctx = &item.context;
 		let script = ctx
 			.witness_script
@@ -905,8 +1286,41 @@ impl ChannelPolicy {
 				None => st.counterparty_selected_contest_delay = Some(delay),
 			}
 		}
-		st.pin_funding(Funding { witness_script: script.clone(), value_sat: ctx.input_value_sat });
-		Ok(())
+		if let Some(funding) = st.funding_position(script, ctx.input_value_sat) {
+			return Ok(funding);
+		}
+		let mut funding = Funding::new(script.clone(), ctx.input_value_sat);
+		if !st.fundings.is_empty() {
+			// Not the channel's first funding: a splice must have created it.
+			let spent = match tx.input.as_slice() {
+				[input] => input.previous_output,
+				_ => return deny("a commitment transaction has exactly one input"),
+			};
+			let output = TxOut {
+				value: Amount::from_sat(ctx.input_value_sat),
+				script_pubkey: ScriptBuf::from_bytes(script.clone()).to_p2wsh(),
+			};
+			let splice = st
+				.splices
+				.iter()
+				.find(|splice| {
+					splice.txid == spent.txid.to_byte_array()
+						&& deserialize::<Transaction>(&splice.transaction)
+							.map(|tx| tx.output.get(spent.vout as usize) == Some(&output))
+							.unwrap_or(false)
+				})
+				.ok_or_else(|| {
+					PolicyError(
+						"commitment spends a funding output this party has seen no splice into"
+							.into(),
+					)
+				})?;
+			funding.floor = splice.min_balance_sat.map(|min_balance_sat| SpliceFloor {
+				commitment_number: splice.commitment_number,
+				min_balance_sat,
+			});
+		}
+		Ok(st.pin_funding(funding))
 	}
 
 	/// Persists the state changes of a successful authorization.
@@ -916,6 +1330,11 @@ impl ChannelPolicy {
 			let _guard = lock.lock().unwrap();
 			let mut current = self.load(&channel).map_err(|e| PolicyError(e.to_string()))?;
 			current.merge(&st);
+			if let Some((script, value, balance)) = auth.balance {
+				if let Some(funding) = current.funding_position(&script, value) {
+					current.fundings[funding].balance_sat = Some(balance);
+				}
+			}
 			self.store(&channel, current).map_err(|e| PolicyError(e.to_string()))?;
 		}
 		Ok(())
@@ -1049,10 +1468,9 @@ impl ChannelPolicy {
 	}
 
 	fn check_balance_decrease(
-		&self, st: &ChannelState, new_balance: u64,
+		&self, last_balance: Option<u64>, new_balance: u64,
 	) -> Result<(), PolicyError> {
-		if let (Some(max), Some(last)) =
-			(self.config.max_holder_balance_decrease_sat, st.last_holder_balance_sat)
+		if let (Some(max), Some(last)) = (self.config.max_holder_balance_decrease_sat, last_balance)
 		{
 			if new_balance + max < last {
 				return deny(format!("holder balance would drop from {last} to {new_balance} sat (max decrease {max})"));
@@ -1062,10 +1480,10 @@ impl ChannelPolicy {
 	}
 
 	fn check_closing(
-		&self, st: &ChannelState, tx: &Transaction, claimed: Option<u64>,
+		&self, tracked: Option<u64>, tx: &Transaction, claimed: Option<u64>,
 	) -> Result<(), PolicyError> {
 		let Some(allow) = &self.config.payout else { return Ok(()) };
-		let expected = st.last_holder_balance_sat.or(claimed).unwrap_or(0);
+		let expected = tracked.or(claimed).unwrap_or(0);
 		if expected <= DUST_SAT {
 			return Ok(());
 		}
@@ -1357,6 +1775,7 @@ mod tests {
 			derivation: Derivation::None,
 			digest: digest(&tx, &redeem, 100_000, EcdsaSighashType::All),
 			context: ctx,
+			splice: None,
 		}
 	}
 
@@ -1368,6 +1787,7 @@ mod tests {
 			derivation: Derivation::None,
 			digest: [1u8; 32],
 			context: SigningContext { op: Some(SigningOp::Test), ..Default::default() },
+			splice: None,
 		};
 		assert!(f.policy.authorize(None, &item, &f.keys).is_ok());
 		let bad = SignItem {
@@ -1462,6 +1882,7 @@ mod tests {
 			derivation: Derivation::Additive { tweak },
 			digest: digest(&tx, &script, 1_000, EcdsaSighashType::All),
 			context: ctx,
+			splice: None,
 		};
 		assert!(f.policy.authorize(Some(&f.channel), &item, &f.keys).is_ok());
 		let mut wrong = tweak;
@@ -1499,6 +1920,7 @@ mod tests {
 			derivation: Derivation::MulAdd { mul, add },
 			digest: digest(&tx, &script, 1_000, EcdsaSighashType::All),
 			context: ctx,
+			splice: None,
 		};
 		assert!(f.policy.authorize(Some(&f.channel), &item, &f.keys).is_ok());
 		let mut bad_add = add;
@@ -1655,8 +2077,9 @@ mod tests {
 		let mut st = ChannelState { validated_holder_commitment: Some(7), ..Default::default() };
 		let mut v1 = st.encode();
 		v1[0] = 1;
-		// Version 1 had no kit field (1 byte) and no pinned parameters (4 + 1 + 1 bytes).
-		v1.truncate(v1.len() - 7);
+		// Version 1 had no kit field (1 byte), no pinned parameters (4 + 1 + 1 bytes) and no
+		// splices (4 bytes).
+		v1.truncate(v1.len() - 11);
 		assert_eq!(ChannelState::decode(&v1).unwrap(), st);
 		st.kit_id = Some(KIT);
 		assert_eq!(ChannelState::decode(&st.encode()).unwrap(), st);
@@ -1687,13 +2110,14 @@ mod tests {
 					script_pubkey: ScriptBuf::new_op_return([2u8]),
 				},
 			]);
-			let redeem = ScriptBuf::from_bytes(vec![0x52; 71]);
+			let redeem = funding_script(&f);
 			let ctx = base_context(&f, SigningOp::ClosingTransaction, &tx, &redeem, 100_000);
 			SignItem {
 				key_id: f.funding,
 				derivation: Derivation::None,
 				digest: digest(&tx, &redeem, 100_000, EcdsaSighashType::All),
 				context: ctx,
+				splice: None,
 			}
 		};
 		assert!(f
@@ -1710,6 +2134,13 @@ mod tests {
 			.policy
 			.authorize(Some(&f.channel), &closing(elsewhere, 60_000), &f.keys)
 			.is_err());
+		// The funding key signs closes of this channel's funding output only.
+		let mut other = closing(ok_script, 59_000);
+		other.context.input_value_sat = 90_000;
+		let tx: Transaction = deserialize(other.context.transaction.as_ref().unwrap()).unwrap();
+		other.digest = digest(&tx, &funding_script(&f), 90_000, EcdsaSighashType::All);
+		let err = f.policy.authorize(Some(&f.channel), &other, &f.keys).unwrap_err();
+		assert!(err.0.contains("does not spend a funding output"), "{err}");
 	}
 
 	#[test]
@@ -1745,6 +2176,7 @@ mod tests {
 				derivation: Derivation::None,
 				digest: digest(&tx, &witness_script, 10_000, EcdsaSighashType::All),
 				context: ctx,
+				splice: None,
 			}
 		};
 		assert!(f.policy.authorize(Some(&f.channel), &sweep(ok_script), &f.keys).is_ok());
@@ -1752,5 +2184,251 @@ mod tests {
 			.policy
 			.authorize(Some(&f.channel), &sweep(ScriptBuf::new_op_return([1u8])), &f.keys)
 			.is_err());
+	}
+
+	// --- splices ---
+
+	const SPLICE_KEY: u8 = 6;
+
+	/// Registers a spliced funding key and returns the new 2-of-2 funding script.
+	fn spliced_funding(f: &mut Fixture) -> (KeyId, ScriptBuf) {
+		let key = f.keys.add(SPLICE_KEY);
+		f.policy.register_key(&f.channel, KeyKind::SplicedFunding, &key).unwrap();
+		let script = chan_utils::make_funding_redeemscript(
+			&f.keys.public_key(&key).unwrap(),
+			&cp_payment_pk(), // the counterparty's funding key changes with a splice too
+		);
+		(key, script)
+	}
+
+	/// A splice of the fixture's 100k funding into `new_value`, with `extra` outputs.
+	fn splice_tx(new_script: &ScriptBuf, new_value: u64, extra: Vec<TxOut>) -> Transaction {
+		let mut outputs = vec![TxOut {
+			value: Amount::from_sat(new_value),
+			script_pubkey: new_script.to_p2wsh(),
+		}];
+		outputs.extend(extra);
+		tx_with_outputs(outputs)
+	}
+
+	fn splice_item(f: &Fixture, tx: &Transaction) -> SignItem {
+		let redeem = funding_script(f);
+		let ctx = base_context(f, SigningOp::SpliceSharedInput, tx, &redeem, 100_000);
+		SignItem {
+			key_id: f.funding,
+			derivation: Derivation::None,
+			digest: digest(tx, &redeem, 100_000, EcdsaSighashType::All),
+			context: ctx,
+			splice: None,
+		}
+	}
+
+	/// The counterparty's commitment `number` on the funding output `vout` of `parent`.
+	#[allow(clippy::too_many_arguments)]
+	fn spliced_commitment(
+		f: &Fixture, key: KeyId, script: &ScriptBuf, value: u64, parent: &Transaction, vout: u32,
+		number: u64, ours: u64,
+	) -> SignItem {
+		let payment_point = f.keys.public_key(&f.payment).unwrap();
+		let to_us = chan_utils::get_countersigner_payment_script(&features(), &payment_point);
+		let mut tx =
+			tx_with_outputs(vec![TxOut { value: Amount::from_sat(ours), script_pubkey: to_us }]);
+		tx.input[0].previous_output = OutPoint { txid: parent.compute_txid(), vout };
+		let mut ctx = base_context(f, SigningOp::CounterpartyCommitment, &tx, script, value);
+		ctx.commitment_number = Some(number);
+		ctx.per_commitment_point = Some([2u8; 33]);
+		ctx.counterparty_keys.as_mut().unwrap().funding_pubkey = cp_payment_pk().serialize();
+		SignItem {
+			key_id: key,
+			derivation: Derivation::None,
+			digest: digest(&tx, script, value, EcdsaSighashType::All),
+			context: ctx,
+			splice: None,
+		}
+	}
+
+	fn allow(f: &Fixture, item: &SignItem) -> Result<(), PolicyError> {
+		f.policy.authorize(Some(&f.channel), item, &f.keys).and_then(|a| f.policy.commit(a))
+	}
+
+	fn elsewhere() -> TxOut {
+		TxOut { value: Amount::from_sat(30_000), script_pubkey: ScriptBuf::new_op_return([9u8]) }
+	}
+
+	#[test]
+	fn a_channel_moves_only_to_a_funding_output_a_signed_splice_creates() {
+		let mut f = fixture(PolicyConfig::default());
+		validate(&f, START - 1).unwrap(); // counterparty commitment 100, our balance 60k
+		let (key, script) = spliced_funding(&mut f);
+		let splice = splice_tx(&script, 150_000, vec![]);
+		let first = spliced_commitment(&f, key, &script, 150_000, &splice, 0, 100, 60_000);
+
+		// The host cannot simply declare a new funding output.
+		let err = allow(&f, &first).unwrap_err();
+		assert!(err.0.contains("no splice"), "{err}");
+
+		allow(&f, &splice_item(&f, &splice)).unwrap();
+		// Not another output of the splice, nor the right one with another value.
+		let wrong = spliced_commitment(&f, key, &script, 150_000, &splice, 1, 100, 60_000);
+		assert!(allow(&f, &wrong).is_err());
+		let wrong = spliced_commitment(&f, key, &script, 140_000, &splice, 0, 100, 60_000);
+		assert!(allow(&f, &wrong).is_err());
+		allow(&f, &first).unwrap();
+
+		let st = f.policy.channel_state(&f.channel).unwrap();
+		assert_eq!(st.fundings.len(), 2);
+		assert_eq!(st.splices.len(), 1);
+		assert_eq!(ChannelState::decode(&st.encode()).unwrap(), st);
+
+		// A splice must spend a funding output of this channel.
+		let mut foreign = splice_item(&f, &splice);
+		foreign.context.input_value_sat = 90_000;
+		foreign.digest = digest(&splice, &funding_script(&f), 90_000, EcdsaSighashType::All);
+		let err = allow(&f, &foreign).unwrap_err();
+		assert!(err.0.contains("does not spend a funding output"), "{err}");
+	}
+
+	#[test]
+	fn a_splice_cannot_pay_our_balance_to_a_script_that_is_not_allow_listed() {
+		let mut list = PayoutAllowlist::default();
+		let ours = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+			.unwrap()
+			.assume_checked()
+			.script_pubkey();
+		list.add_script(ours.clone());
+		let mut f = fixture(PolicyConfig { payout: Some(list), ..Default::default() });
+		validate(&f, START - 1).unwrap(); // the counterparty signed for 60k to us
+		let (key, script) = spliced_funding(&mut f);
+
+		// 30k leaves the channel for somewhere else. Nothing in the transaction says whose
+		// 30k it is; the first commitment on the new funding does.
+		let theft = splice_tx(&script, 69_000, vec![elsewhere()]);
+		allow(&f, &splice_item(&f, &theft)).unwrap();
+		let ours_gone = spliced_commitment(&f, key, &script, 69_000, &theft, 0, 100, 30_000);
+		let err = allow(&f, &ours_gone).unwrap_err();
+		assert!(err.0.contains("not allow-listed"), "{err}");
+		// Had it been the counterparty's 30k, our balance would be untouched.
+		let theirs_gone = spliced_commitment(&f, key, &script, 69_000, &theft, 0, 100, 59_500);
+		allow(&f, &theirs_gone).unwrap();
+		// Once the splice's first commitment is signed, signing it again for less is refused
+		// too; a later commitment is an ordinary update.
+		assert!(allow(&f, &ours_gone).is_err());
+		let later = spliced_commitment(&f, key, &script, 69_000, &theft, 0, 99, 30_000);
+		allow(&f, &later).unwrap();
+
+		// The same amount to our own wallet is a splice-out.
+		let out = splice_tx(
+			&script,
+			69_500,
+			vec![TxOut { value: Amount::from_sat(30_000), script_pubkey: ours }],
+		);
+		allow(&f, &splice_item(&f, &out)).unwrap();
+		let after = spliced_commitment(&f, key, &script, 69_500, &out, 0, 99, 29_500);
+		allow(&f, &after).unwrap();
+	}
+
+	#[test]
+	fn a_splice_needs_a_balance_the_counterparty_signed_for() {
+		let mut f = fixture(PolicyConfig::default());
+		// A counterparty commitment the host had us sign says 60k, but that is the host's word.
+		allow(&f, &counterparty_commitment(&f, 100, 60_000)).unwrap();
+		let (_, script) = spliced_funding(&mut f);
+		let splice = splice_tx(&script, 150_000, vec![]);
+		let err = allow(&f, &splice_item(&f, &splice)).unwrap_err();
+		assert!(err.0.contains("cannot splice yet"), "{err}");
+		// The channel's first holder commitment counts once there is a funding to check its
+		// signature against.
+		let proof = holder_proof(&f, START, 60_000, &f.cp_funding);
+		f.policy.holder_commitment_validated(&f.channel, START, Some(&proof), &f.keys).unwrap();
+		allow(&f, &splice_item(&f, &splice)).unwrap();
+	}
+
+	#[test]
+	fn a_party_that_missed_a_splice_follows_the_parties_signature() {
+		let mut f = fixture(PolicyConfig::default());
+		validate(&f, START - 1).unwrap();
+		let (key, script) = spliced_funding(&mut f);
+		let splice = splice_tx(&script, 150_000, vec![]);
+		let first = spliced_commitment(&f, key, &script, 150_000, &splice, 0, 100, 60_000);
+		assert!(allow(&f, &first).is_err());
+
+		let secp = Secp256k1::new();
+		let msg = Message::from_digest(digest(
+			&splice,
+			&funding_script(&f),
+			100_000,
+			EcdsaSighashType::All,
+		));
+		let proof = |signer: &SecretKey| SpliceProof {
+			transaction: serialize(&splice),
+			input_index: 0,
+			signature: secp.sign_ecdsa(&msg, signer).serialize_compact(),
+		};
+		// Signed by the counterparty alone, or by anyone else: not the parties' agreement.
+		let err = f.policy.learn_splice(&f.channel, &proof(&f.cp_funding), &f.keys).unwrap_err();
+		assert!(err.0.contains("not signed by the parties"), "{err}");
+		assert!(allow(&f, &first).is_err());
+
+		let genuine = proof(&f.keys.secrets[&f.funding]);
+		f.policy.learn_splice(&f.channel, &genuine, &f.keys).unwrap();
+		allow(&f, &first).unwrap();
+		// It can now pass the proof on.
+		assert_eq!(f.policy.splice_proof_for(&f.channel, &first), Some(genuine));
+		assert_eq!(
+			f.policy.splice_proof_for(&f.channel, &counterparty_commitment(&f, 99, 60_000)),
+			None
+		);
+	}
+
+	#[test]
+	fn the_signature_on_a_splice_is_kept_as_its_proof() {
+		let mut f = fixture(PolicyConfig::default());
+		validate(&f, START - 1).unwrap();
+		let (key, script) = spliced_funding(&mut f);
+		let splice = splice_tx(&script, 150_000, vec![]);
+		let item = splice_item(&f, &splice);
+		allow(&f, &item).unwrap();
+		let first = spliced_commitment(&f, key, &script, 150_000, &splice, 0, 100, 60_000);
+		assert_eq!(f.policy.splice_proof_for(&f.channel, &first), None, "not signed yet");
+		let sig = Secp256k1::new()
+			.sign_ecdsa(&Message::from_digest(item.digest), &f.keys.secrets[&f.funding]);
+		f.policy.splice_signed(&f.channel, &item, &sig).unwrap();
+		let proof = f.policy.splice_proof_for(&f.channel, &first).unwrap();
+		assert_eq!(proof.signature, sig.serialize_compact());
+		// And it is a proof another party accepts.
+		let g = {
+			let mut g = fixture(PolicyConfig::default());
+			g.keys = Keys { secrets: f.keys.secrets.clone(), pubkeys: f.keys.pubkeys.clone() };
+			g
+		};
+		allow(&g, &counterparty_commitment(&g, 100, 60_000)).unwrap();
+		g.policy.register_key(&g.channel, KeyKind::SplicedFunding, &key).unwrap();
+		g.policy.learn_splice(&g.channel, &proof, &g.keys).unwrap();
+		allow(&g, &first).unwrap();
+	}
+
+	#[test]
+	fn balances_are_tracked_per_funding_while_a_splice_is_pending() {
+		let mut f = fixture(PolicyConfig {
+			max_holder_balance_decrease_sat: Some(10_000),
+			..Default::default()
+		});
+		validate(&f, START - 1).unwrap();
+		let (key, script) = spliced_funding(&mut f);
+		// We add 50k to the channel. Until the splice confirms, every update is signed for
+		// both funding outputs, and our balance differs between them by those 50k.
+		let splice = splice_tx(&script, 150_000, vec![]);
+		allow(&f, &splice_item(&f, &splice)).unwrap();
+		let new =
+			|number, ours| spliced_commitment(&f, key, &script, 150_000, &splice, 0, number, ours);
+		allow(&f, &new(100, 110_000)).unwrap();
+		allow(&f, &counterparty_commitment(&f, 99, 58_000)).unwrap();
+		allow(&f, &new(99, 108_000)).unwrap();
+		// The cap still holds on each of them.
+		assert!(allow(&f, &counterparty_commitment(&f, 98, 40_000))
+			.unwrap_err()
+			.0
+			.contains("drop"));
+		assert!(allow(&f, &new(98, 90_000)).unwrap_err().0.contains("drop"));
 	}
 }

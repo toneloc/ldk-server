@@ -474,6 +474,20 @@ impl HolderProof {
 	}
 }
 
+/// Evidence that the parties agreed to a splice: the splice transaction and their own
+/// signature on the funding output it spends. A party that did not see the splice being signed
+/// checks it against the funding key it holds a share of, and then follows the channel to the
+/// funding output the splice creates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpliceProof {
+	/// Consensus-serialized splice transaction (witnesses not needed).
+	pub transaction: Vec<u8>,
+	/// The input that spends the previous funding output.
+	pub input_index: u32,
+	/// The parties' signature on that input, 64-byte compact encoding.
+	pub signature: [u8; 64],
+}
+
 /// One signature within a batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignItem {
@@ -481,6 +495,9 @@ pub struct SignItem {
 	pub derivation: Derivation,
 	pub digest: [u8; 32],
 	pub context: SigningContext,
+	/// For a commitment that spends a funding output created by a splice: proof of the splice,
+	/// for parties that missed it. Filled in by the party leading the session.
+	pub splice: Option<SpliceProof>,
 }
 
 impl SignItem {
@@ -489,6 +506,15 @@ impl SignItem {
 		self.derivation.encode(w);
 		w.fixed(&self.digest);
 		self.context.encode(w);
+		match &self.splice {
+			Some(proof) => {
+				w.u8(1);
+				w.bytes(&proof.transaction);
+				w.u32(proof.input_index);
+				w.fixed(&proof.signature);
+			},
+			None => w.u8(0),
+		}
 	}
 	fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
 		Ok(SignItem {
@@ -496,6 +522,16 @@ impl SignItem {
 			derivation: Derivation::decode(r)?,
 			digest: r.fixed32()?,
 			context: SigningContext::decode(r)?,
+			splice: if r.u8()? == 1 {
+				let transaction = r.bytes()?;
+				let input_index = r.u32()?;
+				let mut signature = [0u8; 64];
+				signature[..32].copy_from_slice(&r.fixed32()?);
+				signature[32..].copy_from_slice(&r.fixed32()?);
+				Some(SpliceProof { transaction, input_index, signature })
+			} else {
+				None
+			},
 		})
 	}
 }
@@ -516,6 +552,12 @@ const TAG_COMMIT: u8 = 0x15;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
 	Ping,
+	/// Asks whether the party's payout allow-list contains `script`, so that a splice-out or
+	/// close to an address the parties will refuse can be turned down before it starts.
+	/// Informational: it authorizes nothing.
+	CheckPayout {
+		script: Vec<u8>,
+	},
 	/// Returns the public key for `key_id`, running DKG with the other party if the key does
 	/// not exist yet. Idempotent. `channel` binds the key to a channel for policy purposes.
 	EnsureKey {
@@ -567,6 +609,10 @@ impl Request {
 		w.u8(TAG_REQUEST);
 		match self {
 			Request::Ping => w.u8(0),
+			Request::CheckPayout { script } => {
+				w.u8(9);
+				w.bytes(script);
+			},
 			Request::EnsureKey { key_id, channel } => {
 				w.u8(1);
 				w.fixed(key_id);
@@ -669,6 +715,7 @@ impl Request {
 				idx: r.u64()?,
 				secret: r.fixed32()?,
 			},
+			9 => Request::CheckPayout { script: r.bytes()? },
 			8 => {
 				let request_id = r.fixed16()?;
 				let channel = r.opt_fixed32()?;
@@ -1176,6 +1223,7 @@ mod tests {
 			derivation: Derivation::Additive { tweak: [5u8; 32] },
 			digest: [6u8; 32],
 			context: sample_context(),
+			splice: None,
 		};
 		let reqs = vec![
 			Request::Ping,
@@ -1210,6 +1258,7 @@ mod tests {
 				idx: 42,
 				secret: [3u8; 32],
 			},
+			Request::CheckPayout { script: vec![0, 20, 7, 7] },
 			Request::Sign {
 				request_id: [3u8; 16],
 				channel: Some([8u8; 32]),
@@ -1254,6 +1303,7 @@ mod tests {
 			derivation: Derivation::None,
 			digest: [2u8; 32],
 			context: sample_context(),
+			splice: None,
 		};
 		let ops = vec![
 			SessionOp::Dkg { key_id: [1u8; 32], channel: Some(([2u8; 32], KeyKind::Htlc)) },
