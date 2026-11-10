@@ -30,6 +30,9 @@ use log::{debug, error, info};
 
 use crate::util::config::{MpcConfig, MpcCoverage};
 
+/// How often an on-chain signature is redone to get a low R (each try succeeds half the time).
+const LOW_R_TRIES: usize = 16;
+
 /// Domain-separation tag for deriving MPC key ids from LDK channel key ids.
 const KEY_ID_TAG: &[u8] = b"ldk-server/mpc-key/v1";
 
@@ -480,12 +483,41 @@ impl ExternalChannelSigner for MpcChannelSigner {
 			items.push(item);
 			expected.push(pk);
 		}
-		match self.client.sign_batch(
-			&self.secp,
-			Some(Self::channel_id(channel_keys_id)),
-			items,
-			Some(&expected),
-		) {
+		let signed = self
+			.client
+			.sign_batch(
+				&self.secp,
+				Some(Self::channel_id(channel_keys_id)),
+				items.clone(),
+				Some(&expected),
+			)
+			.and_then(|mut sigs| {
+				// LDK sizes the transactions it builds (anchor and HTLC claims, sweeps,
+				// justice) for signatures with a low R, one byte shorter, which its own signer
+				// gets by trying nonces. A threshold signature has a low R half the time, so
+				// for signatures that end up in a witness, sign again until it does.
+				for i in 0..sigs.len() {
+					let on_chain = !matches!(
+						ops[i],
+						ChannelSignOp::CounterpartyCommitment
+							| ChannelSignOp::CounterpartyCommitmentHtlc
+							| ChannelSignOp::ChannelAnnouncement
+					);
+					let mut tries = 0;
+					while on_chain && sigs[i].serialize_compact()[0] >= 0x80 && tries < LOW_R_TRIES
+					{
+						tries += 1;
+						sigs[i] = self.client.sign_batch(
+							&self.secp,
+							Some(Self::channel_id(channel_keys_id)),
+							vec![items[i].clone()],
+							Some(&expected[i..=i]),
+						)?[0];
+					}
+				}
+				Ok(sigs)
+			});
+		match signed {
 			Ok(sigs) => {
 				debug!(
 					"MPC signed {:?} for channel keys id {} in {:?}",

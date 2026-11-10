@@ -417,7 +417,8 @@ cd e2e-tests && cargo test --test mpc -- --test-threads=1   # regtest, downloads
   - Each party counts for itself; a party that was down counts less. Three must agree, so
     the effective count is that of the third-strictest party.
   - After a party restarts, payments of ours still in flight are counted again.
-  - `--max-balance-decrease-sat` remains as a per-update cap.
+  - `--max-balance-decrease-sat` remains as a per-update cap. It counts forwards too, so it
+    does not suit a node that forwards; the outflow limit does.
 - **Not from VLS:** invoices are not shown to the parties, so they cannot tell a payment the
   operator meant from one a compromised host made up; the limit treats both alike. The
   on-chain wallet is not covered (it is still on the host).

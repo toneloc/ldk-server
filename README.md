@@ -234,8 +234,13 @@ How it is tested:
   generations), payments both ways, restart of all parties, payments with one party down and
   with the leading party down, restart of LDK Server, cooperative close, holder force-close,
   splice-in, a splice by the counterparty, splice-out, a splice-out three parties refuse
-  against a fourth that sides with the host, and a payment refused at the outflow limit.
-  The kits are made by the real ceremony tool.
+  against a fourth that sides with the host, a payment refused at the outflow limit, a
+  channel opened by the peer, a payment forwarded through us, a force-close by the peer
+  with our output swept, and a peer that broadcasts a revoked commitment and loses the
+  whole channel to our justice transaction. The kits are made by the real ceremony tool.
+- **Not exercised end to end:** a force close with HTLCs in flight (the HTLC transactions),
+  failed payments, fee updates, multi-part payments, BOLT 12, a kit running out, and long
+  runs of thousands of updates.
 - **Party tests:** `cargo test -p ldk-server-mpc`. Every quorum signing and decrypting, LDK's
   own shachain store accepting released secrets, a compromised host, a compromised party, a
   party that missed updates or a splice, a forged transaction behind a true description.

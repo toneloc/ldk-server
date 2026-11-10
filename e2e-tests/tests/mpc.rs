@@ -22,15 +22,16 @@ use std::time::{Duration, Instant};
 use e2e_tests::{
 	close_channel, find_available_port, mine_and_sync, mpc_ceremony_binary_path,
 	mpc_party_binary_path, run_cli, send_bolt11_payment, setup_funded_channel, splice_txid,
-	wait_for_channels, wait_for_event, wait_for_force_close_claims, LdkServerHandle, TestBitcoind,
-	TestConfigBuilder,
+	wait_for_channels, wait_for_event, wait_for_force_close_claims, wait_for_gossip,
+	LdkServerHandle, TestBitcoind, TestConfigBuilder,
 };
 use hex_conservative::FromHex;
 use ldk_node::bitcoin::consensus::encode::deserialize;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::Transaction;
 use ldk_server_client::ldk_server_grpc::api::{
-	Bolt11ReceiveRequest, Bolt11SendRequest, GetBalancesRequest, SpliceOutRequest,
+	Bolt11ReceiveRequest, Bolt11SendRequest, ConnectPeerRequest, GetBalancesRequest,
+	SpliceOutRequest,
 };
 use ldk_server_client::ldk_server_grpc::events::event_envelope::Event;
 use ldk_server_client::ldk_server_grpc::types::BalanceSource;
@@ -126,8 +127,12 @@ impl MpcParties {
 		cmd.arg("--share-key-file").arg(self.keys_dir.join(format!("share-{i}.key")));
 		if let Some(xpub) = &self.payout_xpub {
 			cmd.args(["--payout-xpub", xpub, "--payout-lookahead", "200"]);
-			// Pay-per-update cap generous enough for the test payments (10M msat max per hop).
-			cmd.args(["--max-balance-decrease-sat", "20000"]);
+			// The older per-update cap, generous enough for the test payments (10M msat max
+			// per hop). It counts forwards as well, so the tests that set the outflow limit,
+			// which does not, leave it out.
+			if self.outflow_per_day.is_none() {
+				cmd.args(["--max-balance-decrease-sat", "20000"]);
+			}
 		}
 		if let Some((party, address)) = &self.rogue_payout {
 			if *party == i {
@@ -615,4 +620,160 @@ async fn test_mpc_outflow_limit() {
 	)
 	.await;
 	assert!(arrived.is_err(), "a payment beyond the outflow limit went through");
+}
+
+/// What a node holds in all, on chain and in channels.
+async fn total_balance_sat(server: &LdkServerHandle) -> u64 {
+	let b = server.client().get_balances(GetBalancesRequest {}).await.unwrap();
+	b.total_onchain_balance_sats + b.total_lightning_balance_sats
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+	std::fs::create_dir_all(to).unwrap();
+	for entry in std::fs::read_dir(from).unwrap().filter_map(|e| e.ok()) {
+		let target = to.join(entry.file_name());
+		if entry.file_type().unwrap().is_dir() {
+			copy_dir(&entry.path(), &target);
+		} else {
+			std::fs::copy(entry.path(), target).unwrap();
+		}
+	}
+}
+
+#[tokio::test]
+async fn test_mpc_forward_inbound_channel_and_peer_force_close() {
+	let bitcoind = TestBitcoind::new();
+	let mut parties = MpcParties::start();
+	// A tight limit on what may leave our balances: forwards must not count against it.
+	parties.outflow_per_day = Some(5_000);
+	let server_a = start_mpc_server(&bitcoind, &mut parties).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+	let server_c = LdkServerHandle::start(&bitcoind).await;
+
+	// C opens a channel to us (the parties sign for a channel someone else funded), and we
+	// open one to B.
+	let channel_c = setup_funded_channel(&bitcoind, &server_c, &server_a, 200_000).await;
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+	for keystore in &parties.keystores {
+		assert_eq!(MpcParties::share_count(keystore), 10, "five keys per channel");
+		assert_eq!(MpcParties::bound_kits(keystore), 2);
+	}
+	// C also connects to B (no channel), so that it hears of the channel between us and B
+	// from both of its ends without waiting for gossip to be relayed.
+	server_c
+		.client()
+		.connect_peer(ConnectPeerRequest {
+			node_pubkey: server_b.node_id().to_string(),
+			address: format!("127.0.0.1:{}", server_b.p2p_port),
+			persist: false,
+		})
+		.await
+		.unwrap();
+	wait_for_gossip(&server_c, 2, Duration::from_secs(120)).await;
+
+	// C pays B through us: an HTLC comes in on one channel and goes out on the other, four
+	// times the outflow limit. The parties see both and let it pass.
+	let before = total_balance_sat(&server_a).await;
+	send_bolt11_payment(&server_c, &server_b, 20_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	let after = total_balance_sat(&server_a).await;
+	assert!(after >= before, "forwarding lost money: {before} -> {after}");
+
+	// C closes its channel on its own. Our 20,000 sat in it sit in an output of C's
+	// commitment that only our payment key can spend: the parties sign the sweep.
+	run_cli(&server_c, &["force-close-channel", &channel_c, server_a.node_id()]);
+	let start = Instant::now();
+	loop {
+		mine_and_sync(&bitcoind, &[&server_a, &server_b, &server_c], 1).await;
+		let balances = server_a.client().get_balances(GetBalancesRequest {}).await.unwrap();
+		let channels = run_cli(&server_a, &["list-channels"]);
+		// Done when only the channel with B is left and what was in C's channel has arrived
+		// in our wallet (less the sweep's fee).
+		let total = balances.total_onchain_balance_sats + balances.total_lightning_balance_sats;
+		if channels["channels"].as_array().unwrap().len() == 1
+			&& balances.lightning_balances.len() == 1
+			&& total + 5_000 >= after
+		{
+			break;
+		}
+		assert!(
+			start.elapsed() < Duration::from_secs(180),
+			"our output of the closed channel was not swept: {after} -> {total}, {balances:?}"
+		);
+		tokio::time::sleep(Duration::from_millis(300)).await;
+	}
+
+	// The other channel carries on, within the limit.
+	send_bolt11_payment(&server_a, &server_b, 2_000_000).await;
+}
+
+#[tokio::test]
+async fn test_mpc_punishes_a_revoked_commitment() {
+	let bitcoind = TestBitcoind::new();
+	let mut parties = MpcParties::start();
+	let mut server_a = start_mpc_server(&bitcoind, &mut parties).await;
+	let mut server_b = LdkServerHandle::start(&bitcoind).await;
+
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+	send_bolt11_payment(&server_a, &server_b, 18_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	let channels = wait_for_channels(&server_a, 1, Duration::from_secs(30)).await;
+	let funding = channels[0].funding_txo.clone().expect("funding txo");
+
+	// B keeps a copy of its node as it is now, with 18,000 sat on its side.
+	server_b.stop();
+	#[allow(deprecated)]
+	let old_state = tempfile::tempdir().unwrap().into_path();
+	copy_dir(&server_b.storage_dir, &old_state);
+	server_b.start_again().await;
+	// Wait for the two nodes to reconnect and the channel to be usable again.
+	let start = Instant::now();
+	loop {
+		let channels = run_cli(&server_b, &["list-channels"]);
+		if channels["channels"][0]["is_usable"] == true {
+			break;
+		}
+		assert!(start.elapsed() < Duration::from_secs(60), "channel did not come back");
+		tokio::time::sleep(Duration::from_millis(500)).await;
+	}
+
+	// It pays 12,000 back. That revokes the state it copied: we now hold its secret.
+	send_bolt11_payment(&server_b, &server_a, 12_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	let before = total_balance_sat(&server_a).await;
+
+	// B cheats: with us offline, it goes back to the copy and broadcasts the old commitment,
+	// which pays it 18,000 instead of 6,000.
+	server_a.stop();
+	server_b.stop();
+	std::fs::remove_dir_all(&server_b.storage_dir).unwrap();
+	copy_dir(&old_state, &server_b.storage_dir);
+	server_b.start_again().await;
+	let channel_b = run_cli(&server_b, &["list-channels"])["channels"][0]["user_channel_id"]
+		.as_str()
+		.unwrap()
+		.to_string();
+	run_cli(&server_b, &["force-close-channel", &channel_b, server_a.node_id()]);
+	wait_for_spender(&bitcoind, &funding.txid, funding.vout).await;
+	bitcoind.mine_blocks(1);
+	server_b.stop();
+
+	// We come back and find the revoked commitment on chain. Taking B's output needs a
+	// signature with the revocation key, which the parties derive on their shares from our
+	// revocation basepoint and the secret B gave up. We end with the whole channel.
+	server_a.start_again().await;
+	let start = Instant::now();
+	loop {
+		mine_and_sync(&bitcoind, &[&server_a], 1).await;
+		let total = total_balance_sat(&server_a).await;
+		if total >= before + 4_000 {
+			break;
+		}
+		assert!(
+			start.elapsed() < Duration::from_secs(120),
+			"the cheater was not punished: {before} -> {total}"
+		);
+		tokio::time::sleep(Duration::from_millis(300)).await;
+	}
+	let _ = std::fs::remove_dir_all(&old_state);
 }

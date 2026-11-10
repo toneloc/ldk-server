@@ -468,6 +468,21 @@ impl LdkServerHandle {
 		handle
 	}
 
+	/// Kill the server and leave it down. Its storage stays; [`Self::start_again`] brings it
+	/// back.
+	pub fn stop(&mut self) {
+		self.child.0.kill().expect("Failed to kill ldk-server");
+		self.child.0.wait().expect("Failed to reap ldk-server");
+	}
+
+	/// Start a stopped server again with the same config, on whatever is in its storage now.
+	pub async fn start_again(&mut self) {
+		self.child = ServerProcess(spawn_server_process(&self.config_path));
+		forward_server_output(&mut self.child.0);
+		let info = wait_for_server_ready(self, Duration::from_secs(60)).await;
+		assert_eq!(info.node_id, self.node_id, "Node identity changed after restart");
+	}
+
 	/// Kill and restart the server with the same config and storage to test crash recovery.
 	pub async fn restart(&mut self) {
 		self.child.0.kill().expect("Failed to kill ldk-server");
