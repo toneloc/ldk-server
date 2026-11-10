@@ -50,9 +50,12 @@ use bitcoin::{
 	Transaction, TxOut,
 };
 use hex_conservative::DisplayHex;
-use lightning::ln::chan_utils;
+use lightning::ln::chan_utils::{
+	self, ChannelPublicKeys, ChannelTransactionParameters, CommitmentTransaction,
+	CounterpartyChannelTransactionParameters,
+};
 use lightning::ln::channel_keys::{
-	DelayedPaymentBasepoint, DelayedPaymentKey, RevocationBasepoint, RevocationKey,
+	DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, RevocationBasepoint, RevocationKey,
 };
 use lightning::types::features::ChannelTypeFeatures;
 use lightning::util::ser::Readable;
@@ -62,6 +65,7 @@ use crate::protocol::{
 	ChannelId, CounterpartyKeys, Derivation, HolderProof, KeyId, KeyKind, Reader, SignItem,
 	SigningOp, SpliceProof, Writer,
 };
+use crate::vls::{self, Guard, GuardConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyError(pub String);
@@ -151,6 +155,10 @@ pub struct PolicyConfig {
 	pub max_holder_balance_decrease_sat: Option<u64>,
 	/// Maximum amount a cooperative close may pay us below our last tracked balance.
 	pub max_closing_fee_sat: u64,
+	/// Rebuild every commitment from its balances and HTLCs before signing it, and run the
+	/// VLS validator on it (see [`crate::vls`]). `None` turns both off: a party then signs
+	/// whatever transaction it is shown, as long as the rules above hold.
+	pub commitment_validation: Option<GuardConfig>,
 }
 
 impl Default for PolicyConfig {
@@ -159,7 +167,15 @@ impl Default for PolicyConfig {
 			payout: None,
 			max_holder_balance_decrease_sat: None,
 			max_closing_fee_sat: 10_000,
+			commitment_validation: Some(GuardConfig::default()),
 		}
+	}
+}
+
+impl PolicyConfig {
+	/// A policy that does not look inside commitments. For tests of the other rules.
+	pub fn without_commitment_validation() -> Self {
+		PolicyConfig { commitment_validation: None, ..Default::default() }
 	}
 }
 
@@ -192,6 +208,11 @@ pub struct ChannelState {
 	/// (only the funding key does, on a splice).
 	pub counterparty_keys: Option<CounterpartyKeys>,
 	pub counterparty_selected_contest_delay: Option<u16>,
+	/// Pinned with them: the delay on the counterparty's outputs, who opened the channel, and
+	/// the channel type (serialized `ChannelTypeFeatures`).
+	pub holder_selected_contest_delay: Option<u16>,
+	pub is_outbound: Option<bool>,
+	pub channel_type: Option<Vec<u8>>,
 	/// Splice transactions this party saw signed (or was shown the parties' signature on).
 	/// A new funding output is accepted only if one of them creates it.
 	pub splices: Vec<Splice>,
@@ -349,6 +370,13 @@ impl ChannelState {
 			w.opt_u64(splice.min_balance_sat);
 		}
 		w.opt_u64(self.signed_holder_commitment);
+		w.opt_u16(self.holder_selected_contest_delay);
+		w.u8(match self.is_outbound {
+			None => 0,
+			Some(false) => 1,
+			Some(true) => 2,
+		});
+		w.opt_bytes(self.channel_type.as_deref());
 		w.0
 	}
 
@@ -428,6 +456,13 @@ impl ChannelState {
 					});
 				}
 				st.signed_holder_commitment = r.opt_u64()?;
+				st.holder_selected_contest_delay = r.opt_u16()?;
+				st.is_outbound = match r.u8()? {
+					1 => Some(false),
+					2 => Some(true),
+					_ => None,
+				};
+				st.channel_type = r.opt_bytes()?;
 			}
 			Ok(())
 		})()
@@ -476,6 +511,15 @@ impl ChannelState {
 		}
 		self.signed_holder_commitment =
 			min_opt(self.signed_holder_commitment, newer.signed_holder_commitment);
+		if self.holder_selected_contest_delay.is_none() {
+			self.holder_selected_contest_delay = newer.holder_selected_contest_delay;
+		}
+		if self.is_outbound.is_none() {
+			self.is_outbound = newer.is_outbound;
+		}
+		if self.channel_type.is_none() {
+			self.channel_type = newer.channel_type.clone();
+		}
 		if self.counterparty_keys.is_none() {
 			self.counterparty_keys = newer.counterparty_keys.clone();
 		}
@@ -553,6 +597,8 @@ pub struct ChannelPolicy {
 	locks: Mutex<HashMap<ChannelId, Arc<Mutex<()>>>>,
 	tmp_counter: AtomicU64,
 	secp: Secp256k1<All>,
+	/// The VLS validator and its records, unless commitment validation is off.
+	guard: Option<Guard>,
 }
 
 /// Public keys the policy needs from the key store to verify a request.
@@ -569,12 +615,19 @@ pub struct Authorized {
 	/// The funding (witness script and value) whose balance this authorization moved, and
 	/// the new balance.
 	balance: Option<(Vec<u8>, u64, u64)>,
+	/// What the VLS validator records once the commitment is signed.
+	validated: Option<vls::Pending>,
 }
 
 impl ChannelPolicy {
 	pub fn open(dir: &Path, config: PolicyConfig, kits: Option<Arc<KitStore>>) -> io::Result<Self> {
 		fs::create_dir_all(dir)?;
+		let guard = match &config.commitment_validation {
+			Some(guard_config) => Some(Guard::open(&dir.join("vls"), guard_config)?),
+			None => None,
+		};
 		Ok(ChannelPolicy {
+			guard,
 			dir: dir.to_path_buf(),
 			config,
 			kits,
@@ -780,6 +833,28 @@ impl ChannelPolicy {
 				))
 			})?;
 			let (tx, funding) = self.verify_holder_proof(&st, keys, number, proof)?;
+			if let Some(guard) = &self.guard {
+				let checked = self.checked_commitment(
+					&st,
+					keys,
+					&st.fundings[funding],
+					&tx,
+					proof.commitment.as_deref(),
+					false,
+				)?;
+				if let Some((setup, commitment)) = checked {
+					let sig = Signature::from_compact(&proof.counterparty_sig)
+						.map_err(|e| PolicyError(e.to_string()))?;
+					guard
+						.holder_commitment_validated(
+							&Self::guard_key(channel, &st.fundings[funding]),
+							&setup,
+							&commitment,
+							&sig,
+						)
+						.map_err(PolicyError)?;
+				}
+			}
 			if let Some(balance) =
 				self.holder_balance_in_validated_commitment(channel, &st, keys, &tx, number)?
 			{
@@ -905,10 +980,166 @@ impl ChannelPolicy {
 	}
 
 	pub fn counterparty_revocation_validated(
-		&self, _channel: &ChannelId, _idx: u64, _secret: &[u8; 32],
+		&self, channel: &ChannelId, idx: u64, secret: &[u8; 32],
 	) -> Result<(), PolicyError> {
-		// Nothing to enforce yet; recorded for future HTLC accounting.
+		if let Some(guard) = &self.guard {
+			let secret = SecretKey::from_slice(secret).map_err(|e| PolicyError(e.to_string()))?;
+			guard.counterparty_revoked(channel, idx, &secret);
+		}
 		Ok(())
+	}
+
+	// -----------------------------------------------------------------------
+	// Commitments, rebuilt
+	// -----------------------------------------------------------------------
+
+	fn guard_key(channel: &ChannelId, funding: &Funding) -> vls::Key {
+		let mut engine = sha256::Hash::engine();
+		engine.input(&funding.witness_script);
+		engine.input(&funding.value_sat.to_le_bytes());
+		vls::Key { channel: *channel, funding: sha256::Hash::from_engine(engine).to_byte_array() }
+	}
+
+	/// Rebuilds a commitment transaction from what it is said to contain (LDK's
+	/// `CommitmentTransaction`: balances, feerate, HTLCs), using the keys this party holds a
+	/// share of and the counterparty keys and parameters it pinned, and requires the result
+	/// to be `tx`, the transaction whose signature is asked for or shown. A transaction with
+	/// any other output cannot pass.
+	///
+	/// Returns the channel's facts and the commitment's content for the validator, or `None`
+	/// for a channel whose other keys are not held here (funding-only coverage).
+	fn checked_commitment(
+		&self, st: &ChannelState, keys: &dyn KeyLookup, funding: &Funding, tx: &Transaction,
+		commitment: Option<&[u8]>, counterparty_broadcasts: bool,
+	) -> Result<Option<(vls::Setup, vls::Commitment)>, PolicyError> {
+		let key = |kind: KeyKind| st.key(kind).and_then(|id| keys.public_key(id));
+		let (Some(revocation), Some(payment), Some(delayed), Some(htlc)) = (
+			key(KeyKind::Revocation),
+			key(KeyKind::Payment),
+			key(KeyKind::DelayedPayment),
+			key(KeyKind::Htlc),
+		) else {
+			return Ok(None);
+		};
+		let bytes = commitment
+			.ok_or_else(|| PolicyError("missing the commitment's balances and HTLCs".into()))?;
+		let pinned = |what: &str| PolicyError(format!("{what} is not pinned for this channel yet"));
+		let cp = st.counterparty_keys.as_ref().ok_or_else(|| pinned("the counterparty's keys"))?;
+		let holder_delay =
+			st.holder_selected_contest_delay.ok_or_else(|| pinned("our contest delay"))?;
+		let cp_delay = st
+			.counterparty_selected_contest_delay
+			.ok_or_else(|| pinned("the counterparty's contest delay"))?;
+		let is_outbound = st.is_outbound.ok_or_else(|| pinned("the channel direction"))?;
+		let channel_type = st.channel_type.as_ref().ok_or_else(|| pinned("the channel type"))?;
+		let features = ChannelTypeFeatures::read(&mut io::Cursor::new(channel_type))
+			.map_err(|_| PolicyError("bad channel type features".into()))?;
+
+		let ours = Self::our_funding_keys(st, keys);
+		let (our_funding, cp_funding) = match funding_script_keys(&funding.witness_script) {
+			Some((a, b)) if ours.contains(&a) && !ours.contains(&b) => (a, b),
+			Some((a, b)) if ours.contains(&b) && !ours.contains(&a) => (b, a),
+			_ => return deny("funding script is not a 2-of-2 with our funding key"),
+		};
+		let point =
+			|bytes: &[u8; 33]| PublicKey::from_slice(bytes).map_err(|e| PolicyError(e.to_string()));
+		let cp_keys = [
+			cp_funding,
+			point(&cp.revocation_basepoint)?,
+			point(&cp.payment_point)?,
+			point(&cp.delayed_payment_basepoint)?,
+			point(&cp.htlc_basepoint)?,
+		];
+		let spent = match tx.input.as_slice() {
+			[input] => input.previous_output,
+			_ => return deny("a commitment transaction has exactly one input"),
+		};
+		let index = u16::try_from(spent.vout)
+			.map_err(|_| PolicyError("funding output index out of range".into()))?;
+		let parameters = ChannelTransactionParameters {
+			holder_pubkeys: ChannelPublicKeys {
+				funding_pubkey: our_funding,
+				revocation_basepoint: RevocationBasepoint(revocation),
+				payment_point: payment,
+				delayed_payment_basepoint: DelayedPaymentBasepoint(delayed),
+				htlc_basepoint: HtlcBasepoint(htlc),
+			},
+			holder_selected_contest_delay: holder_delay,
+			is_outbound_from_holder: is_outbound,
+			counterparty_parameters: Some(CounterpartyChannelTransactionParameters {
+				pubkeys: ChannelPublicKeys {
+					funding_pubkey: cp_keys[0],
+					revocation_basepoint: RevocationBasepoint(cp_keys[1]),
+					payment_point: cp_keys[2],
+					delayed_payment_basepoint: DelayedPaymentBasepoint(cp_keys[3]),
+					htlc_basepoint: HtlcBasepoint(cp_keys[4]),
+				},
+				selected_contest_delay: cp_delay,
+			}),
+			funding_outpoint: Some(lightning::chain::transaction::OutPoint {
+				txid: spent.txid,
+				index,
+			}),
+			splice_parent_funding_txid: None,
+			channel_type_features: features.clone(),
+			channel_value_satoshis: funding.value_sat,
+		};
+		let commitment = CommitmentTransaction::read(&mut io::Cursor::new(bytes))
+			.map_err(|_| PolicyError("bad commitment description".into()))?;
+		let directed = if counterparty_broadcasts {
+			parameters.as_counterparty_broadcastable()
+		} else {
+			parameters.as_holder_broadcastable()
+		};
+		let trusted = commitment.verify(&directed, &self.secp).map_err(|_| {
+			PolicyError(
+				"commitment does not follow from its balances and HTLCs with this channel's keys"
+					.into(),
+			)
+		})?;
+		if trusted.built_transaction().txid != tx.compute_txid() {
+			return deny("commitment transaction is not the one its balances and HTLCs describe");
+		}
+
+		let (mut incoming, mut outgoing) = (Vec::new(), Vec::new());
+		for h in commitment.nondust_htlcs() {
+			let htlc = vls::Htlc {
+				payment_hash: h.payment_hash.0,
+				value_sat: h.amount_msat / 1000,
+				cltv_expiry: h.cltv_expiry,
+			};
+			// `offered` is from the broadcaster's side.
+			if h.offered == counterparty_broadcasts {
+				incoming.push(htlc);
+			} else {
+				outgoing.push(htlc);
+			}
+		}
+		let (ours_sat, theirs_sat) = if counterparty_broadcasts {
+			(commitment.to_countersignatory_value_sat(), commitment.to_broadcaster_value_sat())
+		} else {
+			(commitment.to_broadcaster_value_sat(), commitment.to_countersignatory_value_sat())
+		};
+		Ok(Some((
+			vls::Setup {
+				is_outbound,
+				value_sat: funding.value_sat,
+				funding_outpoint: spent,
+				holder_selected_contest_delay: holder_delay,
+				counterparty_selected_contest_delay: cp_delay,
+				counterparty_keys: cp_keys,
+				anchors_zero_fee_htlc: features.supports_anchors_zero_fee_htlc_tx(),
+			},
+			vls::Commitment {
+				number: commitment.commitment_number(),
+				per_commitment_point: commitment.per_commitment_point(),
+				ours_sat,
+				theirs_sat,
+				feerate_per_kw: commitment.negotiated_feerate_per_kw(),
+				incoming,
+				outgoing,
+			},
+		)))
 	}
 
 	// -----------------------------------------------------------------------
@@ -934,7 +1165,7 @@ impl ChannelPolicy {
 			if item.derivation != Derivation::None {
 				return deny("derivation requires a channel");
 			}
-			return Ok(Authorized { channel: None, state: None, balance: None });
+			return Ok(Authorized { channel: None, state: None, balance: None, validated: None });
 		};
 		let mut st = self.load(channel).map_err(|e| PolicyError(e.to_string()))?;
 
@@ -971,6 +1202,7 @@ impl ChannelPolicy {
 
 		// 4–9. Operation-specific checks.
 		let mut balance_moved = None;
+		let mut validated = None;
 		match op {
 			SigningOp::CounterpartyCommitment | SigningOp::CounterpartyCommitmentHtlc => {
 				let number = ctx
@@ -986,6 +1218,24 @@ impl ChannelPolicy {
 				if op == SigningOp::CounterpartyCommitment {
 					let tx = tx.as_ref().unwrap();
 					let funding = self.pin_channel_parameters(&mut st, &base_pubkey, item, tx)?;
+					if let Some(guard) = &self.guard {
+						let checked = self.checked_commitment(
+							&st,
+							keys,
+							&st.fundings[funding],
+							tx,
+							ctx.commitment.as_deref(),
+							true,
+						)?;
+						if let Some((setup, commitment)) = checked {
+							let key = Self::guard_key(channel, &st.fundings[funding]);
+							validated = Some(
+								guard
+									.check_counterparty_commitment(&key, &setup, &commitment)
+									.map_err(PolicyError)?,
+							);
+						}
+					}
 					if let Some(balance) =
 						self.holder_balance_in_counterparty_commitment(&st, keys, tx, item)?
 					{
@@ -1012,6 +1262,18 @@ impl ChannelPolicy {
 				let funding = Self::spent_funding(&st, ctx)?;
 				st.signed_holder_commitment = min_opt(st.signed_holder_commitment, Some(number));
 				let tx = tx.as_ref().unwrap();
+				if let (Some(_), Some(funding)) = (&self.guard, funding) {
+					// Our own commitment, rebuilt the same way. Its content was judged when
+					// the counterparty's signature on it was checked.
+					self.checked_commitment(
+						&st,
+						keys,
+						&st.fundings[funding],
+						tx,
+						ctx.commitment.as_deref(),
+						false,
+					)?;
+				}
 				if let Some(balance) =
 					self.holder_balance_in_holder_commitment(channel, &st, keys, tx, item, number)?
 				{
@@ -1052,7 +1314,12 @@ impl ChannelPolicy {
 			SigningOp::Test | SigningOp::Unknown => return deny("unsupported operation"),
 		}
 
-		Ok(Authorized { channel: Some(*channel), state: Some(st), balance: balance_moved })
+		Ok(Authorized {
+			channel: Some(*channel),
+			state: Some(st),
+			balance: balance_moved,
+			validated,
+		})
 	}
 
 	fn set_balance(st: &mut ChannelState, funding: usize, balance: u64) -> (Vec<u8>, u64, u64) {
@@ -1303,6 +1570,33 @@ impl ChannelPolicy {
 				None => st.counterparty_selected_contest_delay = Some(delay),
 			}
 		}
+		if let Some(delay) = ctx.holder_selected_contest_delay {
+			match st.holder_selected_contest_delay {
+				Some(pinned) if pinned != delay => {
+					return deny("our contest delay differs from the one pinned for this channel");
+				},
+				Some(_) => {},
+				None => st.holder_selected_contest_delay = Some(delay),
+			}
+		}
+		if let Some(outbound) = ctx.is_outbound {
+			match st.is_outbound {
+				Some(pinned) if pinned != outbound => {
+					return deny("channel direction differs from the one pinned for this channel");
+				},
+				Some(_) => {},
+				None => st.is_outbound = Some(outbound),
+			}
+		}
+		if let Some(channel_type) = &ctx.channel_type_features {
+			match &st.channel_type {
+				Some(pinned) if pinned != channel_type => {
+					return deny("channel type differs from the one pinned for this channel");
+				},
+				Some(_) => {},
+				None => st.channel_type = Some(channel_type.clone()),
+			}
+		}
 		if let Some(funding) = st.funding_position(script, ctx.input_value_sat) {
 			return Ok(funding);
 		}
@@ -1342,6 +1636,9 @@ impl ChannelPolicy {
 
 	/// Persists the state changes of a successful authorization.
 	pub fn commit(&self, auth: Authorized) -> Result<(), PolicyError> {
+		if let (Some(guard), Some(pending)) = (&self.guard, auth.validated) {
+			guard.apply(pending);
+		}
 		if let (Some(channel), Some(st)) = (auth.channel, auth.state) {
 			let lock = self.lock(&channel);
 			let _guard = lock.lock().unwrap();
@@ -1709,6 +2006,8 @@ mod tests {
 			per_commitment_point: None,
 			counterparty_per_commitment_secret: None,
 			holder_balance_sat: None,
+			is_outbound: None,
+			commitment: None,
 		}
 	}
 
@@ -1761,6 +2060,7 @@ mod tests {
 		HolderProof {
 			transaction: serialize(&tx),
 			counterparty_sig: secp.sign_ecdsa(&msg, signer).serialize_compact(),
+			commitment: None,
 		}
 	}
 
@@ -1798,7 +2098,7 @@ mod tests {
 
 	#[test]
 	fn standalone_keys_only_sign_test_ops() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let item = SignItem {
 			key_id: f.funding,
 			derivation: Derivation::None,
@@ -1819,7 +2119,7 @@ mod tests {
 
 	#[test]
 	fn digest_must_match_sighash() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let mut item = counterparty_commitment(&f, 100, 60_000);
 		assert!(f.policy.authorize(Some(&f.channel), &item, &f.keys).is_ok());
 		item.digest[0] ^= 1;
@@ -1833,7 +2133,7 @@ mod tests {
 
 	#[test]
 	fn key_kind_must_match_operation() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let mut item = counterparty_commitment(&f, 100, 60_000);
 		item.key_id = f.payment;
 		let err = f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap_err();
@@ -1853,7 +2153,7 @@ mod tests {
 	fn commitment_numbers_are_monotonic_and_balance_tracked() {
 		let f = fixture(PolicyConfig {
 			max_holder_balance_decrease_sat: Some(10_000),
-			..Default::default()
+			..PolicyConfig::without_commitment_validation()
 		});
 		let sign = |number: u64, ours: u64| {
 			let item = counterparty_commitment(&f, number, ours);
@@ -1880,7 +2180,7 @@ mod tests {
 
 	#[test]
 	fn htlc_derivation_must_match_bolt3() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let base = f.keys.public_key(&f.htlc).unwrap();
 		let pcp = PublicKey::from_secret_key(
 			&Secp256k1::new(),
@@ -1919,7 +2219,7 @@ mod tests {
 
 	#[test]
 	fn revocation_derivation_must_match_revealed_secret() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let secp = Secp256k1::new();
 		let base = f.keys.public_key(&f.revocation).unwrap();
 		let cp_secret = SecretKey::from_slice(&[0x33u8; 32]).unwrap();
@@ -1952,7 +2252,7 @@ mod tests {
 
 	#[test]
 	fn secrets_release_only_after_newer_holder_commitment_validated() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let start = 281474976710655u64;
 		assert!(f.policy.authorize_release(&f.channel, start).is_err());
 		validate(&f, start - 1).unwrap();
@@ -1982,7 +2282,7 @@ mod tests {
 
 	#[test]
 	fn validation_needs_the_counterpartys_signature() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let claim = |number: u64, proof: Option<&HolderProof>| {
 			f.policy.holder_commitment_validated(&f.channel, number, proof, &f.keys)
 		};
@@ -2022,7 +2322,7 @@ mod tests {
 	fn validated_commitments_respect_the_balance_cap() {
 		let f = fixture(PolicyConfig {
 			max_holder_balance_decrease_sat: Some(10_000),
-			..Default::default()
+			..PolicyConfig::without_commitment_validation()
 		});
 		let item = counterparty_commitment(&f, 100, 60_000);
 		f.policy.commit(f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap()).unwrap();
@@ -2041,7 +2341,7 @@ mod tests {
 
 	#[test]
 	fn pinned_channel_parameters_cannot_change() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let item = counterparty_commitment(&f, 100, 60_000);
 		f.policy.commit(f.policy.authorize(Some(&f.channel), &item, &f.keys).unwrap()).unwrap();
 		let st = f.policy.channel_state(&f.channel).unwrap();
@@ -2065,7 +2365,7 @@ mod tests {
 
 	#[test]
 	fn a_channel_keeps_its_kit() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		f.policy.bind_kit(&f.channel, &KIT).unwrap();
 		assert!(f.policy.bind_kit(&f.channel, &[1u8; 32]).is_err(), "kit cannot be swapped");
 		assert!(f.policy.bind_kit(&[0xddu8; 32], &KIT).is_err(), "kit serves one channel");
@@ -2077,7 +2377,7 @@ mod tests {
 
 	#[test]
 	fn release_stops_where_the_kit_ends() {
-		let f = fixture(PolicyConfig::default());
+		let f = fixture(PolicyConfig::without_commitment_validation());
 		let start = 281474976710655u64;
 		// The fixture kit covers three commitment numbers.
 		assert!(f.policy.per_commitment_point(&f.channel, start - 2).is_ok());
@@ -2095,8 +2395,9 @@ mod tests {
 		let mut v1 = st.encode();
 		v1[0] = 1;
 		// Version 1 had no kit field (1 byte), no pinned parameters (4 + 1 + 1 bytes), no
-		// splices (4 bytes) and no signed holder commitment (1 byte).
-		v1.truncate(v1.len() - 12);
+		// splices (4 bytes), no signed holder commitment (1 byte) and no further pinned
+		// parameters (1 + 1 + 1 bytes).
+		v1.truncate(v1.len() - 15);
 		assert_eq!(ChannelState::decode(&v1).unwrap(), st);
 		st.kit_id = Some(KIT);
 		assert_eq!(ChannelState::decode(&st.encode()).unwrap(), st);
@@ -2113,7 +2414,7 @@ mod tests {
 		let f = fixture(PolicyConfig {
 			payout: Some(allow),
 			max_closing_fee_sat: 2_000,
-			..Default::default()
+			..PolicyConfig::without_commitment_validation()
 		});
 		// Establish a balance of 60k via a signed counterparty commitment.
 		let item = counterparty_commitment(&f, 100, 60_000);
@@ -2178,7 +2479,10 @@ mod tests {
 			.unwrap();
 		let ok_script = Address::p2wpkh(&CompressedPublicKey(child.public_key), Network::Bitcoin)
 			.script_pubkey();
-		let f = fixture(PolicyConfig { payout: Some(allow), ..Default::default() });
+		let f = fixture(PolicyConfig {
+			payout: Some(allow),
+			..PolicyConfig::without_commitment_validation()
+		});
 		let payment_point = f.keys.public_key(&f.payment).unwrap();
 		let witness_script =
 			chan_utils::get_countersigner_payment_script(&features(), &payment_point);
@@ -2274,7 +2578,7 @@ mod tests {
 
 	#[test]
 	fn a_channel_moves_only_to_a_funding_output_a_signed_splice_creates() {
-		let mut f = fixture(PolicyConfig::default());
+		let mut f = fixture(PolicyConfig::without_commitment_validation());
 		validate(&f, START - 1).unwrap(); // counterparty commitment 100, our balance 60k
 		let (key, script) = spliced_funding(&mut f);
 		let splice = splice_tx(&script, 150_000, vec![]);
@@ -2313,7 +2617,10 @@ mod tests {
 			.assume_checked()
 			.script_pubkey();
 		list.add_script(ours.clone());
-		let mut f = fixture(PolicyConfig { payout: Some(list), ..Default::default() });
+		let mut f = fixture(PolicyConfig {
+			payout: Some(list),
+			..PolicyConfig::without_commitment_validation()
+		});
 		validate(&f, START - 1).unwrap(); // the counterparty signed for 60k to us
 		let (key, script) = spliced_funding(&mut f);
 
@@ -2346,7 +2653,7 @@ mod tests {
 
 	#[test]
 	fn a_splice_needs_a_balance_the_counterparty_signed_for() {
-		let mut f = fixture(PolicyConfig::default());
+		let mut f = fixture(PolicyConfig::without_commitment_validation());
 		// A counterparty commitment the host had us sign says 60k, but that is the host's word.
 		allow(&f, &counterparty_commitment(&f, 100, 60_000)).unwrap();
 		let (_, script) = spliced_funding(&mut f);
@@ -2362,7 +2669,7 @@ mod tests {
 
 	#[test]
 	fn a_party_that_missed_a_splice_follows_the_parties_signature() {
-		let mut f = fixture(PolicyConfig::default());
+		let mut f = fixture(PolicyConfig::without_commitment_validation());
 		validate(&f, START - 1).unwrap();
 		let (key, script) = spliced_funding(&mut f);
 		let splice = splice_tx(&script, 150_000, vec![]);
@@ -2399,7 +2706,7 @@ mod tests {
 
 	#[test]
 	fn the_signature_on_a_splice_is_kept_as_its_proof() {
-		let mut f = fixture(PolicyConfig::default());
+		let mut f = fixture(PolicyConfig::without_commitment_validation());
 		validate(&f, START - 1).unwrap();
 		let (key, script) = spliced_funding(&mut f);
 		let splice = splice_tx(&script, 150_000, vec![]);
@@ -2414,7 +2721,7 @@ mod tests {
 		assert_eq!(proof.signature, sig.serialize_compact());
 		// And it is a proof another party accepts.
 		let g = {
-			let mut g = fixture(PolicyConfig::default());
+			let mut g = fixture(PolicyConfig::without_commitment_validation());
 			g.keys = Keys { secrets: f.keys.secrets.clone(), pubkeys: f.keys.pubkeys.clone() };
 			g
 		};
@@ -2428,7 +2735,7 @@ mod tests {
 	fn balances_are_tracked_per_funding_while_a_splice_is_pending() {
 		let mut f = fixture(PolicyConfig {
 			max_holder_balance_decrease_sat: Some(10_000),
-			..Default::default()
+			..PolicyConfig::without_commitment_validation()
 		});
 		validate(&f, START - 1).unwrap();
 		let (key, script) = spliced_funding(&mut f);
@@ -2447,5 +2754,215 @@ mod tests {
 			.0
 			.contains("drop"));
 		assert!(allow(&f, &new(98, 90_000)).unwrap_err().0.contains("drop"));
+	}
+
+	// --- commitments rebuilt from their contents, and the VLS validator ---
+
+	use lightning::ln::chan_utils::HTLCOutputInCommitment;
+	use lightning::types::payment::PaymentHash;
+
+	use crate::vls::OutflowLimit;
+
+	const FEERATE: u32 = 253;
+
+	/// The fee of a commitment with `htlcs` HTLC outputs at [`FEERATE`] (no anchors).
+	fn commitment_fee(htlcs: u64) -> u64 {
+		FEERATE as u64 * (724 + 172 * htlcs) / 1000
+	}
+
+	/// A channel we opened, 100k sat, with real keys on both sides and validation on.
+	struct Real {
+		f: Fixture,
+		params: ChannelTransactionParameters,
+		cp_keys: CounterpartyKeys,
+	}
+
+	fn real(outflow: OutflowLimit) -> Real {
+		let f = fixture(PolicyConfig {
+			commitment_validation: Some(GuardConfig { network: Network::Regtest, outflow }),
+			..Default::default()
+		});
+		let secp = Secp256k1::new();
+		let cp = |n: u8| {
+			PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x50 + n; 32]).unwrap())
+		};
+		let key = |id: &KeyId| f.keys.public_key(id).unwrap();
+		let cp_keys = CounterpartyKeys {
+			funding_pubkey: cp_funding_pk(&f).serialize(),
+			revocation_basepoint: cp(1).serialize(),
+			payment_point: cp_payment_pk().serialize(),
+			delayed_payment_basepoint: cp(3).serialize(),
+			htlc_basepoint: cp(4).serialize(),
+		};
+		let params = ChannelTransactionParameters {
+			holder_pubkeys: ChannelPublicKeys {
+				funding_pubkey: key(&f.funding),
+				revocation_basepoint: RevocationBasepoint(key(&f.revocation)),
+				payment_point: key(&f.payment),
+				delayed_payment_basepoint: DelayedPaymentBasepoint(key(&f.delayed)),
+				htlc_basepoint: HtlcBasepoint(key(&f.htlc)),
+			},
+			holder_selected_contest_delay: 144,
+			is_outbound_from_holder: true,
+			counterparty_parameters: Some(CounterpartyChannelTransactionParameters {
+				pubkeys: ChannelPublicKeys {
+					funding_pubkey: cp_funding_pk(&f),
+					revocation_basepoint: RevocationBasepoint(cp(1)),
+					payment_point: cp_payment_pk(),
+					delayed_payment_basepoint: DelayedPaymentBasepoint(cp(3)),
+					htlc_basepoint: HtlcBasepoint(cp(4)),
+				},
+				selected_contest_delay: 144,
+			}),
+			funding_outpoint: Some(lightning::chain::transaction::OutPoint {
+				txid: Txid::all_zeros(),
+				index: 0,
+			}),
+			splice_parent_funding_txid: None,
+			channel_type_features: features(),
+			channel_value_satoshis: 100_000,
+		};
+		Real { f, params, cp_keys }
+	}
+
+	/// An HTLC of `sat`: `(offered by us, amount, payment hash byte)`.
+	type TestHtlc = (bool, u64, u8);
+
+	impl Real {
+		/// The counterparty's commitment `number` leaving us `ours` sat, the rest (after
+		/// HTLCs and the fee, which we pay) to them.
+		fn counterparty_commitment(&self, number: u64, ours: u64, htlcs: &[TestHtlc]) -> SignItem {
+			let secp = Secp256k1::new();
+			let in_htlcs: u64 = htlcs.iter().map(|h| h.1).sum();
+			let theirs = 100_000 - ours - in_htlcs - commitment_fee(htlcs.len() as u64);
+			let nondust = htlcs
+				.iter()
+				.map(|(ours, sat, hash)| HTLCOutputInCommitment {
+					offered: !ours, // from the broadcaster's side, the counterparty here
+					amount_msat: sat * 1000,
+					cltv_expiry: 500,
+					payment_hash: PaymentHash([*hash; 32]),
+					transaction_output_index: None,
+				})
+				.collect();
+			let point = cp_payment_pk();
+			let commitment = CommitmentTransaction::new(
+				number,
+				&point,
+				theirs,
+				ours,
+				FEERATE,
+				nondust,
+				&self.params.as_counterparty_broadcastable(),
+				&secp,
+			);
+			let tx = commitment.trust().built_transaction().transaction.clone();
+			let redeem = funding_script(&self.f);
+			let mut ctx =
+				base_context(&self.f, SigningOp::CounterpartyCommitment, &tx, &redeem, 100_000);
+			ctx.commitment_number = Some(number);
+			ctx.per_commitment_point = Some(point.serialize());
+			ctx.counterparty_keys = Some(self.cp_keys.clone());
+			ctx.is_outbound = Some(true);
+			ctx.commitment = Some(commitment.encode());
+			SignItem {
+				key_id: self.f.funding,
+				derivation: Derivation::None,
+				digest: digest(&tx, &redeem, 100_000, EcdsaSighashType::All),
+				context: ctx,
+				splice: None,
+			}
+		}
+
+		fn sign(&self, item: &SignItem) -> Result<(), PolicyError> {
+			allow(&self.f, item)
+		}
+	}
+
+	#[test]
+	fn a_commitment_must_be_the_transaction_its_contents_describe() {
+		let r = real(OutflowLimit::Unlimited);
+		let honest = r.counterparty_commitment(START, 99_000, &[]);
+		r.sign(&honest).unwrap();
+
+		// The same description with another transaction behind it: one more output, paying
+		// the host. Everything a party checked before this (sighash, key, number) still holds.
+		let mut forged = r.counterparty_commitment(START - 1, 98_000, &[]);
+		let mut tx: Transaction =
+			deserialize(forged.context.transaction.as_ref().unwrap()).unwrap();
+		tx.output.push(TxOut {
+			value: Amount::from_sat(900),
+			script_pubkey: ScriptBuf::new_op_return([7u8]),
+		});
+		forged.context.transaction = Some(serialize(&tx));
+		forged.digest = digest(&tx, &funding_script(&r.f), 100_000, EcdsaSighashType::All);
+		let err = r.sign(&forged).unwrap_err();
+		assert!(err.0.contains("not the one its balances and HTLCs describe"), "{err}");
+
+		// A description that does not use this channel's keys: the counterparty's delayed key
+		// swapped for one of the host's.
+		let mut other = real(OutflowLimit::Unlimited);
+		other.f = Fixture { ..r.f };
+		let r = other;
+		let mut stranger = r.params.clone();
+		stranger.counterparty_parameters.as_mut().unwrap().pubkeys.delayed_payment_basepoint =
+			DelayedPaymentBasepoint(cp_funding_pk(&r.f));
+		let swapped = Real { f: r.f, params: stranger, cp_keys: r.cp_keys.clone() };
+		let item = swapped.counterparty_commitment(START - 1, 98_000, &[]);
+		let err = swapped.sign(&item).unwrap_err();
+		assert!(err.0.contains("does not follow from its balances"), "{err}");
+
+		// And no description at all.
+		let mut bare = swapped.counterparty_commitment(START - 1, 98_000, &[]);
+		bare.context.commitment = None;
+		assert!(swapped.sign(&bare).unwrap_err().0.contains("missing the commitment"));
+	}
+
+	#[test]
+	fn what_leaves_our_balance_is_counted_against_the_outflow_limit() {
+		let r = real(OutflowLimit::PerDay { sat: 20_000 });
+		let guard = r.f.policy.guard.as_ref().unwrap();
+		r.sign(&r.counterparty_commitment(START, 99_000, &[])).unwrap();
+		assert_eq!(guard.outflow_used_sat(), 0);
+
+		// A payment of our own: 10k offered, counted when it is offered.
+		let paying = r.counterparty_commitment(START - 1, 89_000, &[(true, 10_000, 1)]);
+		r.sign(&paying).unwrap();
+		assert_eq!(guard.outflow_used_sat(), 10_000);
+		// Signing the same commitment again counts nothing more.
+		r.sign(&paying).unwrap();
+		// It settles: the HTLC is gone and the counterparty has the 10k. Nothing new left us
+		// (the fee for the HTLC output comes back to us, who pay the fees).
+		let settled = 89_000 + commitment_fee(1) - commitment_fee(0);
+		r.sign(&r.counterparty_commitment(START - 2, settled, &[])).unwrap();
+		assert_eq!(guard.outflow_used_sat(), 10_000);
+
+		// A second payment that does not fit in what is left of the day's 20k.
+		let too_much = r.counterparty_commitment(START - 3, 74_000, &[(true, 15_000, 2)]);
+		let err = r.sign(&too_much).unwrap_err();
+		assert!(err.0.contains("outflow limit"), "{err}");
+		// One that does.
+		r.sign(&r.counterparty_commitment(START - 3, 81_000, &[(true, 8_000, 2)])).unwrap();
+
+		// No HTLC at all, just less for us and more for them: the same limit.
+		let shifted = r.counterparty_commitment(START - 4, 51_000, &[(true, 8_000, 2)]);
+		let err = r.sign(&shifted).unwrap_err();
+		assert!(err.0.contains("outflow limit"), "{err}");
+		assert_eq!(guard.outflow_used_sat(), 18_000);
+	}
+
+	#[test]
+	fn without_a_limit_payments_pass_but_are_still_validated() {
+		let r = real(OutflowLimit::Unlimited);
+		r.sign(&r.counterparty_commitment(START, 99_000, &[])).unwrap();
+		r.sign(&r.counterparty_commitment(START - 1, 39_000, &[(true, 60_000, 1)])).unwrap();
+		// VLS's own rules still apply: a commitment signed again must not have changed.
+		let changed = r.counterparty_commitment(START - 1, 38_000, &[(true, 61_000, 1)]);
+		let err = r.sign(&changed).unwrap_err();
+		assert!(err.0.contains("retry"), "{err}");
+		// The record survives a restart of the party.
+		let st = r.f.policy.channel_state(&r.f.channel).unwrap();
+		assert_eq!(st.is_outbound, Some(true));
+		assert_eq!(ChannelState::decode(&st.encode()).unwrap(), st);
 	}
 }

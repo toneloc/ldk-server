@@ -23,6 +23,7 @@ done
 for i in "${!PARTIES[@]}"; do
   p="${PARTIES[$i]}"
   "$BIN" --name "$p" --threshold "$THRESHOLD" --listen "127.0.0.1:$((7701 + i))" \
+    --network "${MPC_NETWORK:-signet}" \
     --keystore "$DATA/party-$p" --share-key-file "$DATA/share-$p.key" \
     --auth-key-file "$DATA/client.psk" "${ROSTER[@]}" "$@" \
     > "$DATA/party-$p.log" 2>&1 &

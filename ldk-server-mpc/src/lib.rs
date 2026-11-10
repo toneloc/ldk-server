@@ -30,5 +30,6 @@ pub mod protocol;
 pub mod secure;
 pub mod tdh2;
 pub mod transport;
+pub mod vls;
 
 pub use bitcoin;

@@ -26,6 +26,7 @@ use ldk_server_mpc::mesh::{Identity, PartyInfo};
 use ldk_server_mpc::party::{PartyConfig, PartyService};
 use ldk_server_mpc::policy::{PayoutAllowlist, PolicyConfig};
 use ldk_server_mpc::secure::AtRestKey;
+use ldk_server_mpc::vls::{GuardConfig, OutflowLimit};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -78,6 +79,19 @@ struct Args {
 	/// How many addresses per xpub chain to allow-list.
 	#[arg(long, default_value_t = 2000)]
 	payout_lookahead: u32,
+	/// The network the channels are on: bitcoin, testnet, signet or regtest. It selects the
+	/// limits the validator applies to commitments (stricter on bitcoin).
+	#[arg(long, env = "LDK_MPC_NETWORK", default_value = "bitcoin")]
+	network: ldk_server_mpc::bitcoin::Network,
+	/// The most that may leave our channel balances per hour, in sats, over all channels:
+	/// payments of our own (forwards do not count), fees, and anything else that lowers what
+	/// a commitment leaves us. Each party keeps its own count. Unlimited if neither this nor
+	/// the per-day limit is set.
+	#[arg(long, env = "LDK_MPC_MAX_OUTFLOW_SAT_PER_HOUR")]
+	max_outflow_sat_per_hour: Option<u64>,
+	/// The same limit, per day.
+	#[arg(long, env = "LDK_MPC_MAX_OUTFLOW_SAT_PER_DAY")]
+	max_outflow_sat_per_day: Option<u64>,
 	/// Maximum drop of our channel balance between two consecutive signed commitments, in sats.
 	#[arg(long)]
 	max_balance_decrease_sat: Option<u64>,
@@ -112,10 +126,14 @@ struct Args {
 struct StderrLogger;
 
 impl log::Log for StderrLogger {
-	fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-		true
+	fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+		// The embedded validator reports every payment it sees at info level.
+		!metadata.target().starts_with("lightning_signer") || metadata.level() <= log::Level::Warn
 	}
 	fn log(&self, record: &log::Record<'_>) {
+		if !self.enabled(record.metadata()) {
+			return;
+		}
 		let now = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|d| d.as_millis())
@@ -154,10 +172,20 @@ fn main() {
 			std::process::exit(2);
 		}
 	}
+	let outflow = match (args.max_outflow_sat_per_hour, args.max_outflow_sat_per_day) {
+		(Some(sat), None) => OutflowLimit::PerHour { sat },
+		(None, Some(sat)) => OutflowLimit::PerDay { sat },
+		(None, None) => OutflowLimit::Unlimited,
+		(Some(_), Some(_)) => {
+			eprintln!("set the outflow limit per hour or per day, not both");
+			std::process::exit(2);
+		},
+	};
 	let policy = PolicyConfig {
 		payout: if payout.is_empty() { None } else { Some(payout) },
 		max_holder_balance_decrease_sat: args.max_balance_decrease_sat,
 		max_closing_fee_sat: args.max_closing_fee_sat,
+		commitment_validation: Some(GuardConfig { network: args.network, outflow }),
 	};
 
 	let load_key = |path: &Option<PathBuf>, what: &str| -> Option<[u8; 32]> {

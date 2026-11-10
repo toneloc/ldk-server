@@ -93,7 +93,9 @@ impl Cluster {
 			keystore_dir: self.dirs[i].clone(),
 			protocol_timeout: Duration::from_secs(20),
 			client_timeout: Duration::from_secs(60),
-			policy: Default::default(),
+			// These tests sign made-up transactions; real commitments are covered by the
+			// policy's own tests and the regtest suite.
+			policy: ldk_server_mpc::policy::PolicyConfig::without_commitment_validation(),
 			client_psk: self.keys.client_psk,
 			peer_psk: self.keys.peer_psk,
 			share_key: self.keys.share_key,
@@ -570,6 +572,7 @@ mod revocation {
 			HolderProof {
 				transaction: serialize(&tx),
 				counterparty_sig: Secp256k1::new().sign_ecdsa(&msg, signer).serialize_compact(),
+				commitment: None,
 			}
 		}
 

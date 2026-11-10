@@ -368,6 +368,12 @@ pub struct SigningContext {
 	/// Counterparty's revealed per-commitment secret, for revocation-key derivation checks.
 	pub counterparty_per_commitment_secret: Option<[u8; 32]>,
 	pub holder_balance_sat: Option<u64>,
+	/// Whether we opened the channel.
+	pub is_outbound: Option<bool>,
+	/// For a commitment's funding signature: LDK's serialized `CommitmentTransaction`
+	/// (balances, feerate, HTLCs). A party rebuilds the transaction from it with the keys it
+	/// holds and the counterparty keys it pinned, and signs only if that gives `transaction`.
+	pub commitment: Option<Vec<u8>>,
 }
 
 impl SigningContext {
@@ -401,6 +407,12 @@ impl SigningContext {
 		w.opt_fixed33(self.per_commitment_point.as_ref());
 		w.opt_fixed32(self.counterparty_per_commitment_secret.as_ref());
 		w.opt_u64(self.holder_balance_sat);
+		w.u8(match self.is_outbound {
+			None => 0,
+			Some(false) => 1,
+			Some(true) => 2,
+		});
+		w.opt_bytes(self.commitment.as_deref());
 	}
 
 	fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
@@ -435,6 +447,13 @@ impl SigningContext {
 			per_commitment_point: r.opt_fixed33()?,
 			counterparty_per_commitment_secret: r.opt_fixed32()?,
 			holder_balance_sat: r.opt_u64()?,
+			is_outbound: match r.u8()? {
+				0 => None,
+				1 => Some(false),
+				2 => Some(true),
+				_ => return Err(DecodeError("bad channel direction")),
+			},
+			commitment: r.opt_bytes()?,
 		})
 	}
 }
@@ -448,6 +467,8 @@ pub struct HolderProof {
 	pub transaction: Vec<u8>,
 	/// The counterparty's signature, 64-byte compact encoding.
 	pub counterparty_sig: [u8; 64],
+	/// LDK's serialized `CommitmentTransaction` for it (see [`SigningContext::commitment`]).
+	pub commitment: Option<Vec<u8>>,
 }
 
 impl HolderProof {
@@ -457,6 +478,7 @@ impl HolderProof {
 				w.u8(1);
 				w.bytes(&p.transaction);
 				w.fixed(&p.counterparty_sig);
+				w.opt_bytes(p.commitment.as_deref());
 			},
 			None => w.u8(0),
 		}
@@ -470,7 +492,7 @@ impl HolderProof {
 		let mut counterparty_sig = [0u8; 64];
 		counterparty_sig[..32].copy_from_slice(&r.fixed32()?);
 		counterparty_sig[32..].copy_from_slice(&r.fixed32()?);
-		Ok(Some(HolderProof { transaction, counterparty_sig }))
+		Ok(Some(HolderProof { transaction, counterparty_sig, commitment: r.opt_bytes()? }))
 	}
 }
 
@@ -1213,6 +1235,8 @@ mod tests {
 			per_commitment_point: Some([2u8; 33]),
 			counterparty_per_commitment_secret: None,
 			holder_balance_sat: Some(50_000),
+			is_outbound: Some(true),
+			commitment: Some(vec![1, 2, 3]),
 		}
 	}
 
@@ -1237,7 +1261,11 @@ mod tests {
 				idx: 42,
 				newer: Some((
 					41,
-					HolderProof { transaction: vec![1], counterparty_sig: [2u8; 64] },
+					HolderProof {
+						transaction: vec![1],
+						counterparty_sig: [2u8; 64],
+						commitment: None,
+					},
 				)),
 			},
 			Request::HolderCommitmentValidated {
@@ -1251,6 +1279,7 @@ mod tests {
 				proof: Some(HolderProof {
 					transaction: vec![1, 2, 3],
 					counterparty_sig: [7u8; 64],
+					commitment: Some(vec![5, 6]),
 				}),
 			},
 			Request::CounterpartyRevocationValidated {
@@ -1313,14 +1342,25 @@ mod tests {
 			SessionOp::ReleaseSecret {
 				channel: [2u8; 32],
 				idx: 7,
-				newer: Some((6, HolderProof { transaction: vec![4], counterparty_sig: [5u8; 64] })),
+				newer: Some((
+					6,
+					HolderProof {
+						transaction: vec![4],
+						counterparty_sig: [5u8; 64],
+						commitment: None,
+					},
+				)),
 			},
 			SessionOp::Tdh2Dkg,
 			SessionOp::BindKit { channel: [2u8; 32], kit_id: [3u8; 32] },
 			SessionOp::HolderCommitmentValidated {
 				channel: [2u8; 32],
 				commitment_number: 6,
-				proof: Some(HolderProof { transaction: vec![9], counterparty_sig: [8u8; 64] }),
+				proof: Some(HolderProof {
+					transaction: vec![9],
+					counterparty_sig: [8u8; 64],
+					commitment: None,
+				}),
 			},
 			SessionOp::CounterpartyRevocationValidated {
 				channel: [2u8; 32],

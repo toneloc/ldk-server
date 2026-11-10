@@ -22,14 +22,17 @@ use std::time::{Duration, Instant};
 use e2e_tests::{
 	close_channel, find_available_port, mine_and_sync, mpc_ceremony_binary_path,
 	mpc_party_binary_path, run_cli, send_bolt11_payment, setup_funded_channel, splice_txid,
-	wait_for_channels, wait_for_force_close_claims, LdkServerHandle, TestBitcoind,
+	wait_for_channels, wait_for_event, wait_for_force_close_claims, LdkServerHandle, TestBitcoind,
 	TestConfigBuilder,
 };
 use hex_conservative::FromHex;
 use ldk_node::bitcoin::consensus::encode::deserialize;
 use ldk_node::bitcoin::secp256k1::PublicKey;
 use ldk_node::bitcoin::Transaction;
-use ldk_server_client::ldk_server_grpc::api::{GetBalancesRequest, SpliceOutRequest};
+use ldk_server_client::ldk_server_grpc::api::{
+	Bolt11ReceiveRequest, Bolt11SendRequest, GetBalancesRequest, SpliceOutRequest,
+};
+use ldk_server_client::ldk_server_grpc::events::event_envelope::Event;
 use ldk_server_client::ldk_server_grpc::types::BalanceSource;
 
 const PARTIES: usize = 4;
@@ -50,6 +53,8 @@ struct MpcParties {
 	payout_xpub: Option<String>,
 	/// An address allow-listed on one party only, as `(party, address)`.
 	rogue_payout: Option<(usize, String)>,
+	/// The parties' limit on what may leave our channel balances per day, in sat.
+	outflow_per_day: Option<u64>,
 }
 
 fn wait_for_port(addr: &str) {
@@ -95,6 +100,7 @@ impl MpcParties {
 			keys_dir,
 			payout_xpub: None,
 			rogue_payout: None,
+			outflow_per_day: None,
 		};
 		// One party first: LDK Server only needs to reach a party at startup. The others
 		// start once the server has exported its wallet xpub (see `start_rest`), so every
@@ -107,6 +113,10 @@ impl MpcParties {
 		let mut cmd = Command::new(mpc_party_binary_path());
 		cmd.args(["--name", &format!("party-{i}"), "--threshold", &THRESHOLD.to_string()]);
 		cmd.args(["--listen", &self.client_addrs[i]]);
+		cmd.args(["--network", "regtest"]);
+		if let Some(sat) = self.outflow_per_day {
+			cmd.args(["--max-outflow-sat-per-day", &sat.to_string()]);
+		}
 		cmd.arg("--keystore").arg(&self.keystores[i]);
 		for p in 0..PARTIES {
 			cmd.arg("--party")
@@ -560,4 +570,49 @@ async fn test_mpc_splice() {
 	let funding_after =
 		run_cli(&server_a, &["list-channels"])["channels"][0]["funding_txo"].clone();
 	assert_eq!(funding_after, funding_before);
+}
+
+#[tokio::test]
+async fn test_mpc_outflow_limit() {
+	let bitcoind = TestBitcoind::new();
+	let mut parties = MpcParties::start();
+	// Every party lets at most 15,000 sat a day leave our channel balances.
+	parties.outflow_per_day = Some(15_000);
+	let server_a = start_mpc_server(&bitcoind, &mut parties).await;
+	let server_b = LdkServerHandle::start(&bitcoind).await;
+	setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
+
+	// 10,000 sat out fits. What comes in does not count, and does not buy more room.
+	send_bolt11_payment(&server_a, &server_b, 10_000_000).await;
+	send_bolt11_payment(&server_b, &server_a, 3_000_000).await;
+	tokio::time::sleep(Duration::from_secs(5)).await;
+
+	// 8,000 more would make 18,000. This is the payment a compromised LDK Server would
+	// send to itself: the parties do not sign the commitment that carries it, so the
+	// counterparty never sees it.
+	let mut received = server_b.client().subscribe_events().await.unwrap();
+	let invoice = server_b
+		.client()
+		.bolt11_receive(Bolt11ReceiveRequest {
+			amount_msat: Some(8_000_000),
+			description: None,
+			expiry_secs: 3600,
+		})
+		.await
+		.unwrap();
+	server_a
+		.client()
+		.bolt11_send(Bolt11SendRequest {
+			invoice: invoice.invoice,
+			amount_msat: None,
+			route_parameters: None,
+		})
+		.await
+		.unwrap();
+	let arrived = tokio::time::timeout(
+		Duration::from_secs(10),
+		wait_for_event(&mut received, |event| matches!(event, Event::PaymentReceived(_))),
+	)
+	.await;
+	assert!(arrived.is_err(), "a payment beyond the outflow limit went through");
 }

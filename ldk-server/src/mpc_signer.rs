@@ -243,6 +243,8 @@ impl MpcChannelSigner {
 			per_commitment_point: ctx.per_commitment_point.map(|p| p.serialize()),
 			counterparty_per_commitment_secret: secret.map(|s| s.secret_bytes()),
 			holder_balance_sat: ctx.holder_balance_sat,
+			is_outbound: Some(ctx.is_outbound_from_holder),
+			commitment: ctx.commitment.clone(),
 		}
 	}
 
@@ -419,7 +421,7 @@ impl ExternalChannelSigner for MpcChannelSigner {
 
 	fn holder_commitment_validated(
 		&self, channel_keys_id: [u8; 32], commitment_number: u64, commitment_tx: &Transaction,
-		counterparty_sig: &Signature,
+		counterparty_sig: &Signature, commitment: Vec<u8>, _htlc_preimages: Vec<[u8; 32]>,
 	) -> Result<(), ()> {
 		// The parties do not take our word for it: they check the counterparty's signature on
 		// the commitment transaction themselves before any older state can be revoked.
@@ -427,6 +429,7 @@ impl ExternalChannelSigner for MpcChannelSigner {
 		let proof = HolderProof {
 			transaction: ldk_node::bitcoin::consensus::encode::serialize(commitment_tx),
 			counterparty_sig: counterparty_sig.serialize_compact(),
+			commitment: Some(commitment),
 		};
 		{
 			let mut latest = self.latest_proofs.lock().unwrap();

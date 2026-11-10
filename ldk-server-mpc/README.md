@@ -175,7 +175,14 @@ enough shares that only the third member's policy stands in the way; three hold 
   BOLT 3 derivation, commitment-number monotonicity, our balance (located by script, not by
   metadata) against `--max-balance-decrease-sat`, and payout destinations (`--payout-xpub`,
   `--payout-address`) for closes and sweeps. It also verifies holder-commitment proofs and
-  decides when this party contributes to releasing a per-commitment secret.
+  decides when this party contributes to releasing a per-commitment secret. For a commitment
+  it takes LDK's description of it (balances, feerate, HTLCs), rebuilds the transaction with
+  the keys the parties hold and the counterparty keys it pinned, and requires that to be the
+  transaction it is asked to sign.
+- `src/vls.rs` – the [Validating Lightning Signer](https://gitlab.com/lightning-signer/validating-lightning-signer)'s
+  validator (`vls-core`), run by every party on every commitment: its per-commitment rules,
+  its rule that an HTLC we offer is either a forward or a payment of our own that was
+  approved, and the outflow limit that approves such payments (see below).
 - `src/kit.rs` – channel kits: the file format, the kit store with its kit-to-channel
   bindings, kit generation for the ceremony, and Shamir splitting of the master seed.
 - `src/secure.rs` – forward-secret encrypted framing (X25519 + HKDF-SHA256 + AES-256-GCM)
@@ -281,7 +288,8 @@ ROSTER="--threshold 3 --party a=127.0.0.1:7711=<id a> --party b=127.0.0.1:7712=<
 #    LDK Server and every party need the same file)
 ldk-server-mpc-party --name a --listen 127.0.0.1:7701 --keystore mpc/a $ROSTER \
   --auth-key-file mpc/client.psk --share-key-file mpc/share-a.key \
-  --payout-xpub "$(cat <storage>/onchain_wallet_xpub)" --max-balance-decrease-sat 100000
+  --payout-xpub "$(cat <storage>/onchain_wallet_xpub)" --network bitcoin \
+  --max-outflow-sat-per-day 5000000
 # ... and likewise b, c, d on 7702, 7703, 7704
 
 # 5: once all are up, the first party in the roster runs the TDH2 key generation and every
@@ -390,9 +398,31 @@ cd e2e-tests && cargo test --test mpc -- --test-threads=1   # regtest, downloads
   through the service; cb-mpc's public API has no refresh for TDH2 key shares.
 - **Key generation needs every party**, so a channel cannot open while one is down, and a
   party that loses its keystore cannot rejoin (the others refuse to regenerate a key).
-- **Policy scope.** The balance cap is a per-update delta, not a price-based rule, and off
-  unless `--max-balance-decrease-sat` is set; HTLC accounting (which HTLCs may be settled)
-  is not enforced. Counterparty revocation notices are recorded but not verified.
+- **What a commitment may contain.** A party signs a commitment only if it can rebuild it
+  from its balances and HTLCs with the channel's keys, and VLS's validator accepts it
+  (delays, feerate and fee bounds, HTLC count and value, sequence). VLS's rules that need
+  the block height are off: the parties do not follow the chain. VLS's limits are its
+  defaults for `--network`, among them 16,777,216 sat of HTLCs in flight per channel and
+  channels of at most 10 BTC; they are not configurable here yet.
+- **What may leave our balance.** An HTLC we offer is fine if an HTLC for the same payment
+  hash is offered to us (a forward). Anything else is our own money leaving: payments of our
+  own, dust HTLCs, fees paid to the counterparty's side, a plain shift of balance. Each party
+  counts all of it, over all channels, against `--max-outflow-sat-per-hour` or
+  `--max-outflow-sat-per-day`, and refuses the commitment that would exceed it. That is the
+  bound on what a compromised LDK Server can pay out over Lightning. Things to know:
+  - The limit is off unless set. Without it the validator still runs, but any amount may
+    be paid out.
+  - A refused commitment stops the channel's updates, incoming ones too, until the window
+    has room again. LDK retries by itself. Set the limit above what the node really sends.
+  - Each party counts for itself; a party that was down counts less. Three must agree, so
+    the effective count is that of the third-strictest party.
+  - After a party restarts, payments of ours still in flight are counted again.
+  - `--max-balance-decrease-sat` remains as a per-update cap.
+- **Not from VLS:** invoices are not shown to the parties, so they cannot tell a payment the
+  operator meant from one a compromised host made up; the limit treats both alike. The
+  on-chain wallet is not covered (it is still on the host).
+- **A party that missed updates** takes VLS's sequence up where it finds it instead of
+  refusing, and skips the check of a counterparty revocation it has no point for.
 - **Pinning is trust on first use, once.** The funding script and counterparty basepoints a
   party checks holder commitments against are the ones in the first counterparty commitment
   it signed for the channel. That is the channel open, when the funds still come from the

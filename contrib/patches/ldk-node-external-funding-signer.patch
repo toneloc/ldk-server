@@ -2392,3 +2392,128 @@ index d1784de..f1759bd 100644
 -- 
 2.43.0
 
+From 3a511839fbc16b7047908297d16a23b744ae3823 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 16:27:17 +0000
+Subject: [PATCH] signer: pass the commitment's balances and HTLCs to the
+ external signer
+
+SignContext carries the serialized CommitmentTransaction for commitment
+signatures, and whether we opened the channel; holder_commitment_validated gets
+the same. A signer can then rebuild the transaction with keys it trusts
+(CommitmentTransaction::verify) and apply policy to its content, instead of
+signing whatever transaction it is shown.
+
+Written with the help of an AI tool (Claude).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FEFPxoVaygFeJXwvZUffGz
+---
+ src/signer.rs | 35 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/src/signer.rs b/src/signer.rs
+index f1759bd..97cbcf9 100644
+--- a/src/signer.rs
++++ b/src/signer.rs
+@@ -156,6 +156,15 @@ pub struct SignContext {
+ 	pub per_commitment_point: Option<PublicKey>,
+ 	/// Our balance in the commitment as LDK computed it (informational; verify from the tx).
+ 	pub holder_balance_sat: Option<u64>,
++	/// Whether we opened the channel (and so pay the commitment fees).
++	pub is_outbound_from_holder: bool,
++	/// For a commitment's funding signature: the serialized
++	/// [`CommitmentTransaction`], which carries the balances, the feerate and the HTLCs. A
++	/// signer can rebuild the transaction from it with keys it trusts
++	/// ([`CommitmentTransaction::verify`]) instead of signing whatever `transaction` says.
++	pub commitment: Option<Vec<u8>>,
++	/// Preimages of HTLCs the commitment settles, as far as LDK knows them.
++	pub htlc_preimages: Vec<[u8; 32]>,
+ }
+ 
+ impl SignContext {
+@@ -180,6 +189,9 @@ impl SignContext {
+ 			sighash_type: EcdsaSighashType::All,
+ 			per_commitment_point: None,
+ 			holder_balance_sat: None,
++			is_outbound_from_holder: params.is_outbound_from_holder,
++			commitment: None,
++			htlc_preimages: Vec::new(),
+ 		}
+ 	}
+ 
+@@ -241,9 +253,13 @@ pub trait ExternalChannelSigner: Send + Sync {
+ 	/// `commitment_tx` is that commitment transaction and `counterparty_sig` the counterparty's
+ 	/// signature on its funding input, so the signer can check the claim itself instead of
+ 	/// taking this node's word for it.
++	///
++	/// `commitment` is the serialized [`CommitmentTransaction`] (see
++	/// [`SignContext::commitment`]) and `htlc_preimages` the preimages of outbound HTLCs it
++	/// settles.
+ 	fn holder_commitment_validated(
+ 		&self, channel_keys_id: [u8; 32], commitment_number: u64, commitment_tx: &Transaction,
+-		counterparty_sig: &Signature,
++		counterparty_sig: &Signature, commitment: Vec<u8>, htlc_preimages: Vec<[u8; 32]>,
+ 	) -> Result<(), ()>;
+ 
+ 	/// Informs the signer that the counterparty revoked commitment `idx` with `secret`.
+@@ -418,6 +434,9 @@ impl NodeChannelSigner {
+ 				sighash_type: EcdsaSighashType::All,
+ 				per_commitment_point: None,
+ 				holder_balance_sat: None,
++				is_outbound_from_holder: false,
++				commitment: None,
++				htlc_preimages: Vec::new(),
+ 			},
+ 		};
+ 		context = context.with_input(spend_tx, input_idx, value, witness_script.clone());
+@@ -481,6 +500,9 @@ impl NodeChannelSigner {
+ 			sighash_type: EcdsaSighashType::All,
+ 			per_commitment_point: Some(descriptor.per_commitment_point),
+ 			holder_balance_sat: None,
++			is_outbound_from_holder: false,
++			commitment: None,
++			htlc_preimages: Vec::new(),
+ 		}
+ 		.with_input(spend_tx, input_idx, value, witness_script.clone());
+ 		let key =
+@@ -520,6 +542,8 @@ impl ChannelSigner for NodeChannelSigner {
+ 				holder_tx.commitment_number(),
+ 				&trusted.built_transaction().transaction,
+ 				&holder_tx.counterparty_sig,
++				CommitmentTransaction::encode(holder_tx),
++				outbound_htlc_preimages.iter().map(|p| p.0).collect(),
+ 			)?;
+ 		}
+ 		self.inner.validate_holder_commitment(holder_tx, outbound_htlc_preimages)
+@@ -591,12 +615,18 @@ impl EcdsaChannelSigner for NodeChannelSigner {
+ 		base.commitment_number = Some(commitment_tx.commitment_number());
+ 		base.per_commitment_point = Some(keys.per_commitment_point);
+ 		base.holder_balance_sat = Some(commitment_tx.to_countersignatory_value_sat());
+-		let funding_ctx = base.clone().with_input(
++		let mut funding_ctx = base.clone().with_input(
+ 			&built.transaction,
+ 			0,
+ 			channel_parameters.channel_value_satoshis,
+ 			redeemscript,
+ 		);
++		funding_ctx.commitment = Some(commitment_tx.encode());
++		funding_ctx.htlc_preimages = inbound_htlc_preimages
++			.iter()
++			.chain(outbound_htlc_preimages.iter())
++			.map(|p| p.0)
++			.collect();
+ 		let mut requests = vec![SignRequest {
+ 			key: Self::funding_key(channel_parameters),
+ 			msg: funding_msg,
+@@ -686,6 +716,7 @@ impl EcdsaChannelSigner for NodeChannelSigner {
+ 		ctx.commitment_number = Some(commitment_tx.commitment_number());
+ 		ctx.per_commitment_point = Some(trusted.keys().per_commitment_point);
+ 		ctx.holder_balance_sat = Some(commitment_tx.to_broadcaster_value_sat());
++		ctx.commitment = Some(CommitmentTransaction::encode(commitment_tx));
+ 		self.sign_one(
+ 			ext,
+ 			SignRequest { key: Self::funding_key(channel_parameters), msg, context: ctx },
+-- 
+2.43.0
+

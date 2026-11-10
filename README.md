@@ -88,8 +88,12 @@ Details, diagrams and the threat model are in
   splice transaction they signed, and refuse a splice that pays our balance anywhere but an
   allow-listed address. Fee bumps of a pending splice have not been run with MPC, and a
   splice the parties refuse midway stays pending (see `ldk-server-mpc/README.md`).
-- **Policy.** HTLC-level accounting is not enforced. The balance cap is a per-update delta
-  and is off by default.
+- **Policy.** Every party rebuilds each commitment from its balances and HTLCs and runs the
+  Validating Lightning Signer's validator on it, so it signs nothing but real commitments of
+  the channel. How much may leave our balances is a limit per hour or day that is off by
+  default (`--max-outflow-sat-per-day`); without it a compromised LDK Server can still pay
+  our balance out over Lightning. When the limit is reached the channel stops updating
+  until the window moves on.
 - **Revocation kits.** A kit covers a fixed number of channel states and must be refilled by
   the ceremony before it runs out. The master seed is whole during a ceremony run, offline.
 - **Independence.** The parties must run on separate infrastructure with separate operators
