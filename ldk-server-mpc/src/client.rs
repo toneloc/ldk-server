@@ -1,4 +1,4 @@
-//! Blocking client used by LDK Server's channel signer to talk to MPC Party A (P1).
+//! Blocking client used by LDK Server's channel signer to talk to the MPC parties.
 //!
 //! Each call opens a fresh TCP connection, sends one [`Request`] and reads one [`Response`].
 //! Calls are bounded by `timeout` so LDK's signer callbacks can never block indefinitely.
@@ -6,6 +6,8 @@
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::secp256k1::ecdsa::Signature;
@@ -58,20 +60,31 @@ impl From<io::Error> for ClientError {
 
 #[derive(Clone, Debug)]
 pub struct MpcClient {
-	addr: SocketAddr,
+	/// The parties' client addresses. Any party can lead a request; if one cannot be reached
+	/// the next is tried.
+	addrs: Vec<SocketAddr>,
+	/// The party that answered last, tried first next time.
+	preferred: Arc<AtomicUsize>,
 	connect_timeout: Duration,
 	/// Read/write timeout for ordinary requests.
 	request_timeout: Duration,
 	/// Read timeout for `EnsureKey`, which may run a DKG.
 	dkg_timeout: Duration,
-	/// Pre-shared key for the authenticated, encrypted link to Party A.
+	/// Pre-shared key for the authenticated, encrypted link to the parties.
 	psk: Option<[u8; 32]>,
 }
 
 impl MpcClient {
 	pub fn new(addr: SocketAddr) -> Self {
+		Self::with_parties(vec![addr])
+	}
+
+	/// A client that can send its requests to any of `addrs`.
+	pub fn with_parties(addrs: Vec<SocketAddr>) -> Self {
+		assert!(!addrs.is_empty(), "at least one party address is needed");
 		MpcClient {
-			addr,
+			addrs,
+			preferred: Arc::new(AtomicUsize::new(0)),
 			connect_timeout: Duration::from_secs(5),
 			request_timeout: Duration::from_secs(30),
 			dkg_timeout: Duration::from_secs(120),
@@ -92,12 +105,36 @@ impl MpcClient {
 		self
 	}
 
-	pub fn addr(&self) -> SocketAddr {
-		self.addr
+	pub fn addrs(&self) -> &[SocketAddr] {
+		&self.addrs
 	}
 
+	/// Sends `req` to a party, moving on to the next one when a party cannot be reached or
+	/// cannot reach a quorum itself. A party's refusal on policy grounds is final: the other
+	/// parties took part in that decision.
 	fn call(&self, req: &Request, read_timeout: Duration) -> Result<Response, ClientError> {
-		let stream = TcpStream::connect_timeout(&self.addr, self.connect_timeout)?;
+		let first = self.preferred.load(Ordering::Relaxed);
+		let mut last = None;
+		for n in 0..self.addrs.len() {
+			let i = (first + n) % self.addrs.len();
+			match self.call_one(&self.addrs[i], req, read_timeout) {
+				Err(
+					e @ (ClientError::Io(_)
+					| ClientError::Remote { code: ErrorCode::PeerUnavailable, .. }),
+				) => last = Some(e),
+				other => {
+					self.preferred.store(i, Ordering::Relaxed);
+					return other;
+				},
+			}
+		}
+		Err(last.expect("at least one party address"))
+	}
+
+	fn call_one(
+		&self, addr: &SocketAddr, req: &Request, read_timeout: Duration,
+	) -> Result<Response, ClientError> {
+		let stream = TcpStream::connect_timeout(addr, self.connect_timeout)?;
 		stream.set_nodelay(true)?;
 		stream.set_write_timeout(Some(self.request_timeout))?;
 		stream.set_read_timeout(Some(read_timeout))?;
@@ -166,11 +203,14 @@ impl MpcClient {
 		)?)
 	}
 
+	/// Asks for the per-commitment secret of commitment `idx`. `newer` is a later holder
+	/// commitment and its proof, if the caller has one: a party that missed the validation
+	/// notice can then catch up from this request.
 	pub fn release_commitment_secret(
-		&self, channel: &ChannelId, idx: u64,
+		&self, channel: &ChannelId, idx: u64, newer: Option<(u64, HolderProof)>,
 	) -> Result<[u8; 32], ClientError> {
 		match self.call(
-			&Request::ReleaseCommitmentSecret { channel: *channel, idx },
+			&Request::ReleaseCommitmentSecret { channel: *channel, idx, newer },
 			self.request_timeout,
 		)? {
 			Response::Secret { secret } => Ok(secret),
@@ -199,7 +239,7 @@ impl MpcClient {
 		)?)
 	}
 
-	/// Requests one 2-of-2 signature per item. If `expected_pubkeys` is given (one per item),
+	/// Requests one threshold signature per item. If `expected_pubkeys` is given (one per item),
 	/// each signature is verified locally before being returned.
 	pub fn sign_batch<C: Verification>(
 		&self, secp: &Secp256k1<C>, channel: Option<ChannelId>, items: Vec<SignItem>,

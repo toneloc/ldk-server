@@ -1,3 +1,28 @@
+# cb-mpc signing benchmarks (ldk-server-mpc)
+
+## Threshold signing, three of four (branch `mpc`, 2026-11-09)
+
+Measured with `ldk-server-mpc-bench --mode inproc` (debug build of the Rust code, Release
+build of cb-mpc `0b71670` plus the derivation patch) on a two-core x86-64 Linux container.
+All parties run as threads of one process over an in-memory transport, so the three signing
+parties share two cores; parties on machines of their own would each have a core, but add
+network round trips.
+
+| operation                       | parties       | n  | mean   | p50    | p95    | min    | max    |
+|---------------------------------|---------------|----|--------|--------|--------|--------|--------|
+| key generation                  | 4 (3 needed)  | 5  | 25 ms  | 24 ms  | 28 ms  | 23 ms  | 28 ms  |
+| signature                       | 3 of 4        | 40 | 388 ms | 382 ms | 427 ms | 355 ms | 472 ms |
+| key generation                  | 2 (2 needed)  | 5  | 7 ms   | 7 ms   | 9 ms   | 5 ms   | 9 ms   |
+| signature                       | 2 of 2        | 40 | 188 ms | 186 ms | 210 ms | 172 ms | 221 ms |
+
+In the regtest end-to-end test, on the same machine with four party processes, LDK Server
+logged 380 to 410 ms for one holder-commitment signature. The signatures of one request are
+made one after another, so a commitment update that carries HTLCs takes one such round per
+signature. This is several times slower than the two-party protocol below; it has not been
+measured on the hardware those numbers come from.
+
+The rest of this page is the earlier two-party (ECDSA-2P) measurement, kept for comparison.
+
 # cb-mpc 2-of-2 signing benchmarks (ldk-server-mpc)
 
 Measured 2026-10-07 with `ldk-server-mpc-bench` (release build).

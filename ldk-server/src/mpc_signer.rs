@@ -1,4 +1,4 @@
-//! [`ExternalChannelSigner`] implementation backed by the Coinbase cb-mpc 2-of-2 party service
+//! [`ExternalChannelSigner`] implementation backed by the Coinbase cb-mpc threshold party service
 //! (`ldk-server-mpc`).
 //!
 //! With `coverage = "all"` every channel key (funding, payment, delayed-payment, HTLC and
@@ -43,6 +43,9 @@ pub(crate) struct MpcChannelSigner {
 	/// the next request. Returning an error from LDK's validation callbacks would force-close
 	/// the channel, so notices are best-effort with ordered retry instead.
 	pending_notices: Mutex<Vec<PendingNotice>>,
+	/// The latest validated holder commitment of each channel and its proof. Sent along with
+	/// a release request so a party that missed the validation notice can catch up.
+	latest_proofs: Mutex<HashMap<ChannelId, (u64, HolderProof)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +56,7 @@ enum PendingNotice {
 
 impl MpcChannelSigner {
 	pub(crate) fn new(config: &MpcConfig) -> Result<Self, String> {
-		let mut client = MpcClient::new(config.party_address).with_timeouts(
+		let mut client = MpcClient::with_parties(config.party_addresses.clone()).with_timeouts(
 			Duration::from_secs(5),
 			Duration::from_secs(config.request_timeout_secs),
 			Duration::from_secs(config.dkg_timeout_secs),
@@ -65,7 +68,9 @@ impl MpcChannelSigner {
 						.map_err(|e| format!("failed to load MPC auth key {path}: {e}"))?;
 				client = client.with_psk(psk);
 			},
-			None => log::warn!("mpc.auth_key_path not set: the link to MPC Party A is plain TCP"),
+			None => {
+				log::warn!("mpc.auth_key_path not set: the link to the MPC parties is plain TCP")
+			},
 		}
 		let coverage = match config.coverage {
 			MpcCoverage::Funding => KeyCoverage::FundingOnly,
@@ -77,6 +82,7 @@ impl MpcChannelSigner {
 			secp: Secp256k1::new(),
 			pubkeys: Mutex::new(HashMap::new()),
 			pending_notices: Mutex::new(Vec::new()),
+			latest_proofs: Mutex::new(HashMap::new()),
 		})
 	}
 
@@ -390,11 +396,13 @@ impl ExternalChannelSigner for MpcChannelSigner {
 		&self, channel_keys_id: [u8; 32], idx: u64,
 	) -> Result<[u8; 32], ()> {
 		self.flush_notices().map_err(|e| error!("MPC notice replay failed: {e}"))?;
-		self.client.release_commitment_secret(&Self::channel_id(channel_keys_id), idx).map_err(
-			|e| {
-				error!("MPC release of commitment secret {idx} failed: {e}");
-			},
-		)
+		let channel = Self::channel_id(channel_keys_id);
+		// Commitment numbers count down: a proof helps only if it is for a later state.
+		let newer =
+			self.latest_proofs.lock().unwrap().get(&channel).filter(|(n, _)| *n < idx).cloned();
+		self.client.release_commitment_secret(&channel, idx, newer).map_err(|e| {
+			error!("MPC release of commitment secret {idx} failed: {e}");
+		})
 	}
 
 	fn holder_commitment_validated(
@@ -403,14 +411,18 @@ impl ExternalChannelSigner for MpcChannelSigner {
 	) -> Result<(), ()> {
 		// The parties do not take our word for it: they check the counterparty's signature on
 		// the commitment transaction themselves before any older state can be revoked.
-		self.notify(PendingNotice::HolderCommitmentValidated {
-			channel: Self::channel_id(channel_keys_id),
-			commitment_number,
-			proof: HolderProof {
-				transaction: ldk_node::bitcoin::consensus::encode::serialize(commitment_tx),
-				counterparty_sig: counterparty_sig.serialize_compact(),
-			},
-		});
+		let channel = Self::channel_id(channel_keys_id);
+		let proof = HolderProof {
+			transaction: ldk_node::bitcoin::consensus::encode::serialize(commitment_tx),
+			counterparty_sig: counterparty_sig.serialize_compact(),
+		};
+		{
+			let mut latest = self.latest_proofs.lock().unwrap();
+			if latest.get(&channel).map(|(n, _)| commitment_number < *n).unwrap_or(true) {
+				latest.insert(channel, (commitment_number, proof.clone()));
+			}
+		}
+		self.notify(PendingNotice::HolderCommitmentValidated { channel, commitment_number, proof });
 		Ok(())
 	}
 

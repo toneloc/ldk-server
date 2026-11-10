@@ -285,12 +285,12 @@ fn main() {
 			},
 		};
 		if let Err(e) = mpc_signer.ping() {
-			error!("MPC party A at {} is unreachable: {e}", mpc_config.party_address);
+			error!("No MPC party at {:?} is reachable: {e}", mpc_config.party_addresses);
 			std::process::exit(-1);
 		}
 		info!(
-			"Channel keys are 2-of-2 MPC-backed via party A at {} (coverage: {:?})",
-			mpc_config.party_address, mpc_config.coverage
+			"Channel keys are threshold MPC-backed via the parties at {:?} (coverage: {:?})",
+			mpc_config.party_addresses, mpc_config.coverage
 		);
 		builder.set_external_channel_signer(Arc::new(mpc_signer));
 	}

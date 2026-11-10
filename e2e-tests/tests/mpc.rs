@@ -7,8 +7,9 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! End-to-end tests of LDK Server with Coinbase cb-mpc 2-of-2 MPC-backed channel keys, on
-//! regtest. Two MPC party processes are started and the offline ceremony tool makes their
+//! End-to-end tests of LDK Server with Coinbase cb-mpc threshold MPC-backed channel keys, on
+//! regtest. Four MPC party processes are started, any three of which must agree to sign or to
+//! release a revocation secret, and the offline ceremony tool makes their
 //! channel kits (threshold-encrypted revocation secrets); server A is configured with `[mpc]`
 //! and opens a channel to a plain server B.
 
@@ -30,48 +31,22 @@ use ldk_node::bitcoin::Transaction;
 use ldk_server_client::ldk_server_grpc::api::GetBalancesRequest;
 use ldk_server_client::ldk_server_grpc::types::BalanceSource;
 
-/// Two MPC party processes (P2 then P1) with their own keystores.
-struct MpcParties {
-	p1: Option<Child>,
-	p2: Option<Child>,
-	p1_addr: String,
-	p2_addr: String,
-	keystore_a: PathBuf,
-	keystore_b: PathBuf,
-	/// Key files: client PSK (LDK Server <-> A), peer PSK (A <-> B), share keys (at rest).
-	keys_dir: PathBuf,
-	/// BIP 84 account xpub of server A's on-chain wallet, allow-listed on Party B.
-	payout_xpub: Option<String>,
-}
+const PARTIES: usize = 4;
+const THRESHOLD: usize = 3;
 
-fn spawn_party(
-	role: &str, listen: &str, peer: Option<&str>, keystore: &Path, keys_dir: &Path,
-	payout_xpub: Option<&str>,
-) -> Child {
-	let mut cmd = Command::new(mpc_party_binary_path());
-	cmd.args(["--role", role, "--listen", listen, "--keystore", keystore.to_str().unwrap()]);
-	if let Some(peer) = peer {
-		cmd.args(["--peer", peer]);
-	}
-	cmd.arg("--peer-auth-key-file").arg(keys_dir.join("peer.psk"));
-	cmd.arg("--share-key-file").arg(keys_dir.join(format!("share-{role}.key")));
-	if role == "p1" {
-		cmd.arg("--auth-key-file").arg(keys_dir.join("client.psk"));
-	}
-	if let Some(xpub) = payout_xpub {
-		cmd.args(["--payout-xpub", xpub, "--payout-lookahead", "200"]);
-		// Pay-per-update cap generous enough for the test payments (10M msat max per hop).
-		cmd.args(["--max-balance-decrease-sat", "20000"]);
-	}
-	let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-	let stderr = child.stderr.take().unwrap();
-	let tag = format!("mpc-{role}");
-	std::thread::spawn(move || {
-		for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-			eprintln!("[{tag}] {line}");
-		}
-	});
-	child
+/// Four MPC party processes, any three of which must agree, each with its own keystore.
+struct MpcParties {
+	children: Vec<Option<Child>>,
+	/// Where each party takes LDK Server's requests, and where it takes the other parties.
+	client_addrs: Vec<String>,
+	peer_addrs: Vec<String>,
+	keystores: Vec<PathBuf>,
+	/// Each party's identity public key (hex), as printed by `--print-identity`.
+	identities: Vec<String>,
+	/// Key files: client PSK (LDK Server <-> parties) and each party's share key (at rest).
+	keys_dir: PathBuf,
+	/// BIP 84 account xpub of server A's on-chain wallet, allow-listed on every party.
+	payout_xpub: Option<String>,
 }
 
 fn wait_for_port(addr: &str) {
@@ -85,68 +60,138 @@ fn wait_for_port(addr: &str) {
 impl MpcParties {
 	fn start() -> Self {
 		#[allow(deprecated)]
-		let keystore_a = tempfile::tempdir().unwrap().into_path();
-		#[allow(deprecated)]
-		let keystore_b = tempfile::tempdir().unwrap().into_path();
-		#[allow(deprecated)]
 		let keys_dir = tempfile::tempdir().unwrap().into_path();
-		let p1_addr = format!("127.0.0.1:{}", find_available_port());
-		let p2_addr = format!("127.0.0.1:{}", find_available_port());
+		#[allow(deprecated)]
+		let keystores: Vec<PathBuf> =
+			(0..PARTIES).map(|_| tempfile::tempdir().unwrap().into_path()).collect();
+		let addr = || format!("127.0.0.1:{}", find_available_port());
+		// Each party creates its identity key and prints the public half; the operators
+		// exchange those before any party starts.
+		let identities = keystores
+			.iter()
+			.enumerate()
+			.map(|(i, keystore)| {
+				let out = Command::new(mpc_party_binary_path())
+					.arg("--keystore")
+					.arg(keystore)
+					.arg("--share-key-file")
+					.arg(keys_dir.join(format!("share-{i}.key")))
+					.arg("--print-identity")
+					.output()
+					.unwrap();
+				assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+				String::from_utf8(out.stdout).unwrap().trim().to_string()
+			})
+			.collect();
 		let mut parties = MpcParties {
-			p1: None,
-			p2: None,
-			p1_addr,
-			p2_addr,
-			keystore_a,
-			keystore_b,
+			children: (0..PARTIES).map(|_| None).collect(),
+			client_addrs: (0..PARTIES).map(|_| addr()).collect(),
+			peer_addrs: (0..PARTIES).map(|_| addr()).collect(),
+			keystores,
+			identities,
 			keys_dir,
 			payout_xpub: None,
 		};
-		// Party A first: LDK Server only needs A at startup. Party B is started once the
-		// server has exported its wallet xpub (see `start_b`), so B can allow-list it.
-		parties.spawn_a();
+		// One party first: LDK Server only needs to reach a party at startup. The others
+		// start once the server has exported its wallet xpub (see `start_rest`), so every
+		// party can allow-list it.
+		parties.spawn(0);
 		parties
 	}
 
-	fn spawn_a(&mut self) {
-		self.p1 = Some(spawn_party(
-			"p1",
-			&self.p1_addr,
-			Some(&self.p2_addr),
-			&self.keystore_a,
-			&self.keys_dir,
-			None,
-		));
-		wait_for_port(&self.p1_addr);
+	fn spawn(&mut self, i: usize) {
+		let mut cmd = Command::new(mpc_party_binary_path());
+		cmd.args(["--name", &format!("party-{i}"), "--threshold", &THRESHOLD.to_string()]);
+		cmd.args(["--listen", &self.client_addrs[i]]);
+		cmd.arg("--keystore").arg(&self.keystores[i]);
+		for p in 0..PARTIES {
+			cmd.arg("--party")
+				.arg(format!("party-{p}={}={}", self.peer_addrs[p], self.identities[p]));
+		}
+		cmd.arg("--auth-key-file").arg(self.keys_dir.join("client.psk"));
+		cmd.arg("--share-key-file").arg(self.keys_dir.join(format!("share-{i}.key")));
+		if let Some(xpub) = &self.payout_xpub {
+			cmd.args(["--payout-xpub", xpub, "--payout-lookahead", "200"]);
+			// Pay-per-update cap generous enough for the test payments (10M msat max per hop).
+			cmd.args(["--max-balance-decrease-sat", "20000"]);
+		}
+		let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+		let stderr = child.stderr.take().unwrap();
+		let tag = format!("mpc-{i}");
+		std::thread::spawn(move || {
+			for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+				eprintln!("[{tag}] {line}");
+			}
+		});
+		self.children[i] = Some(child);
+		wait_for_port(&self.client_addrs[i]);
+		wait_for_port(&self.peer_addrs[i]);
 	}
 
-	/// Starts Party B with `payout_xpub` allow-listed.
-	fn start_b(&mut self, payout_xpub: &str) {
+	fn kill(&mut self, i: usize) {
+		if let Some(mut child) = self.children[i].take() {
+			let _ = child.kill();
+			let _ = child.wait();
+		}
+	}
+
+	/// Starts the remaining parties, and restarts the first, with `payout_xpub` allow-listed.
+	fn start_rest(&mut self, payout_xpub: &str) {
 		self.payout_xpub = Some(payout_xpub.to_string());
-		self.spawn_b();
+		self.kill(0);
+		for i in 0..PARTIES {
+			self.spawn(i);
+		}
 	}
 
-	fn spawn_b(&mut self) {
-		self.p2 = Some(spawn_party(
-			"p2",
-			&self.p2_addr,
-			None,
-			&self.keystore_b,
-			&self.keys_dir,
-			self.payout_xpub.as_deref(),
-		));
-		wait_for_port(&self.p2_addr);
+	/// Kills every party and starts them again on the same keystores.
+	fn restart(&mut self) {
+		for i in 0..PARTIES {
+			self.kill(i);
+		}
+		for i in 0..PARTIES {
+			self.spawn(i);
+		}
 	}
 
-	fn spawn_all(&mut self) {
-		self.spawn_b();
-		self.spawn_a();
+	fn client_psk_path(&self) -> PathBuf {
+		self.keys_dir.join("client.psk")
+	}
+
+	fn share_count(dir: &Path) -> usize {
+		// Shares are encrypted at rest; only count them.
+		std::fs::read_dir(dir)
+			.unwrap()
+			.filter_map(|e| e.ok())
+			.filter(|e| e.path().extension().map(|x| x == "share").unwrap_or(false))
+			.count()
+	}
+
+	/// Joint public keys of all shares held by the first party (derived from the shares).
+	fn first_party_pubkeys(&self) -> Vec<PublicKey> {
+		let mut keys = Vec::new();
+		for entry in std::fs::read_dir(&self.keystores[0]).unwrap().filter_map(|e| e.ok()) {
+			if entry.path().extension().map(|x| x == "share").unwrap_or(false) {
+				let bytes = std::fs::read(entry.path()).unwrap();
+				assert!(
+					ldk_server_mpc::secure::AtRestKey::is_encrypted(&bytes),
+					"share not encrypted"
+				);
+				let share_key: [u8; 32] =
+					std::fs::read(self.keys_dir.join("share-0.key")).unwrap().try_into().unwrap();
+				let plain =
+					ldk_server_mpc::secure::AtRestKey::new(&share_key).open(&bytes).unwrap();
+				let share = ldk_server_mpc::mp::KeyShare(plain);
+				keys.push(PublicKey::from_slice(&share.public_key_compressed().unwrap()).unwrap());
+			}
+		}
+		keys
 	}
 
 	/// Runs the offline ceremony with the real tool: a master seed split among three
-	/// custodians, two of whom then make `kits` channel kits. Both parties get a copy.
+	/// custodians, two of whom then make `kits` channel kits. Every party gets a copy.
 	fn run_ceremony(&self, kits: u32, states: u32) {
-		let tdh2_pub = self.keystore_a.join("tdh2.pub");
+		let tdh2_pub = self.keystores[0].join("tdh2.pub");
 		let start = Instant::now();
 		while !tdh2_pub.exists() {
 			assert!(
@@ -198,7 +243,7 @@ impl MpcParties {
 			"--out-dir",
 			kit_dir.to_str().unwrap(),
 		]);
-		for keystore in [&self.keystore_a, &self.keystore_b] {
+		for keystore in &self.keystores {
 			let dest = keystore.join("kits");
 			std::fs::create_dir_all(&dest).unwrap();
 			for entry in std::fs::read_dir(&kit_dir).unwrap().filter_map(|e| e.ok()) {
@@ -215,68 +260,23 @@ impl MpcParties {
 			.filter(|e| e.path().extension().map(|x| x == "bound").unwrap_or(false))
 			.count()
 	}
-
-	fn client_psk_path(&self) -> PathBuf {
-		self.keys_dir.join("client.psk")
-	}
-
-	fn kill_all(&mut self) {
-		for child in [self.p1.take(), self.p2.take()].into_iter().flatten() {
-			let mut child = child;
-			let _ = child.kill();
-			let _ = child.wait();
-		}
-	}
-
-	/// Kills both parties and starts them again on the same keystores.
-	fn restart(&mut self) {
-		self.kill_all();
-		self.spawn_all();
-	}
-
-	fn share_count(dir: &Path) -> usize {
-		// Shares are encrypted at rest; only count them.
-		std::fs::read_dir(dir)
-			.unwrap()
-			.filter_map(|e| e.ok())
-			.filter(|e| e.path().extension().map(|x| x == "share").unwrap_or(false))
-			.count()
-	}
-
-	/// Aggregate public keys of all shares held by party A (derived from the share blobs).
-	fn party_a_pubkeys(&self) -> Vec<PublicKey> {
-		let mut keys = Vec::new();
-		for entry in std::fs::read_dir(&self.keystore_a).unwrap().filter_map(|e| e.ok()) {
-			if entry.path().extension().map(|x| x == "share").unwrap_or(false) {
-				let bytes = std::fs::read(entry.path()).unwrap();
-				assert!(
-					ldk_server_mpc::secure::AtRestKey::is_encrypted(&bytes),
-					"share not encrypted"
-				);
-				let share_key: [u8; 32] =
-					std::fs::read(self.keys_dir.join("share-p1.key")).unwrap().try_into().unwrap();
-				let plain =
-					ldk_server_mpc::secure::AtRestKey::new(&share_key).open(&bytes).unwrap();
-				let blob = ldk_server_mpc::cbmpc::KeyBlob(plain);
-				keys.push(PublicKey::from_slice(&blob.public_key_compressed().unwrap()).unwrap());
-			}
-		}
-		keys
-	}
 }
 
 impl Drop for MpcParties {
 	fn drop(&mut self) {
-		self.kill_all();
-		let _ = std::fs::remove_dir_all(&self.keystore_a);
-		let _ = std::fs::remove_dir_all(&self.keystore_b);
+		for i in 0..PARTIES {
+			self.kill(i);
+		}
+		for keystore in &self.keystores {
+			let _ = std::fs::remove_dir_all(keystore);
+		}
 		let _ = std::fs::remove_dir_all(&self.keys_dir);
 	}
 }
 
-/// Starts the MPC-backed server, then Party B with the server's wallet xpub allow-listed.
+/// Starts the MPC-backed server, then every party with the server's wallet xpub allow-listed.
 async fn start_mpc_server(bitcoind: &TestBitcoind, parties: &mut MpcParties) -> LdkServerHandle {
-	let party_address = parties.p1_addr.clone();
+	let party_address = parties.client_addrs.join(",");
 	let auth_key_path = parties.client_psk_path();
 	let server = LdkServerHandle::start_with_config(bitcoind, move |params| {
 		let mut config = TestConfigBuilder::new(params).alias(Some("mpc-node")).build();
@@ -295,8 +295,8 @@ async fn start_mpc_server(bitcoind: &TestBitcoind, parties: &mut MpcParties) -> 
 	})
 	.await;
 	let xpub = std::fs::read_to_string(server.storage_dir.join("onchain_wallet_xpub")).unwrap();
-	parties.start_b(xpub.trim());
-	// With both parties up they generate their joint TDH2 key; the ceremony then makes the
+	parties.start_rest(xpub.trim());
+	// With every party up they generate their joint TDH2 key; the ceremony then makes the
 	// kits a channel needs before it can open.
 	parties.run_ceremony(2, 400);
 	server
@@ -367,16 +367,16 @@ async fn test_mpc_channel_open_pay_and_coop_close() {
 	assert_separate_wallet_mnemonic(&server_a);
 	let user_channel_id = setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 
-	// Exactly one distributed key was generated and each party holds one share.
 	// Five distributed keys (funding, payment, delayed-payment, HTLC, revocation) were
-	// generated for the channel and each party holds one share of each.
-	assert_eq!(MpcParties::share_count(&parties.keystore_a), 5);
-	assert_eq!(MpcParties::share_count(&parties.keystore_b), 5);
-	let mpc_pubkeys = parties.party_a_pubkeys();
+	// generated for the channel and each of the four parties holds one share of each.
+	for keystore in &parties.keystores {
+		assert_eq!(MpcParties::share_count(keystore), 5);
+	}
+	let mpc_pubkeys = parties.first_party_pubkeys();
 	assert_eq!(mpc_pubkeys.len(), 5);
-	// The channel took one of the two kits, on both parties, and neither party holds a seed
-	// for the revocation secrets.
-	for keystore in [&parties.keystore_a, &parties.keystore_b] {
+	// The channel took one of the two kits, on every party, and no party holds a seed for
+	// the revocation secrets.
+	for keystore in &parties.keystores {
 		assert_eq!(MpcParties::bound_kits(keystore), 1);
 		assert!(!keystore.join("master.secret").exists());
 	}
@@ -389,13 +389,25 @@ async fn test_mpc_channel_open_pay_and_coop_close() {
 	parties.restart();
 	send_bolt11_payment(&server_a, &server_b, 1_000_000).await;
 
+	// Any three of the four parties are enough. With the last party down, payments go
+	// through in both directions; the same with the first party down, the one LDK Server
+	// was talking to.
+	parties.kill(3);
+	send_bolt11_payment(&server_a, &server_b, 1_000_000).await;
+	send_bolt11_payment(&server_b, &server_a, 500_000).await;
+	parties.spawn(3);
+	parties.kill(0);
+	send_bolt11_payment(&server_a, &server_b, 1_000_000).await;
+	send_bolt11_payment(&server_b, &server_a, 500_000).await;
+	parties.spawn(0);
+
 	// Restart LDK Server: channel signers are re-derived through the MPC service.
 	let mut server_a = server_a;
 	server_a.restart().await;
 	let channels = wait_for_channels(&server_a, 1, Duration::from_secs(30)).await;
 	let funding = channels[0].funding_txo.clone().expect("funding txo");
 	send_bolt11_payment(&server_b, &server_a, 500_000).await;
-	assert_eq!(MpcParties::share_count(&parties.keystore_a), 5, "no new keys after restart");
+	assert_eq!(MpcParties::share_count(&parties.keystores[0]), 5, "no new keys after restart");
 
 	let balances_before = server_a.client().get_balances(GetBalancesRequest {}).await.unwrap();
 
@@ -426,9 +438,13 @@ async fn test_mpc_channel_force_close() {
 
 	let user_channel_id = setup_funded_channel(&bitcoind, &server_a, &server_b, 100_000).await;
 	send_bolt11_payment(&server_a, &server_b, 5_000_000).await;
+	// The payment is reported once the preimage is back, a few signing rounds before the HTLC
+	// is gone from both commitments. Let those finish, so the force-closed commitment carries
+	// balances only and each side ends with the single claim checked below.
+	tokio::time::sleep(Duration::from_secs(5)).await;
 	let channels = wait_for_channels(&server_a, 1, Duration::from_secs(30)).await;
 	let funding = channels[0].funding_txo.clone().expect("funding txo");
-	let mpc_pubkeys = parties.party_a_pubkeys();
+	let mpc_pubkeys = parties.first_party_pubkeys();
 
 	// Holder force-close: our commitment transaction is signed with the MPC funding key and
 	// broadcast by server A.

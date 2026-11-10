@@ -260,18 +260,19 @@ Two resolution methods are supported via the `mode` field:
 
 ### `[mpc]`
 
-Enables 2-of-2 MPC-backed channel keys via the Coinbase cb-mpc party service
-(`ldk-server-mpc`). `party_address` is the address of MPC Party A (the cb-mpc P1 service,
-the only party LDK Server talks to). `coverage` is `"all"` (default: every channel key is
+Enables threshold MPC-backed channel keys via the Coinbase cb-mpc party service
+(`ldk-server-mpc`). `party_address` lists the client addresses of the MPC parties, separated
+by commas; LDK Server sends each request to one of them and moves to the next when a party
+cannot be reached. `coverage` is `"all"` (default: every channel key is
 distributed, and the per-commitment secrets are threshold-encrypted channel kits made by the
 offline `ldk-server-mpc-ceremony`; a channel cannot open until the parties have an unused kit)
 or `"funding"` (funding key only). `auth_key_path`
-is the 32-byte pre-shared key file Party A was started with (`--auth-key-file`); it
+is the 32-byte pre-shared key file the parties were started with (`--auth-key-file`); it
 authenticates and encrypts the link. Optional `request_timeout_secs` (default 30) bounds
 signing requests and `dkg_timeout_secs` (default 120) bounds first-use key generation. Only
 enable on a fresh node. Also available as `--mpc-party-address` or
 `LDK_SERVER_MPC_PARTY_ADDRESS`. LDK Server writes the on-chain wallet's BIP 84 account xpub to
-`<storage>/onchain_wallet_xpub` so MPC Party B can be started with `--payout-xpub`. See
+`<storage>/onchain_wallet_xpub` so the MPC parties can be started with `--payout-xpub`. See
 [`ldk-server-mpc/README.md`](../ldk-server-mpc/README.md).
 
 ## Storage Layout

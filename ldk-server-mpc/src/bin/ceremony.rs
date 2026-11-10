@@ -17,9 +17,9 @@
 //!     --kit <kit id hex> --from-state 50000 --states 50000 --out-dir ./kits
 //! ```
 //!
-//! `tdh2.pub` is written by Party A to its keystore after the parties' key generation. Copy the
-//! resulting `.kit` files to the kit directory of **both** parties; they hold only public points
-//! and ciphertexts.
+//! `tdh2.pub` is written by every party to its keystore after the parties' key generation.
+//! Copy the resulting `.kit` files to the kit directory of **every** party; they hold only
+//! public points and ciphertexts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,7 +50,7 @@ struct SeedArgs {
 	/// The seed fingerprint printed by `new-seed`. The run stops if the rebuilt seed differs.
 	#[arg(long)]
 	fingerprint: String,
-	/// The parties' joint TDH2 public key file (`tdh2.pub` from Party A's keystore).
+	/// The parties' joint TDH2 public key file (`tdh2.pub` from a party's keystore).
 	#[arg(long)]
 	tdh2_public_key: PathBuf,
 	/// Directory to write the kit files to.

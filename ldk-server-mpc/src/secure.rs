@@ -1,4 +1,4 @@
-//! Authenticated, encrypted framing over TCP for the party links.
+//! Encrypted framing over TCP for the links to and between the parties.
 //!
 //! Both ends share a 32-byte pre-shared key (PSK). A connection starts with a handshake:
 //! each side sends a random 32-byte nonce and an ephemeral X25519 public key; both derive
@@ -8,8 +8,9 @@
 //! sides; the ephemeral agreement gives forward secrecy.
 //!
 //! The PSK files are generated on first start with `0600` permissions and must be copied to
-//! the other end out of band. Two different keys are used: one between LDK Server and
-//! Party A, one between Party A and Party B.
+//! the other end out of band. LDK Server and the parties share one. Between parties the PSK
+//! is optional: they authenticate each other with identity keys, by signing the handshake's
+//! binding value (see [`crate::mesh`]).
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -89,6 +90,9 @@ pub struct SecureStream {
 	stream: TcpStream,
 	send: Direction,
 	recv: Direction,
+	/// A value both ends derive from the handshake and nobody else can. Signing it proves a
+	/// party's identity on this very connection (see `mesh`).
+	binding: [u8; 32],
 }
 
 impl SecureStream {
@@ -129,13 +133,16 @@ impl SecureStream {
 		salt_input.extend_from_slice(&first_nonce);
 		salt_input.extend_from_slice(&second_nonce);
 
-		let keys: [[u8; 32]; 2] = agree_ephemeral(my_priv, &their_pub, |shared| {
+		let keys: [[u8; 32]; 3] = agree_ephemeral(my_priv, &their_pub, |shared| {
 			let mut ikm = Vec::with_capacity(64);
 			ikm.extend_from_slice(shared);
 			ikm.extend_from_slice(psk);
 			let prk = Salt::new(HKDF_SHA256, &salt_input).extract(&ikm);
-			let mut out = [[0u8; 32]; 2];
-			for (i, label) in [&b"ldk-mpc i->r"[..], &b"ldk-mpc r->i"[..]].iter().enumerate() {
+			let mut out = [[0u8; 32]; 3];
+			for (i, label) in [&b"ldk-mpc i->r"[..], &b"ldk-mpc r->i"[..], &b"ldk-mpc binding"[..]]
+				.iter()
+				.enumerate()
+			{
 				let info = [*label];
 				let okm = prk.expand(&info, HkdfLen(32)).expect("hkdf expand");
 				okm.fill(&mut out[i]).expect("hkdf fill");
@@ -150,6 +157,7 @@ impl SecureStream {
 			stream,
 			send: Direction::new(&send_key),
 			recv: Direction::new(&recv_key),
+			binding: keys[2],
 		};
 
 		// Key confirmation: each side seals an empty frame; a wrong PSK fails here, before any
@@ -168,39 +176,88 @@ impl SecureStream {
 	}
 
 	pub fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
-		if payload.len() > MAX_FRAME_LEN {
-			return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
-		}
-		let nonce = self.send.next_nonce()?;
-		let mut buf = payload.to_vec();
-		self.send
-			.key
-			.seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
-			.map_err(|_| io::Error::other("seal failed"))?;
-		write_frame(&mut self.stream, &buf)
+		seal_frame(&mut self.stream, &mut self.send, payload)
 	}
 
 	pub fn read_frame(&mut self) -> io::Result<Vec<u8>> {
-		let mut buf = read_frame(&mut self.stream)?;
-		if buf.len() < TAG_LEN {
-			return Err(io::Error::new(io::ErrorKind::InvalidData, "short ciphertext"));
-		}
-		let nonce = self.recv.next_nonce()?;
-		let plain_len = self
-			.recv
-			.key
-			.open_in_place(nonce, Aad::empty(), &mut buf)
-			.map_err(|_| {
-				io::Error::new(io::ErrorKind::PermissionDenied, "frame authentication failed")
-			})?
-			.len();
-		buf.truncate(plain_len);
-		Ok(buf)
+		open_frame(&mut self.stream, &mut self.recv)
+	}
+
+	pub fn binding(&self) -> [u8; 32] {
+		self.binding
+	}
+
+	/// Splits the connection so one thread can read while another writes.
+	pub fn split(self) -> io::Result<(SecureReader, SecureWriter)> {
+		let read_half = self.stream.try_clone()?;
+		Ok((
+			SecureReader { stream: read_half, recv: self.recv },
+			SecureWriter { stream: self.stream, send: self.send },
+		))
 	}
 
 	pub fn set_timeouts(&self, timeout: std::time::Duration) -> io::Result<()> {
 		self.stream.set_read_timeout(Some(timeout))?;
 		self.stream.set_write_timeout(Some(timeout))
+	}
+}
+
+fn seal_frame(stream: &mut TcpStream, send: &mut Direction, payload: &[u8]) -> io::Result<()> {
+	if payload.len() > MAX_FRAME_LEN {
+		return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
+	}
+	let nonce = send.next_nonce()?;
+	let mut buf = payload.to_vec();
+	send.key
+		.seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
+		.map_err(|_| io::Error::other("seal failed"))?;
+	write_frame(stream, &buf)
+}
+
+fn open_frame(stream: &mut TcpStream, recv: &mut Direction) -> io::Result<Vec<u8>> {
+	let mut buf = read_frame(stream)?;
+	if buf.len() < TAG_LEN {
+		return Err(io::Error::new(io::ErrorKind::InvalidData, "short ciphertext"));
+	}
+	let nonce = recv.next_nonce()?;
+	let plain_len = recv
+		.key
+		.open_in_place(nonce, Aad::empty(), &mut buf)
+		.map_err(|_| {
+			io::Error::new(io::ErrorKind::PermissionDenied, "frame authentication failed")
+		})?
+		.len();
+	buf.truncate(plain_len);
+	Ok(buf)
+}
+
+/// The reading half of a split [`SecureStream`].
+pub struct SecureReader {
+	stream: TcpStream,
+	recv: Direction,
+}
+
+impl SecureReader {
+	pub fn read_frame(&mut self) -> io::Result<Vec<u8>> {
+		open_frame(&mut self.stream, &mut self.recv)
+	}
+}
+
+/// The writing half of a split [`SecureStream`].
+pub struct SecureWriter {
+	stream: TcpStream,
+	send: Direction,
+}
+
+impl SecureWriter {
+	pub fn write_frame(&mut self, payload: &[u8]) -> io::Result<()> {
+		seal_frame(&mut self.stream, &mut self.send, payload)
+	}
+
+	/// Closes the connection in both directions, which also ends a blocked read on the other
+	/// half.
+	pub fn shutdown(&self) {
+		let _ = self.stream.shutdown(std::net::Shutdown::Both);
 	}
 }
 

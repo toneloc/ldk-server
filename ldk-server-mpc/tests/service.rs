@@ -1,4 +1,5 @@
-//! End-to-end tests of the party services over TCP: client -> P1 -> P2.
+//! End-to-end tests of the party services over TCP: a client and four parties, any three of
+//! which must agree.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -7,8 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ldk_server_mpc::bitcoin::secp256k1::{Message, Secp256k1};
-use ldk_server_mpc::cbmpc::Party;
 use ldk_server_mpc::client::{ClientError, MpcClient};
+use ldk_server_mpc::mesh::{Identity, PartyInfo};
 use ldk_server_mpc::party::{PartyConfig, PartyService};
 use ldk_server_mpc::protocol::{ErrorCode, SigningContext, SigningOp};
 
@@ -20,91 +21,251 @@ fn tmp_dir(name: &str) -> PathBuf {
 	d
 }
 
-struct Pair {
-	p1: Arc<PartyService>,
-	p2: Arc<PartyService>,
-	p1_addr: SocketAddr,
+/// Keys used to secure a cluster's links and shares, if any.
+#[derive(Clone, Copy, Default)]
+struct Keys {
+	client_psk: Option<[u8; 32]>,
+	peer_psk: Option<[u8; 32]>,
+	share_key: Option<[u8; 32]>,
 }
 
-fn start_party(
-	party: Party, peer: Option<SocketAddr>, keystore: PathBuf,
-) -> (Arc<PartyService>, SocketAddr) {
-	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-	let addr = listener.local_addr().unwrap();
-	let cfg = PartyConfig {
-		party,
-		listen_addr: addr,
-		peer_addr: peer,
-		keystore_dir: keystore,
-		p1_name: "test-party-a".into(),
-		p2_name: "test-party-b".into(),
-		protocol_timeout: Duration::from_secs(30),
-		client_timeout: Duration::from_secs(60),
-		policy: Default::default(),
-		client_psk: None,
-		peer_psk: None,
-		share_key: None,
-		kit_dir: None,
-	};
-	let svc = PartyService::new(cfg).unwrap();
-	let s = Arc::clone(&svc);
-	thread::spawn(move || s.serve_on(listener).unwrap());
-	(svc, addr)
+/// A set of parties on loopback. A party can be stopped and started again on the same
+/// keystore, addresses and identity.
+struct Cluster {
+	threshold: usize,
+	infos: Vec<PartyInfo>,
+	identities: Vec<Vec<u8>>,
+	client_addrs: Vec<SocketAddr>,
+	dirs: Vec<PathBuf>,
+	keys: Keys,
+	parties: Vec<Option<Arc<PartyService>>>,
+	/// Listeners bound when the addresses were picked, held until the party first starts so
+	/// no other test can take the port in between: (clients, parties).
+	bound: Vec<Option<(TcpListener, TcpListener)>>,
 }
 
-fn start_pair(ks_a: PathBuf, ks_b: PathBuf) -> Pair {
-	let (p2, p2_addr) = start_party(Party::P2, None, ks_b);
-	let (p1, p1_addr) = start_party(Party::P1, Some(p2_addr), ks_a);
-	Pair { p1, p2, p1_addr }
+impl Cluster {
+	fn start(name: &str, n: usize, threshold: usize) -> Cluster {
+		Self::start_with(name, n, threshold, Keys::default())
+	}
+
+	fn start_with(name: &str, n: usize, threshold: usize, keys: Keys) -> Cluster {
+		let listeners: Vec<(TcpListener, TcpListener)> = (0..n)
+			.map(|_| {
+				let bind = || TcpListener::bind("127.0.0.1:0").unwrap();
+				(bind(), bind())
+			})
+			.collect();
+		let identities: Vec<(Identity, Vec<u8>)> =
+			(0..n).map(|_| Identity::generate().unwrap()).collect();
+		let infos: Vec<PartyInfo> = identities
+			.iter()
+			.enumerate()
+			.map(|(i, (id, _))| PartyInfo {
+				name: format!("party-{i}"),
+				addr: listeners[i].1.local_addr().unwrap(),
+				identity: id.public_key(),
+			})
+			.collect();
+		let mut cluster = Cluster {
+			threshold,
+			infos,
+			identities: identities.into_iter().map(|(_, pkcs8)| pkcs8).collect(),
+			client_addrs: listeners.iter().map(|l| l.0.local_addr().unwrap()).collect(),
+			dirs: (0..n).map(|i| tmp_dir(&format!("{name}-{i}"))).collect(),
+			keys,
+			parties: (0..n).map(|_| None).collect(),
+			bound: listeners.into_iter().map(Some).collect(),
+		};
+		for i in 0..n {
+			cluster.up(i);
+		}
+		cluster
+	}
+
+	fn config(&self, i: usize) -> PartyConfig {
+		PartyConfig {
+			name: self.infos[i].name.clone(),
+			parties: self.infos.clone(),
+			threshold: self.threshold,
+			identity: Identity::from_pkcs8(&self.identities[i]).unwrap(),
+			listen_addr: self.client_addrs[i],
+			keystore_dir: self.dirs[i].clone(),
+			protocol_timeout: Duration::from_secs(20),
+			client_timeout: Duration::from_secs(60),
+			policy: Default::default(),
+			client_psk: self.keys.client_psk,
+			peer_psk: self.keys.peer_psk,
+			share_key: self.keys.share_key,
+			kit_dir: None,
+		}
+	}
+
+	/// Starts party `i`.
+	fn up(&mut self, i: usize) {
+		let svc = PartyService::new(self.config(i)).unwrap();
+		let bind = |addr: SocketAddr| {
+			let start = Instant::now();
+			loop {
+				match TcpListener::bind(addr) {
+					Ok(l) => return l,
+					Err(e) => {
+						assert!(start.elapsed() < Duration::from_secs(10), "bind {addr}: {e}")
+					},
+				}
+				thread::sleep(Duration::from_millis(50));
+			}
+		};
+		let (clients, peers) = match self.bound[i].take() {
+			Some(listeners) => listeners,
+			None => (bind(self.client_addrs[i]), bind(self.infos[i].addr)),
+		};
+		let s = Arc::clone(&svc);
+		thread::spawn(move || s.serve_on(clients, peers).unwrap());
+		self.parties[i] = Some(svc);
+	}
+
+	/// Stops party `i`: it no longer accepts clients or other parties.
+	fn down(&mut self, i: usize) {
+		let svc = self.parties[i].take().expect("party is up");
+		svc.request_shutdown();
+		// The listeners close once their accept loops have seen the shutdown.
+		let start = Instant::now();
+		while std::net::TcpStream::connect(self.infos[i].addr).is_ok()
+			|| std::net::TcpStream::connect(self.client_addrs[i]).is_ok()
+		{
+			assert!(start.elapsed() < Duration::from_secs(10), "party {i} did not stop");
+			thread::sleep(Duration::from_millis(20));
+		}
+	}
+
+	fn party(&self, i: usize) -> &Arc<PartyService> {
+		self.parties[i].as_ref().expect("party is up")
+	}
+
+	/// A client that sends its requests to party `i` only.
+	fn client_of(&self, i: usize) -> MpcClient {
+		let client = MpcClient::new(self.client_addrs[i]);
+		match self.keys.client_psk {
+			Some(psk) => client.with_psk(psk),
+			None => client,
+		}
+	}
+
+	/// A client that knows every party, as LDK Server does.
+	fn client(&self) -> MpcClient {
+		let client = MpcClient::with_parties(self.client_addrs.clone());
+		match self.keys.client_psk {
+			Some(psk) => client.with_psk(psk),
+			None => client,
+		}
+	}
+
+	fn shares(&self, i: usize) -> usize {
+		ldk_server_mpc::party::KeyStore::open(&self.dirs[i]).unwrap().count().unwrap()
+	}
+}
+
+fn verify(
+	pk: &ldk_server_mpc::bitcoin::secp256k1::PublicKey, digest: [u8; 32],
+	sig: &ldk_server_mpc::bitcoin::secp256k1::ecdsa::Signature,
+) {
+	Secp256k1::new().verify_ecdsa(&Message::from_digest(digest), sig, pk).unwrap();
 }
 
 #[test]
-fn dkg_sign_and_restore_over_tcp() {
+fn keygen_sign_and_restore_over_tcp() {
 	let secp = Secp256k1::new();
-	let ks_a = tmp_dir("a");
-	let ks_b = tmp_dir("b");
-	let pair = start_pair(ks_a.clone(), ks_b.clone());
-	let client = MpcClient::new(pair.p1_addr);
+	let mut cluster = Cluster::start("basic", 4, 3);
+	let client = cluster.client();
 	client.ping().unwrap();
 
 	let key_id = [0x11u8; 32];
 	let pk = client.ensure_key(&key_id).unwrap();
-	// Idempotent: second call returns the same key without a new DKG.
+	// Idempotent: a second call returns the same key without a new key generation.
 	assert_eq!(client.ensure_key(&key_id).unwrap(), pk);
-	assert_eq!(client.get_public_key(&key_id).unwrap(), pk);
-	// Both parties persisted exactly one share each and agree on the key.
-	assert_eq!(pair.p1.store().count().unwrap(), 1);
-	assert_eq!(pair.p2.store().count().unwrap(), 1);
-	assert_eq!(pair.p2.public_key(&key_id).unwrap(), pk);
+	// Every party stored exactly one share and agrees on the key, whichever one is asked.
+	for i in 0..4 {
+		assert_eq!(cluster.shares(i), 1);
+		assert_eq!(cluster.client_of(i).get_public_key(&key_id).unwrap(), pk);
+	}
 
 	let digest = [0xabu8; 32];
 	let ctx = SigningContext { op: Some(SigningOp::Test), ..Default::default() };
 	let sig = client.sign(&secp, &key_id, &digest, Some(ctx), Some(&pk)).unwrap();
-	secp.verify_ecdsa(&Message::from_digest(digest), &sig, &pk).unwrap();
+	verify(&pk, digest, &sig);
 	// Low-S enforced.
 	let mut normalized = sig;
 	normalized.normalize_s();
 	assert_eq!(normalized, sig);
+	// Any party can lead.
+	for i in 0..4 {
+		let digest = [0xb0 + i as u8; 32];
+		let sig = cluster.client_of(i).sign(&secp, &key_id, &digest, None, Some(&pk)).unwrap();
+		verify(&pk, digest, &sig);
+	}
 
-	// Restart both services (new processes in spirit: fresh service objects, same keystores).
-	pair.p1.request_shutdown();
-	pair.p2.request_shutdown();
-	let pair2 = start_pair(ks_a.clone(), ks_b.clone());
-	let client2 = MpcClient::new(pair2.p1_addr);
-	assert_eq!(client2.get_public_key(&key_id).unwrap(), pk, "key share restored after restart");
-	let digest2 = [0xcdu8; 32];
-	let sig2 = client2.sign(&secp, &key_id, &digest2, None, Some(&pk)).unwrap();
-	secp.verify_ecdsa(&Message::from_digest(digest2), &sig2, &pk).unwrap();
+	// Restart every party on its keystore: shares are restored.
+	for i in 0..4 {
+		cluster.down(i);
+		cluster.up(i);
+	}
+	assert_eq!(client.get_public_key(&key_id).unwrap(), pk, "key share restored after restart");
+	let sig = client.sign(&secp, &key_id, &[0xcdu8; 32], None, Some(&pk)).unwrap();
+	verify(&pk, [0xcdu8; 32], &sig);
+}
 
-	let _ = std::fs::remove_dir_all(ks_a);
-	let _ = std::fs::remove_dir_all(ks_b);
+#[test]
+fn signing_survives_one_party_down_but_not_two() {
+	let secp = Secp256k1::new();
+	let mut cluster = Cluster::start("down", 4, 3);
+	let client = cluster.client();
+	let key_id = [0x21u8; 32];
+	let pk = client.ensure_key(&key_id).unwrap();
+
+	// Whichever single party is down, the other three sign.
+	for dead in [3, 1, 0] {
+		cluster.down(dead);
+		let digest = [0x30 + dead as u8; 32];
+		// The client knows every party, so it also gets past a dead leader.
+		let sig = client.sign(&secp, &key_id, &digest, None, Some(&pk)).unwrap();
+		verify(&pk, digest, &sig);
+		cluster.up(dead);
+	}
+
+	// With two parties down no quorum exists.
+	cluster.down(2);
+	cluster.down(3);
+	let err = client.sign(&secp, &key_id, &[0x3fu8; 32], None, Some(&pk)).unwrap_err();
+	assert!(matches!(err, ClientError::Remote { code: ErrorCode::PeerUnavailable, .. }), "{err}");
+	// Back to three: signing resumes.
+	cluster.up(2);
+	let sig = client.sign(&secp, &key_id, &[0x40u8; 32], None, Some(&pk)).unwrap();
+	verify(&pk, [0x40u8; 32], &sig);
+}
+
+#[test]
+fn key_generation_needs_every_party_and_stores_nothing_otherwise() {
+	let mut cluster = Cluster::start("keygen-all", 4, 3);
+	cluster.down(2);
+	let client = cluster.client_of(0);
+	let err = client.ensure_key(&[0x41u8; 32]).unwrap_err();
+	assert!(matches!(err, ClientError::Remote { code: ErrorCode::PeerUnavailable, .. }), "{err}");
+	for i in 0..4 {
+		assert_eq!(cluster.shares(i), 0, "party {i} stored a share of a key that was never made");
+	}
+	cluster.up(2);
+	client.ensure_key(&[0x41u8; 32]).unwrap();
+	for i in 0..4 {
+		assert_eq!(cluster.shares(i), 1);
+	}
 }
 
 #[test]
 fn invalid_key_id_is_rejected() {
 	let secp = Secp256k1::new();
-	let pair = start_pair(tmp_dir("a2"), tmp_dir("b2"));
-	let client = MpcClient::new(pair.p1_addr);
+	let cluster = Cluster::start("badkey", 4, 3);
+	let client = cluster.client();
 	let err = client.get_public_key(&[9u8; 32]).unwrap_err();
 	assert!(matches!(err, ClientError::Remote { code: ErrorCode::KeyNotFound, .. }), "{err}");
 	let err = client.sign(&secp, &[9u8; 32], &[0u8; 32], None, None).unwrap_err();
@@ -112,7 +273,7 @@ fn invalid_key_id_is_rejected() {
 }
 
 #[test]
-fn mpc_process_unavailable() {
+fn unreachable_parties_and_timeouts_are_bounded() {
 	// Nothing listening on this port.
 	let free = TcpListener::bind("127.0.0.1:0").unwrap();
 	let addr = free.local_addr().unwrap();
@@ -124,21 +285,7 @@ fn mpc_process_unavailable() {
 	);
 	assert!(matches!(client.ping().unwrap_err(), ClientError::Io(_)));
 
-	// P1 up but P2 down: DKG must fail with PeerUnavailable, and no share may be persisted.
-	let p2_dummy = TcpListener::bind("127.0.0.1:0").unwrap();
-	let p2_addr = p2_dummy.local_addr().unwrap();
-	drop(p2_dummy);
-	let ks = tmp_dir("a3");
-	let (p1, p1_addr) = start_party(Party::P1, Some(p2_addr), ks);
-	let client = MpcClient::new(p1_addr);
-	let err = client.ensure_key(&[1u8; 32]).unwrap_err();
-	assert!(matches!(err, ClientError::Remote { code: ErrorCode::PeerUnavailable, .. }), "{err}");
-	assert_eq!(p1.store().count().unwrap(), 0);
-}
-
-#[test]
-fn signing_timeout_is_bounded() {
-	// A "service" that accepts connections but never answers.
+	// A "party" that accepts connections but never answers.
 	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
 	let addr = listener.local_addr().unwrap();
 	thread::spawn(move || {
@@ -161,13 +308,13 @@ fn signing_timeout_is_bounded() {
 
 #[test]
 fn repeated_and_concurrent_requests() {
-	let pair = start_pair(tmp_dir("a4"), tmp_dir("b4"));
-	let client = MpcClient::new(pair.p1_addr);
+	let cluster = Cluster::start("concurrent", 4, 3);
+	let client = cluster.client();
 	let secp = Secp256k1::new();
 
 	// Several keys, created concurrently.
 	let mut handles = Vec::new();
-	for i in 0..4u8 {
+	for i in 0..3u8 {
 		let client = client.clone();
 		handles.push(thread::spawn(move || {
 			let key_id = [i; 32];
@@ -177,12 +324,12 @@ fn repeated_and_concurrent_requests() {
 	let keys: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 	let mut pks: Vec<_> = keys.iter().map(|(_, pk)| *pk).collect();
 	pks.dedup();
-	assert_eq!(pks.len(), 4, "distinct keys");
+	assert_eq!(pks.len(), 3, "distinct keys");
 
-	// Concurrent signing on the same key (serialized server-side) and on different keys.
+	// Concurrent signing on the same key and on different keys, through different leaders.
 	let mut handles = Vec::new();
-	for (n, (key_id, pk)) in keys.iter().cycle().take(8).enumerate() {
-		let client = client.clone();
+	for (n, (key_id, pk)) in keys.iter().cycle().take(6).enumerate() {
+		let client = cluster.client_of(n % 4);
 		let (key_id, pk) = (*key_id, *pk);
 		handles.push(thread::spawn(move || {
 			let secp = Secp256k1::new();
@@ -190,7 +337,7 @@ fn repeated_and_concurrent_requests() {
 				let mut digest = [j; 32];
 				digest[0] = n as u8;
 				let sig = client.sign(&secp, &key_id, &digest, None, Some(&pk)).unwrap();
-				secp.verify_ecdsa(&Message::from_digest(digest), &sig, &pk).unwrap();
+				verify(&pk, digest, &sig);
 			}
 		}));
 	}
@@ -203,120 +350,87 @@ fn repeated_and_concurrent_requests() {
 	for j in 0..5u8 {
 		let digest = [0xf0 + j; 32];
 		let sig = client.sign(&secp, &key_id, &digest, None, Some(&pk)).unwrap();
-		secp.verify_ecdsa(&Message::from_digest(digest), &sig, &pk).unwrap();
+		verify(&pk, digest, &sig);
 	}
 }
 
 #[test]
-fn p2_refuses_dkg_for_existing_key_id() {
-	// Simulates P1 losing its keystore while P2 still holds a share for the same id.
-	let ks_a = tmp_dir("a5");
-	let ks_b = tmp_dir("b5");
-	let pair = start_pair(ks_a.clone(), ks_b.clone());
-	let client = MpcClient::new(pair.p1_addr);
+fn a_party_that_lost_its_keystore_cannot_regenerate_a_key() {
+	let mut cluster = Cluster::start("lost", 4, 3);
 	let key_id = [0x55u8; 32];
-	client.ensure_key(&key_id).unwrap();
-	pair.p1.request_shutdown();
-	pair.p2.request_shutdown();
+	let pk = cluster.client().ensure_key(&key_id).unwrap();
 
-	let ks_a_fresh = tmp_dir("a5-fresh");
-	let (p2, p2_addr) = start_party(Party::P2, None, ks_b);
-	let (_p1, p1_addr) = start_party(Party::P1, Some(p2_addr), ks_a_fresh);
-	let client = MpcClient::new(p1_addr);
-	let err = client.ensure_key(&key_id).unwrap_err();
+	// Party 0 comes back with an empty keystore and is asked for the key again.
+	cluster.down(0);
+	cluster.dirs[0] = tmp_dir("lost-0-fresh");
+	cluster.up(0);
+	let err = cluster.client_of(0).ensure_key(&key_id).unwrap_err();
 	assert!(matches!(err, ClientError::Remote { code: ErrorCode::KeyMismatch, .. }), "{err}");
-	assert_eq!(p2.store().count().unwrap(), 1);
+	assert_eq!(cluster.shares(1), 1);
+	// The other three still sign with the original key.
+	let secp = Secp256k1::new();
+	let sig = cluster.client_of(1).sign(&secp, &key_id, &[0x56u8; 32], None, Some(&pk)).unwrap();
+	verify(&pk, [0x56u8; 32], &sig);
 }
 
 #[test]
-fn psk_secured_links_and_encrypted_shares() {
+fn secured_links_and_encrypted_shares() {
 	use ldk_server_mpc::secure::AtRestKey;
-	let client_psk = [0xa1u8; 32];
-	let peer_psk = [0xb2u8; 32];
-	let share_key = [0xc3u8; 32];
-	let ks_a = tmp_dir("sa");
-	let ks_b = tmp_dir("sb");
-	let start = |party: Party, peer: Option<SocketAddr>, keystore: PathBuf| {
-		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-		let addr = listener.local_addr().unwrap();
-		let cfg = PartyConfig {
-			party,
-			listen_addr: addr,
-			peer_addr: peer,
-			keystore_dir: keystore,
-			p1_name: "test-party-a".into(),
-			p2_name: "test-party-b".into(),
-			protocol_timeout: Duration::from_secs(30),
-			client_timeout: Duration::from_secs(60),
-			policy: Default::default(),
-			client_psk: Some(client_psk),
-			peer_psk: Some(peer_psk),
-			share_key: Some(share_key),
-			kit_dir: None,
-		};
-		let svc = PartyService::new(cfg).unwrap();
-		let s = Arc::clone(&svc);
-		thread::spawn(move || s.serve_on(listener).unwrap());
-		(svc, addr)
+	let keys = Keys {
+		client_psk: Some([0xa1u8; 32]),
+		peer_psk: Some([0xb2u8; 32]),
+		share_key: Some([0xc3u8; 32]),
 	};
-	let (_p2, p2_addr) = start(Party::P2, None, ks_b.clone());
-	let (p1, p1_addr) = start(Party::P1, Some(p2_addr), ks_a.clone());
-	p1.ensure_tdh2().unwrap();
+	let mut cluster = Cluster::start_with("secure", 3, 2, keys);
+	cluster.party(0).ensure_tdh2().unwrap();
 	let secp = Secp256k1::new();
 
 	// Correct PSK: works end to end.
-	let client = MpcClient::new(p1_addr).with_psk(client_psk);
+	let client = cluster.client();
 	let key_id = [0x61u8; 32];
 	let pk = client.ensure_key(&key_id).unwrap();
 	let sig = client.sign(&secp, &key_id, &[0x62u8; 32], None, Some(&pk)).unwrap();
-	secp.verify_ecdsa(&Message::from_digest([0x62u8; 32]), &sig, &pk).unwrap();
+	verify(&pk, [0x62u8; 32], &sig);
 
 	// Key shares, including the TDH2 share, are encrypted on disk.
-	for dir in [&ks_a, &ks_b] {
+	for dir in &cluster.dirs {
 		assert!(dir.join("tdh2.keyshare").exists());
 		for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
 			let name = entry.file_name().to_string_lossy().to_string();
 			if name.ends_with(".share") || name == "tdh2.keyshare" {
 				let bytes = std::fs::read(entry.path()).unwrap();
 				assert!(AtRestKey::is_encrypted(&bytes), "{name} not encrypted");
-				assert!(AtRestKey::new(&share_key).open(&bytes).is_ok());
+				assert!(AtRestKey::new(&keys.share_key.unwrap()).open(&bytes).is_ok());
 			}
 		}
 	}
 
-	// Wrong / missing PSK: rejected before any request is served.
-	let bad = MpcClient::new(p1_addr).with_psk([0xffu8; 32]);
+	// Wrong / missing client PSK: rejected before any request is served.
+	let bad = MpcClient::new(cluster.client_addrs[0]).with_psk([0xffu8; 32]);
 	assert!(matches!(bad.ping().unwrap_err(), ClientError::Io(_)));
-	let plain = MpcClient::new(p1_addr);
-	assert!(plain.ping().is_err());
+	assert!(MpcClient::new(cluster.client_addrs[0]).ping().is_err());
 
-	// Restart with the wrong share key: shares cannot be read.
-	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-	let cfg = PartyConfig {
-		party: Party::P2,
-		listen_addr: listener.local_addr().unwrap(),
-		peer_addr: None,
-		keystore_dir: ks_b.clone(),
-		p1_name: "test-party-a".into(),
-		p2_name: "test-party-b".into(),
-		protocol_timeout: Duration::from_secs(30),
-		client_timeout: Duration::from_secs(60),
-		policy: Default::default(),
-		client_psk: None,
-		peer_psk: Some(peer_psk),
-		share_key: Some([0x00u8; 32]),
-		kit_dir: None,
-	};
-	assert!(PartyService::new(cfg).is_err(), "wrong share key must fail to open the TDH2 share");
+	// A party with the wrong group PSK cannot take part, so (2 of 3) the others carry on.
+	cluster.down(2);
+	cluster.keys.peer_psk = Some([0x00u8; 32]);
+	cluster.up(2);
+	let sig = cluster.client_of(0).sign(&secp, &key_id, &[0x63u8; 32], None, Some(&pk)).unwrap();
+	verify(&pk, [0x63u8; 32], &sig);
+	let err =
+		cluster.client_of(2).sign(&secp, &key_id, &[0x64u8; 32], None, Some(&pk)).unwrap_err();
+	assert!(matches!(err, ClientError::Remote { code: ErrorCode::PeerUnavailable, .. }), "{err}");
+
+	// Restart with the wrong share key: the shares cannot be read.
+	cluster.down(1);
+	cluster.keys.share_key = Some([0x00u8; 32]);
+	assert!(PartyService::new(cluster.config(1)).is_err(), "wrong share key must fail");
 }
 
 // ---------------------------------------------------------------------------
-// Revocation secrets: kits, joint release, and a compromised Party A
+// Revocation secrets: kits, joint release, and compromised hosts and parties
 // ---------------------------------------------------------------------------
 
 mod revocation {
-	use std::net::TcpStream;
-
 	use ldk_server_mpc::bitcoin::absolute::LockTime;
 	use ldk_server_mpc::bitcoin::consensus::encode::serialize;
 	use ldk_server_mpc::bitcoin::hashes::Hash;
@@ -333,7 +447,6 @@ mod revocation {
 		CounterpartyKeys, Derivation, HolderProof, KeyKind, SessionAck, SessionOp, SessionStart,
 		SignItem,
 	};
-	use ldk_server_mpc::secure::Conn;
 	use lightning::ln::chan_utils::{self, CounterpartyCommitmentSecrets};
 	use lightning::types::features::ChannelTypeFeatures;
 	use lightning::util::ser::Writeable;
@@ -344,7 +457,7 @@ mod revocation {
 	const VALUE: u64 = 100_000;
 
 	struct Channel {
-		pair: Pair,
+		cluster: Cluster,
 		client: MpcClient,
 		id: [u8; 32],
 		funding: PublicKey,
@@ -463,32 +576,86 @@ mod revocation {
 			let proof = self.holder_proof(number, &self.cp_funding);
 			self.client.holder_commitment_validated(&self.id, number, Some(proof)).unwrap();
 		}
+
+		fn release(&self, idx: u64) -> Result<[u8; 32], ClientError> {
+			self.client.release_commitment_secret(&self.id, idx, None)
+		}
+
+		/// One channel update: the parties sign the counterparty's new commitment, the
+		/// counterparty signs ours (`old - 1`), and we revoke `old`.
+		fn update(&self, old: u64) -> [u8; 32] {
+			self.sign_counterparty_commitment(old - 1);
+			self.validate(old - 1);
+			self.release(old).unwrap()
+		}
+
+		/// A request to sign our own commitment `number` for broadcast.
+		fn holder_commitment_item(&self, number: u64) -> SignItem {
+			let tx = self.commitment_tx(
+				number,
+				vec![TxOut {
+					value: Amount::from_sat(60_000),
+					script_pubkey: ScriptBuf::new_op_return([1u8]),
+				}],
+			);
+			let point = self.client.per_commitment_point(&self.id, number).unwrap();
+			let context = SigningContext {
+				op: Some(SigningOp::HolderCommitment),
+				channel_keys_id: Some([1u8; 32]),
+				channel_value_satoshis: Some(VALUE),
+				commitment_number: Some(number),
+				channel_type_features: Some(ChannelTypeFeatures::only_static_remote_key().encode()),
+				counterparty_keys: Some(self.counterparty_keys()),
+				holder_selected_contest_delay: Some(144),
+				counterparty_selected_contest_delay: Some(144),
+				transaction: Some(serialize(&tx)),
+				input_index: 0,
+				input_value_sat: VALUE,
+				witness_script: Some(self.funding_script().to_bytes()),
+				sighash_type: 0x01,
+				per_commitment_point: Some(point.serialize()),
+				..Default::default()
+			};
+			SignItem {
+				key_id: [0xf1; 32],
+				derivation: Derivation::None,
+				digest: self.sighash(&tx),
+				context,
+			}
+		}
+
+		fn sign_holder_commitment(&self, number: u64) -> Result<(), ClientError> {
+			let item = self.holder_commitment_item(number);
+			self.client
+				.sign_batch(&Secp256k1::new(), Some(self.id), vec![item], Some(&[self.funding]))
+				.map(|_| ())
+		}
 	}
 
-	/// Starts both parties, runs the ceremony for `kits` kits of `states` states each, and
-	/// creates the channel's keys.
+	/// Starts four parties (any three must agree), runs the ceremony for `kits` kits of
+	/// `states` states each, and creates the channel's keys.
 	fn channel(name: &str, kits: u8, states: u32) -> Channel {
-		let ks_a = tmp_dir(&format!("{name}-a"));
-		let ks_b = tmp_dir(&format!("{name}-b"));
-		let pair = start_pair(ks_a.clone(), ks_b.clone());
-		let client = MpcClient::new(pair.p1_addr);
+		let cluster = Cluster::start(name, 4, 3);
+		let client = cluster.client();
 
-		// The parties generate their joint TDH2 key; Party A publishes the public key.
-		pair.p1.ensure_tdh2().unwrap();
-		let tdh2_pub = pair.p1.tdh2_public_key().unwrap();
-		assert_eq!(pair.p2.tdh2_public_key().unwrap(), tdh2_pub);
-		let published = std::fs::read_to_string(ks_a.join("tdh2.pub")).unwrap();
-		assert_eq!(published, hex(&tdh2_pub));
+		// The parties generate their joint TDH2 key and each publishes the public key.
+		cluster.party(0).ensure_tdh2().unwrap();
+		let tdh2_pub = cluster.party(0).tdh2_public_key().unwrap();
+		for i in 0..4 {
+			assert_eq!(cluster.party(i).tdh2_public_key().unwrap(), tdh2_pub);
+			let published = std::fs::read_to_string(cluster.dirs[i].join("tdh2.pub")).unwrap();
+			assert_eq!(published, hex(&tdh2_pub));
+		}
 
-		// The offline ceremony: custodians rebuild the master seed and make the kits. Both
-		// parties get a copy of every kit file.
+		// The offline ceremony: custodians rebuild the master seed and make the kits. Every
+		// party gets a copy of every kit file.
 		let pieces = split_seed(&[0x5eu8; 32], 2, 3, |b| b.fill(0x17)).unwrap();
 		let seed = combine_seed(&pieces[1..]).unwrap();
 		for k in 0..kits {
 			let kit_id = [0xa0 + k; 32];
 			let segment = generate_segment(&seed, &kit_id, &tdh2_pub, TOP, states).unwrap();
-			for ks in [&ks_a, &ks_b] {
-				std::fs::write(ks.join("kits").join(segment_file_name(&kit_id, TOP)), &segment)
+			for dir in &cluster.dirs {
+				std::fs::write(dir.join("kits").join(segment_file_name(&kit_id, TOP)), &segment)
 					.unwrap();
 			}
 		}
@@ -500,7 +667,7 @@ mod revocation {
 		key(0xf3, KeyKind::DelayedPayment);
 		let secp = Secp256k1::new();
 		Channel {
-			pair,
+			cluster,
 			client,
 			id,
 			funding,
@@ -528,52 +695,51 @@ mod revocation {
 		}
 	}
 
-	/// What Party B answers when asked directly, as a compromised Party A would.
-	fn ask_party_b(pair: &Pair, op: SessionOp) -> SessionAck {
-		let addr = pair.p2.config().listen_addr;
-		let stream = TcpStream::connect(addr).unwrap();
-		let mut conn = Conn::new(stream, None, true).unwrap();
-		conn.write_frame(&SessionStart { op }.encode()).unwrap();
-		SessionAck::decode(&conn.read_frame().unwrap()).unwrap()
+	/// What party `to` answers when party `from` asks it directly, as a compromised party
+	/// that ignores its own policy would.
+	fn ask_as(cluster: &Cluster, from: usize, to: usize, op: SessionOp) -> SessionAck {
+		let mut link = cluster.party(from).roster().connect(to).unwrap();
+		let start = SessionStart { session: [7u8; 16], members: vec![from as u8, to as u8], op };
+		link.write_frame(&start.encode()).unwrap();
+		SessionAck::decode(&link.read_frame().unwrap()).unwrap()
 	}
 
 	#[test]
 	fn secrets_are_released_in_order_and_fit_the_shachain() {
 		let ch = channel("release", 1, 12);
 		// No party stores a seed or a secret.
-		for dir in
-			[ch.pair.p1.config().keystore_dir.clone(), ch.pair.p2.config().keystore_dir.clone()]
-		{
+		for dir in &ch.cluster.dirs {
 			assert!(!dir.join("master.secret").exists());
 		}
 
 		let p0 = ch.client.per_commitment_point(&ch.id, TOP).unwrap();
 		assert_eq!(ch.client.per_commitment_point(&ch.id, TOP).unwrap(), p0, "stable");
-		// Both parties bound the same kit to the channel.
-		let kit = ch.pair.p1.policy().kit_of(&ch.id).unwrap().unwrap();
-		assert_eq!(ch.pair.p2.policy().kit_of(&ch.id).unwrap(), Some(kit));
+		// Every party bound the same kit to the channel and serves the same points.
+		let kit = ch.cluster.party(0).policy().kit_of(&ch.id).unwrap().unwrap();
+		for i in 0..4 {
+			assert_eq!(ch.cluster.party(i).policy().kit_of(&ch.id).unwrap(), Some(kit));
+			assert_eq!(ch.cluster.client_of(i).per_commitment_point(&ch.id, TOP).unwrap(), p0);
+		}
 
 		// Nothing is releasable before a newer state is validated.
-		assert!(denied(ch.client.release_commitment_secret(&ch.id, TOP).unwrap_err())
-			.contains("no holder commitment validated"));
+		assert!(denied(ch.release(TOP).unwrap_err()).contains("no holder commitment validated"));
 		ch.client.holder_commitment_validated(&ch.id, TOP, None).unwrap();
-		assert!(ch.client.release_commitment_secret(&ch.id, TOP).is_err());
+		assert!(ch.release(TOP).is_err());
 
-		// Ten channel updates: the counterparty signs our new state, then we revoke the old
-		// one. The counterparty's shachain store accepts every secret.
+		// Ten channel updates. The counterparty's shachain store accepts every secret.
 		let mut peer = CounterpartyCommitmentSecrets::new();
 		for i in 0..10u64 {
 			let old = TOP - i;
-			ch.sign_counterparty_commitment(old - 1);
 			let point = ch.client.per_commitment_point(&ch.id, old).unwrap();
-			ch.validate(old - 1);
-			let secret = ch.client.release_commitment_secret(&ch.id, old).unwrap();
+			let secret = ch.update(old);
 			assert_eq!(point_of(&secret), point);
-			assert_eq!(ch.client.release_commitment_secret(&ch.id, old).unwrap(), secret, "retry");
+			// A retry, through another party, gives the same secret.
+			let again = ch.cluster.client_of(2).release_commitment_secret(&ch.id, old, None);
+			assert_eq!(again.unwrap(), secret);
 			peer.provide_secret(old, secret).expect("fits the shachain");
 			// The state that is now current, and every later one, stay sealed.
-			assert!(ch.client.release_commitment_secret(&ch.id, old - 1).is_err());
-			assert!(ch.client.release_commitment_secret(&ch.id, old - 2).is_err());
+			assert!(ch.release(old - 1).is_err());
+			assert!(ch.release(old - 2).is_err());
 		}
 	}
 
@@ -598,44 +764,156 @@ mod revocation {
 		);
 		assert!(msg.contains("is not holder commitment"), "{msg}");
 
-		// So the current state's secret stays sealed.
-		assert!(ch.client.release_commitment_secret(&ch.id, TOP).is_err());
+		// So the current state's secret stays sealed, whichever party is asked.
+		for i in 0..4 {
+			assert!(ch.cluster.client_of(i).release_commitment_secret(&ch.id, TOP, None).is_err());
+		}
 	}
 
 	#[test]
-	fn party_b_decides_for_itself() {
-		let ch = channel("rogue-a", 1, 6);
+	fn a_compromised_party_cannot_release_or_rebind_on_its_own() {
+		let ch = channel("rogue", 1, 6);
 		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
-		ch.sign_counterparty_commitment(TOP - 1);
-		ch.validate(TOP - 1);
+		ch.update(TOP);
 
-		// A compromised Party A skips its own policy and asks Party B directly for the
-		// current state, a future state, and a validation without proof.
-		for idx in [TOP - 1, TOP - 3] {
-			match ask_party_b(&ch.pair, SessionOp::ReleaseSecret { channel: ch.id, idx }) {
-				SessionAck::Error { code, .. } => assert_eq!(code, ErrorCode::PolicyDenied),
-				SessionAck::Ok { .. } => panic!("Party B released secret {idx}"),
+		// Party 3 is compromised: it ignores its own policy and asks the others directly for
+		// the current state, a future state, and a validation without proof.
+		for to in 0..3 {
+			for idx in [TOP - 1, TOP - 3] {
+				let op = SessionOp::ReleaseSecret { channel: ch.id, idx, newer: None };
+				match ask_as(&ch.cluster, 3, to, op) {
+					SessionAck::Error { code, .. } => assert_eq!(code, ErrorCode::PolicyDenied),
+					SessionAck::Ok { .. } => panic!("party {to} released secret {idx}"),
+				}
 			}
-		}
-		let claim = SessionOp::HolderCommitmentValidated {
-			channel: ch.id,
-			commitment_number: TOP - 2,
-			proof: None,
-		};
-		assert!(matches!(ask_party_b(&ch.pair, claim), SessionAck::Error { .. }));
-		// It may not swap the channel's kit for another either.
-		let swap = SessionOp::BindKit { channel: ch.id, kit_id: [0xee; 32] };
-		assert!(matches!(ask_party_b(&ch.pair, swap), SessionAck::Error { .. }));
-
-		// For the one state that may be released, Party B's answer alone is not the secret:
-		// Party A needs its own share to finish the decryption.
-		let partial =
-			match ask_party_b(&ch.pair, SessionOp::ReleaseSecret { channel: ch.id, idx: TOP }) {
-				SessionAck::Ok { payload } => payload,
-				SessionAck::Error { message, .. } => panic!("{message}"),
+			let claim = SessionOp::HolderCommitmentValidated {
+				channel: ch.id,
+				commitment_number: TOP - 2,
+				proof: None,
 			};
-		let secret = ch.client.release_commitment_secret(&ch.id, TOP).unwrap();
+			assert!(matches!(ask_as(&ch.cluster, 3, to, claim), SessionAck::Error { .. }));
+			// It may not swap the channel's kit for another either.
+			let swap = SessionOp::BindKit { channel: ch.id, kit_id: [0xee; 32] };
+			assert!(matches!(ask_as(&ch.cluster, 3, to, swap), SessionAck::Error { .. }));
+		}
+
+		// It cannot speak for another party: the leader of a session must be the party that
+		// proved its identity on the link.
+		let mut link = ch.cluster.party(3).roster().connect(0).unwrap();
+		let start = SessionStart {
+			session: [8u8; 16],
+			members: vec![1, 0],
+			op: SessionOp::ReleaseSecret { channel: ch.id, idx: TOP, newer: None },
+		};
+		link.write_frame(&start.encode()).unwrap();
+		assert!(matches!(
+			SessionAck::decode(&link.read_frame().unwrap()).unwrap(),
+			SessionAck::Error { code: ErrorCode::BadRequest, .. }
+		));
+
+		// For the one state that may be released, another party's answer alone is not the
+		// secret: it takes three.
+		let op = SessionOp::ReleaseSecret { channel: ch.id, idx: TOP, newer: None };
+		let partial = match ask_as(&ch.cluster, 3, 0, op) {
+			SessionAck::Ok { payload } => payload,
+			SessionAck::Error { message, .. } => panic!("{message}"),
+		};
+		let secret = ch.release(TOP).unwrap();
 		assert!(!partial.windows(32).any(|w| w == secret));
+	}
+
+	#[test]
+	fn a_channel_keeps_working_with_one_party_down() {
+		let mut ch = channel("three", 1, 12);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		let mut peer = CounterpartyCommitmentSecrets::new();
+		peer.provide_secret(TOP, ch.update(TOP)).unwrap();
+
+		// Each party in turn is down for one update, the leader included.
+		for (n, dead) in [3usize, 0, 2, 1].into_iter().enumerate() {
+			ch.cluster.down(dead);
+			let old = TOP - 1 - n as u64;
+			peer.provide_secret(old, ch.update(old)).expect("fits the shachain");
+			ch.cluster.up(dead);
+		}
+
+		// With two down, nothing is signed and nothing is released.
+		ch.cluster.down(0);
+		ch.cluster.down(1);
+		assert!(ch.release(TOP - 4).is_err());
+		assert!(ch.sign_holder_commitment(TOP - 5).is_err());
+	}
+
+	#[test]
+	fn a_party_that_missed_updates_catches_up_from_the_proof() {
+		let mut ch = channel("stale", 1, 12);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.update(TOP);
+
+		// Party 3 is down for two updates.
+		ch.cluster.down(3);
+		ch.update(TOP - 1);
+		ch.update(TOP - 2);
+		ch.cluster.up(3);
+		fn validated(ch: &Channel, i: usize) -> Option<u64> {
+			ch.cluster.party(i).policy().channel_state(&ch.id).unwrap().validated_holder_commitment
+		}
+		assert_eq!(validated(&ch, 0), Some(TOP - 3));
+		assert_eq!(validated(&ch, 3), Some(TOP - 1), "party 3 missed two validations");
+
+		// Now party 2 goes down, so every quorum includes the stale party 3. Asked on its
+		// outdated record alone it refuses to release, and no quorum agrees.
+		ch.cluster.down(2);
+		assert!(ch.release(TOP - 2).is_err());
+		// With the newer commitment and the counterparty's signature in the request, it
+		// checks them itself, catches up, and the release goes through.
+		let newer = (TOP - 3, ch.holder_proof(TOP - 3, &ch.cp_funding));
+		ch.client.release_commitment_secret(&ch.id, TOP - 2, Some(newer)).unwrap();
+		assert_eq!(validated(&ch, 3), Some(TOP - 3));
+
+		// A forged "newer" proof teaches it nothing.
+		let forged = ch.holder_proof(TOP - 4, &SecretKey::from_slice(&[0x99u8; 32]).unwrap());
+		let res = ch.client.release_commitment_secret(&ch.id, TOP - 3, Some((TOP - 4, forged)));
+		assert!(res.is_err());
+		assert_eq!(validated(&ch, 3), Some(TOP - 3));
+
+		// The channel carries on with parties 0, 1 and 3.
+		ch.update(TOP - 3);
+	}
+
+	#[test]
+	fn a_stale_party_cannot_be_used_to_broadcast_a_revoked_state() {
+		let mut ch = channel("fork", 1, 12);
+		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
+		ch.update(TOP);
+
+		// The latest state may be signed for broadcast.
+		ch.sign_holder_commitment(TOP - 1).unwrap();
+
+		// Party 3 misses the update that revokes TOP - 1, so its record still says TOP - 1 is
+		// the latest state.
+		ch.cluster.down(3);
+		ch.update(TOP - 1);
+		ch.cluster.up(3);
+
+		// A compromised host now asks for the revoked state to be signed for broadcast (the
+		// counterparty, holding its secret, could then take the whole channel). Every quorum
+		// holds at least two parties that saw the revocation, and they refuse; so does the
+		// request when it is led by the stale party itself.
+		let msg = denied(ch.sign_holder_commitment(TOP - 1).unwrap_err());
+		assert!(msg.contains("older than validated"), "{msg}");
+		let stale = ch.cluster.client_of(3);
+		let err = stale
+			.sign_batch(
+				&Secp256k1::new(),
+				Some(ch.id),
+				vec![ch.holder_commitment_item(TOP - 1)],
+				None,
+			)
+			.unwrap_err();
+		assert!(denied(err).contains("older than validated"));
+		// The current state can still be signed.
+		ch.sign_holder_commitment(TOP - 2).unwrap();
 	}
 
 	#[test]
@@ -643,7 +921,7 @@ mod revocation {
 		// No kits: the first point request fails, and nothing was bound.
 		let ch = channel("nokit", 0, 1);
 		assert!(ch.client.per_commitment_point(&ch.id, TOP).is_err());
-		assert_eq!(ch.pair.p1.policy().kit_of(&ch.id).unwrap(), None);
+		assert_eq!(ch.cluster.party(0).policy().kit_of(&ch.id).unwrap(), None);
 
 		// A kit of three states serves three points and then asks for a refill.
 		let ch = channel("short", 1, 3);
@@ -653,15 +931,15 @@ mod revocation {
 		let err = ch.client.per_commitment_point(&ch.id, TOP - 3).unwrap_err();
 		assert!(err.to_string().contains("refill"), "{err}");
 
-		// The refill ceremony adds a segment to both parties; the channel carries on.
-		let kit = ch.pair.p1.policy().kit_of(&ch.id).unwrap().unwrap();
-		let tdh2_pub = ch.pair.p1.tdh2_public_key().unwrap();
+		// The refill ceremony adds a segment to every party; the channel carries on.
+		let kit = ch.cluster.party(0).policy().kit_of(&ch.id).unwrap().unwrap();
+		let tdh2_pub = ch.cluster.party(0).tdh2_public_key().unwrap();
 		let pieces = split_seed(&[0x5eu8; 32], 2, 3, |b| b.fill(0x17)).unwrap();
 		let seed = combine_seed(&pieces[..2]).unwrap();
 		let segment = generate_segment(&seed, &kit, &tdh2_pub, TOP - 3, 3).unwrap();
-		for svc in [&ch.pair.p1, &ch.pair.p2] {
-			std::fs::write(svc.kits().dir().join(segment_file_name(&kit, TOP - 3)), &segment)
-				.unwrap();
+		for i in 0..4 {
+			let dir = ch.cluster.party(i).kits().dir().to_path_buf();
+			std::fs::write(dir.join(segment_file_name(&kit, TOP - 3)), &segment).unwrap();
 		}
 		ch.client.per_commitment_point(&ch.id, TOP - 3).unwrap();
 	}
@@ -672,8 +950,8 @@ mod revocation {
 		let other = [0xc2u8; 32];
 		ch.client.per_commitment_point(&ch.id, TOP).unwrap();
 		ch.client.per_commitment_point(&other, TOP).unwrap();
-		let a = ch.pair.p1.policy().kit_of(&ch.id).unwrap().unwrap();
-		let b = ch.pair.p1.policy().kit_of(&other).unwrap().unwrap();
+		let a = ch.cluster.party(0).policy().kit_of(&ch.id).unwrap().unwrap();
+		let b = ch.cluster.party(0).policy().kit_of(&other).unwrap().unwrap();
 		assert_ne!(a, b);
 		// A third channel finds the pool empty.
 		assert!(ch.client.per_commitment_point(&[0xc3u8; 32], TOP).is_err());

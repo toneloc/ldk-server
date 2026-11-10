@@ -1,180 +1,149 @@
-From 38dcc051c91971b8d81a6978f0d424c66306ed8e Mon Sep 17 00:00:00 2001
-From: toneloc <3665696+toneloc@users.noreply.github.com>
-Date: Thu, 8 Oct 2026 00:22:36 -0400
-Subject: [PATCH] Add ecdsa_2p::derive_additive_tweak and derive_mul_add (local
- key derivation, C and C++ API)
+From b07382c5ada8d8729ca2dd360359157230d248c9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 01:05:39 +0000
+Subject: [PATCH] Add ecdsa_mp::derive_mul_add_ac (local key derivation on
+ threshold shares, C and C++ API)
 
+Derives key * mul + add on an access-structure key share without interaction:
+every party maps its share x_i to mul * x_i + add and every public share Qi to
+mul * Qi + add * G. Valid only for a single THRESHOLD gate (Shamir sharing),
+where any quorum's Lagrange coefficients sum to one. Used for BOLT 3
+per-commitment keys (mul = 1) and revocation keys.
+
+Written with AI assistance (Claude).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FEFPxoVaygFeJXwvZUffGz
 ---
- include/cbmpc/api/ecdsa_2p.h   | 11 +++++
- include/cbmpc/c_api/ecdsa_2p.h | 11 +++++
- src/cbmpc/api/ecdsa2pc.cpp     | 73 ++++++++++++++++++++++++++++++++++
- src/cbmpc/c_api/ecdsa2pc.cpp   | 48 ++++++++++++++++++++++
- 4 files changed, 143 insertions(+)
+ include/cbmpc/api/ecdsa_mp.h   |  6 ++++
+ include/cbmpc/c_api/ecdsa_mp.h |  9 +++++
+ src/cbmpc/api/ecdsa_mp.cpp     | 62 ++++++++++++++++++++++++++++++++++
+ src/cbmpc/c_api/ecdsa_mp.cpp   | 25 ++++++++++++++
+ 4 files changed, 102 insertions(+)
 
-diff --git a/include/cbmpc/api/ecdsa_2p.h b/include/cbmpc/api/ecdsa_2p.h
-index c95a5e6..1154386 100644
---- a/include/cbmpc/api/ecdsa_2p.h
-+++ b/include/cbmpc/api/ecdsa_2p.h
-@@ -34,6 +34,17 @@ error_t refresh(const coinbase::api::job_2p_t& job, mem_t key_blob, buf_t& new_k
- // On any error, `sig_der` is cleared.
- error_t sign(const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash, buf_t& sid, buf_t& sig_der);
+diff --git a/include/cbmpc/api/ecdsa_mp.h b/include/cbmpc/api/ecdsa_mp.h
+index e7c9438..f1de966 100644
+--- a/include/cbmpc/api/ecdsa_mp.h
++++ b/include/cbmpc/api/ecdsa_mp.h
+@@ -83,6 +83,12 @@ error_t sign_additive(const job_mp_t& job, mem_t key_blob, mem_t msg, party_idx_
+ error_t sign_ac(const job_mp_t& job, mem_t ac_key_blob, const access_structure_t& access_structure, mem_t msg,
+                 party_idx_t sig_receiver, buf_t& sig_der);
  
-+// Locally derive a key blob for `key + tweak` (tweak: 32-byte big-endian scalar in [1, q)).
-+// Non-interactive; both parties apply the same tweak to their blobs of the same key and obtain
-+// shares of the derived key, whose public key is Q + tweak*G. Used for Lightning-style
-+// additive key derivation (BOLT 3 per-commitment keys).
-+error_t derive_additive_tweak(mem_t key_blob, mem_t tweak, buf_t& out_key_blob);
++// Local (non-interactive) derivation of `key * mul + add` on an access-structure key share
++// (from `dkg_ac` / `refresh_ac`). `mul` and `add` are 32-byte big-endian scalars; `mul` must be
++// non-zero. Valid only when the access structure is a single THRESHOLD gate over the parties.
++// All parties must apply the same (mul, add). Derived blobs must not be refreshed.
++error_t derive_mul_add_ac(mem_t ac_key_blob, mem_t mul, mem_t add, buf_t& out_ac_key_blob);
 +
-+// Locally derive a key blob for `key * mul + add` (32-byte big-endian scalars, mul in [1, q),
-+// add in [0, q)). Both parties apply the same values. Public key is mul*Q + add*G. Intended for
-+// BOLT 3 revocation keys; derived blobs are ephemeral and must not be refreshed.
-+error_t derive_mul_add(mem_t key_blob, mem_t mul, mem_t add, buf_t& out_key_blob);
-+
- // Get the compressed public key from a key blob.
- error_t get_public_key_compressed(mem_t key_blob, buf_t& pub_key);
+ // Get the compressed public key from a key blob (SEC1 compressed point).
+ //
+ // This is the same encoding as `ecdsa_2p::get_public_key_compressed`.
+diff --git a/include/cbmpc/c_api/ecdsa_mp.h b/include/cbmpc/c_api/ecdsa_mp.h
+index 5dbe31d..096abdb 100644
+--- a/include/cbmpc/c_api/ecdsa_mp.h
++++ b/include/cbmpc/c_api/ecdsa_mp.h
+@@ -122,6 +122,15 @@ cbmpc_error_t cbmpc_ecdsa_mp_sign_ac(const cbmpc_mp_job_t* job, cmem_t ac_key_bl
+                                      const cbmpc_access_structure_t* access_structure, cmem_t msg_hash,
+                                      int32_t sig_receiver, cmem_t* sig_der_out);
  
-diff --git a/include/cbmpc/c_api/ecdsa_2p.h b/include/cbmpc/c_api/ecdsa_2p.h
-index b82bd02..882a675 100644
---- a/include/cbmpc/c_api/ecdsa_2p.h
-+++ b/include/cbmpc/c_api/ecdsa_2p.h
-@@ -42,6 +42,17 @@ cbmpc_error_t cbmpc_ecdsa_2p_refresh(const cbmpc_2pc_job_t* job, cmem_t key_blob
- cbmpc_error_t cbmpc_ecdsa_2p_sign(const cbmpc_2pc_job_t* job, cmem_t key_blob, cmem_t msg_hash, cmem_t sid_in,
-                                   cmem_t* sid_out, cmem_t* sig_der_out);
- 
-+// Locally derive a key blob for `key + tweak` (32-byte big-endian scalar in [1, q)).
-+// Both parties apply the same tweak to blobs of the same key; the derived public key is
-+// Q + tweak*G. Non-interactive.
++// Local (non-interactive) derivation of `key * mul + add` on an access-structure key share.
++// See `coinbase::api::ecdsa_mp::derive_mul_add_ac`. Valid only for a single THRESHOLD gate.
 +//
-+// Ownership: same as `cbmpc_ecdsa_2p_get_public_key_compressed`.
-+cbmpc_error_t cbmpc_ecdsa_2p_derive_additive_tweak(cmem_t key_blob, cmem_t tweak, cmem_t* out_key_blob);
++// Ownership:
++// - On success, `out_ac_key_blob->data` is allocated by the library and must be
++//   freed with `cbmpc_cmem_free(*out_ac_key_blob)`.
++// - On failure, `*out_ac_key_blob` is set to `{NULL, 0}`.
++cbmpc_error_t cbmpc_ecdsa_mp_derive_mul_add_ac(cmem_t ac_key_blob, cmem_t mul, cmem_t add, cmem_t* out_ac_key_blob);
 +
-+// Locally derive a key blob for `key * mul + add` (32-byte scalars). Public key is
-+// mul*Q + add*G. Ephemeral; do not refresh derived blobs. Ownership as above.
-+cbmpc_error_t cbmpc_ecdsa_2p_derive_mul_add(cmem_t key_blob, cmem_t mul, cmem_t add, cmem_t* out_key_blob);
-+
- // Compute compressed public key for a key blob.
+ // Compute compressed public key for a key blob (SEC1 compressed point).
  //
  // Ownership:
-diff --git a/src/cbmpc/api/ecdsa2pc.cpp b/src/cbmpc/api/ecdsa2pc.cpp
-index 142455e..5e39230 100644
---- a/src/cbmpc/api/ecdsa2pc.cpp
-+++ b/src/cbmpc/api/ecdsa2pc.cpp
-@@ -179,6 +179,79 @@ error_t sign(const coinbase::api::job_2p_t& job, mem_t key_blob, mem_t msg_hash,
-   return sign_common(&coinbase::mpc::ecdsa2pc::sign, job, key_blob, msg_hash, sid, sig_der);
+diff --git a/src/cbmpc/api/ecdsa_mp.cpp b/src/cbmpc/api/ecdsa_mp.cpp
+index bb0c917..84ccca5 100644
+--- a/src/cbmpc/api/ecdsa_mp.cpp
++++ b/src/cbmpc/api/ecdsa_mp.cpp
+@@ -454,6 +454,68 @@ error_t sign_additive(const job_mp_t& job, mem_t key_blob, mem_t msg, party_idx_
+   return coinbase::mpc::ecdsampc::sign(mpc_job, key, msg, sig_receiver, sig_der);
  }
  
-+error_t derive_additive_tweak(mem_t key_blob, mem_t tweak, buf_t& out_key_blob) {
-+  // Local (non-interactive) derivation of `key + tweak`: Q' = Q + tweak*G, and P2 adds the
-+  // tweak to its share. P1's share and the Paillier ciphertext c_key = Enc(x1) are unchanged,
-+  // exactly as the non-hardened step of hd_keyset_ecdsa_2p::derive_keys does. Both parties
-+  // must apply the same tweak to the same key blob to obtain shares of the same derived key.
-+  out_key_blob.free();
-+  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
-+                                                                          coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
-+    return rv;
-+  if (tweak.size != 32) return coinbase::error(E_BADARG, "tweak must be 32 bytes");
-+
-+  coinbase::mpc::ecdsa2pc::key_t key;
-+  if (const error_t rv = deserialize_key_blob(key_blob, key)) return rv;
-+
-+  const mod_t& q = key.curve.order();
-+  const auto& G = key.curve.generator();
-+  const bn_t t = bn_t::from_bin(tweak);
-+  if (t == 0 || t >= q) return coinbase::error(E_BADARG, "tweak out of range");
-+
-+  coinbase::mpc::ecdsa2pc::key_t derived;
-+  derived.role = key.role;
-+  derived.curve = key.curve;
-+  derived.paillier = key.paillier;
-+  derived.c_key = key.c_key;
-+  derived.Q = key.Q + t * G;
-+  if (key.role == coinbase::mpc::party_t::p2) {
-+    MODULO(q) derived.x_share = key.x_share + t;
-+  } else {
-+    derived.x_share = key.x_share;
-+  }
-+  if (key.curve.check(derived.Q)) return coinbase::error(E_CRYPTO, "derived point invalid");
-+  return serialize_key_blob(derived, out_key_blob);
-+}
-+
-+error_t derive_mul_add(mem_t key_blob, mem_t mul, mem_t add, buf_t& out_key_blob) {
-+  // Local derivation of `key * mul + add`: Q' = mul*Q + add*G. With the additive sharing
-+  // x = x1 + x2, both shares are multiplied by `mul`; P1's Paillier ciphertext c_key = Enc(x1)
-+  // becomes Enc(x1 * mul) via deterministic (non-rerandomized) homomorphic scalar
-+  // multiplication so both parties hold the same ciphertext; P2 additionally adds `add`.
-+  // P1's integer representative x1 * mul stays far below N (x1 < 2q after refresh, mul < q).
-+  // Intended for BOLT 3 revocation keys; derived blobs are ephemeral and must not be refreshed.
-+  out_key_blob.free();
-+  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
++error_t derive_mul_add_ac(mem_t ac_key_blob, mem_t mul, mem_t add, buf_t& out_ac_key_blob) {
++  // Local (non-interactive) derivation of `key * mul + add` on an access-structure key share.
++  //
++  // Valid ONLY when the access structure is a single THRESHOLD gate over the parties (plain
++  // Shamir sharing): with f the sharing polynomial and x = f(0), the polynomial mul*f + add
++  // shares mul*x + add, and its value at each party's point is mul*x_i + add. So every party
++  // applies the same map to its own share, and every public share Qi maps to mul*Qi + add*G.
++  // For any quorum the Lagrange coefficients sum to one, so the derived additive shares used
++  // by sign_ac again add up to the derived key. AND/OR structures do not have this property.
++  //
++  // Intended for BOLT 3 per-commitment keys (mul = 1) and revocation keys. All parties must
++  // apply the same (mul, add) to blobs of the same key. Derived blobs are ephemeral and must
++  // not be refreshed.
++  out_ac_key_blob.free();
++  if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(ac_key_blob, "ac_key_blob",
 +                                                                          coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
 +    return rv;
 +  if (mul.size != 32 || add.size != 32) return coinbase::error(E_BADARG, "mul/add must be 32 bytes");
 +
-+  coinbase::mpc::ecdsa2pc::key_t key;
-+  if (const error_t rv = deserialize_key_blob(key_blob, key)) return rv;
++  error_t rv = UNINITIALIZED_ERROR;
++  key_blob_v1_t blob;
++  if (rv = coinbase::convert(blob, ac_key_blob)) return rv;
++  if (blob.version != ac_key_blob_version_v1) return coinbase::error(E_FORMAT, "not an access-structure key blob");
 +
-+  const mod_t& q = key.curve.order();
-+  const auto& G = key.curve.generator();
-+  const bn_t m = bn_t::from_bin(mul);
-+  const bn_t a = bn_t::from_bin(add);
++  const auto cid = static_cast<curve_id>(blob.curve);
++  if (cid == curve_id::ed25519) return coinbase::error(E_FORMAT, "invalid key blob curve");
++  const auto curve = to_internal_curve(cid);
++  if (!curve.valid()) return coinbase::error(E_FORMAT, "invalid key blob curve");
++
++  const coinbase::crypto::mod_t& q = curve.order();
++  const auto& G = curve.generator();
++  const coinbase::crypto::bn_t m = coinbase::crypto::bn_t::from_bin(mul);
++  const coinbase::crypto::bn_t a = coinbase::crypto::bn_t::from_bin(add);
 +  if (m == 0 || m >= q) return coinbase::error(E_BADARG, "mul out of range");
 +  if (a >= q) return coinbase::error(E_BADARG, "add out of range");
++  if (!q.is_in_range(blob.x_share)) return coinbase::error(E_FORMAT, "invalid key blob");
 +
-+  coinbase::mpc::ecdsa2pc::key_t derived;
-+  derived.role = key.role;
-+  derived.curve = key.curve;
-+  derived.paillier = key.paillier;
-+  derived.c_key = key.paillier.mul_scalar(key.c_key, m, coinbase::crypto::paillier_t::rerand_e::off);
-+  derived.Q = m * key.Q + a * G;
-+  if (key.role == coinbase::mpc::party_t::p2) {
-+    MODULO(q) derived.x_share = key.x_share * m + a;
-+  } else {
-+    derived.x_share = key.x_share * m;  // plain integer, matches Dec(c_key')
-+    if (!key.paillier.get_N().is_in_range(derived.x_share)) return coinbase::error(E_RANGE, "share too large");
++  const coinbase::crypto::ecc_point_t aG = a * G;
++
++  coinbase::crypto::ecc_point_t Q;
++  if (rv = Q.from_bin(curve, blob.Q_compressed)) return coinbase::error(rv, "invalid key blob");
++  const coinbase::crypto::ecc_point_t Q_derived = m * Q + aG;
++  if (Q_derived.is_infinity() || curve.check(Q_derived)) return coinbase::error(E_CRYPTO, "derived point invalid");
++
++  key_blob_v1_t derived;
++  derived.version = blob.version;
++  derived.curve = blob.curve;
++  derived.party_name = blob.party_name;
++  derived.Q_compressed = Q_derived.to_compressed_bin();
++  for (const auto& kv : blob.Qis_compressed) {
++    coinbase::crypto::ecc_point_t Qi;
++    if (rv = Qi.from_bin(curve, kv.second)) return coinbase::error(rv, "invalid key blob");
++    const coinbase::crypto::ecc_point_t Qi_derived = m * Qi + aG;
++    if (Qi_derived.is_infinity()) return coinbase::error(E_CRYPTO, "derived share point invalid");
++    derived.Qis_compressed[kv.first] = Qi_derived.to_compressed_bin();
 +  }
-+  if (key.curve.check(derived.Q)) return coinbase::error(E_CRYPTO, "derived point invalid");
-+  return serialize_key_blob(derived, out_key_blob);
++  MODULO(q) derived.x_share = blob.x_share * m + a;
++
++  out_ac_key_blob = coinbase::convert(derived);
++  return SUCCESS;
 +}
 +
  error_t get_public_key_compressed(mem_t key_blob, buf_t& pub_key) {
    if (const error_t rv = coinbase::api::detail::validate_mem_arg_max_size(key_blob, "key_blob",
                                                                            coinbase::api::detail::MAX_OPAQUE_BLOB_SIZE))
-diff --git a/src/cbmpc/c_api/ecdsa2pc.cpp b/src/cbmpc/c_api/ecdsa2pc.cpp
-index db7249d..9b437d3 100644
---- a/src/cbmpc/c_api/ecdsa2pc.cpp
-+++ b/src/cbmpc/c_api/ecdsa2pc.cpp
-@@ -145,6 +145,54 @@ cbmpc_error_t cbmpc_ecdsa_2p_sign(const cbmpc_2pc_job_t* job, cmem_t key_blob, c
-   return sign_common(&coinbase::api::ecdsa_2p::sign, job, key_blob, msg_hash, sid_in, sid_out, sig_der_out);
+diff --git a/src/cbmpc/c_api/ecdsa_mp.cpp b/src/cbmpc/c_api/ecdsa_mp.cpp
+index 2d0ca78..893f685 100644
+--- a/src/cbmpc/c_api/ecdsa_mp.cpp
++++ b/src/cbmpc/c_api/ecdsa_mp.cpp
+@@ -337,6 +337,31 @@ cbmpc_error_t cbmpc_ecdsa_mp_sign_ac(const cbmpc_mp_job_t* job, cmem_t ac_key_bl
+   }
  }
  
-+cbmpc_error_t cbmpc_ecdsa_2p_derive_additive_tweak(cmem_t key_blob, cmem_t tweak, cmem_t* out_key_blob) {
++cbmpc_error_t cbmpc_ecdsa_mp_derive_mul_add_ac(cmem_t ac_key_blob, cmem_t mul, cmem_t add, cmem_t* out_ac_key_blob) {
 +  try {
-+    if (!out_key_blob) return E_BADARG;
-+    *out_key_blob = cmem_t{nullptr, 0};
-+    const auto vkb = validate_cmem(key_blob);
-+    if (vkb) return vkb;
-+    const auto vtw = validate_cmem(tweak);
-+    if (vtw) return vtw;
-+
-+    coinbase::buf_t out;
-+    const coinbase::error_t rv =
-+        coinbase::api::ecdsa_2p::derive_additive_tweak(view_cmem(key_blob), view_cmem(tweak), out);
-+    if (rv) return rv;
-+    return alloc_cmem_from_buf(out, out_key_blob);
-+  } catch (const std::bad_alloc&) {
-+    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
-+    return E_INSUFFICIENT;
-+  } catch (...) {
-+    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
-+    return E_GENERAL;
-+  }
-+}
-+
-+cbmpc_error_t cbmpc_ecdsa_2p_derive_mul_add(cmem_t key_blob, cmem_t mul, cmem_t add, cmem_t* out_key_blob) {
-+  try {
-+    if (!out_key_blob) return E_BADARG;
-+    *out_key_blob = cmem_t{nullptr, 0};
-+    const auto vkb = validate_cmem(key_blob);
++    if (!out_ac_key_blob) return E_BADARG;
++    *out_ac_key_blob = cmem_t{nullptr, 0};
++    const auto vkb = validate_cmem(ac_key_blob);
 +    if (vkb) return vkb;
 +    const auto vm = validate_cmem(mul);
 +    if (vm) return vm;
@@ -183,21 +152,21 @@ index db7249d..9b437d3 100644
 +
 +    coinbase::buf_t out;
 +    const coinbase::error_t rv =
-+        coinbase::api::ecdsa_2p::derive_mul_add(view_cmem(key_blob), view_cmem(mul), view_cmem(add), out);
++        coinbase::api::ecdsa_mp::derive_mul_add_ac(view_cmem(ac_key_blob), view_cmem(mul), view_cmem(add), out);
 +    if (rv) return rv;
-+    return alloc_cmem_from_buf(out, out_key_blob);
++    return alloc_cmem_from_buf(out, out_ac_key_blob);
 +  } catch (const std::bad_alloc&) {
-+    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
++    if (out_ac_key_blob) *out_ac_key_blob = cmem_t{nullptr, 0};
 +    return E_INSUFFICIENT;
 +  } catch (...) {
-+    if (out_key_blob) *out_key_blob = cmem_t{nullptr, 0};
++    if (out_ac_key_blob) *out_ac_key_blob = cmem_t{nullptr, 0};
 +    return E_GENERAL;
 +  }
 +}
 +
- cbmpc_error_t cbmpc_ecdsa_2p_get_public_key_compressed(cmem_t key_blob, cmem_t* out_pub_key) {
+ cbmpc_error_t cbmpc_ecdsa_mp_get_public_key_compressed(cmem_t key_blob, cmem_t* out_pub_key) {
    try {
      if (!out_pub_key) return E_BADARG;
 -- 
-2.50.1 (Apple Git-155)
+2.43.0
 

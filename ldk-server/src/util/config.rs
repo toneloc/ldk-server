@@ -91,19 +91,20 @@ pub struct Config {
 	pub onchain_wallet_mnemonic_path: Option<String>,
 }
 
-/// Configuration of the external 2-of-2 MPC funding-key signer (`[mpc]` section).
+/// Configuration of the external threshold MPC channel-key signer (`[mpc]` section).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MpcConfig {
-	/// Address of MPC Party A (the cb-mpc P1 service).
-	pub party_address: SocketAddr,
+	/// Client addresses of the MPC parties. Any party can lead a request; if one cannot be
+	/// reached the next is tried.
+	pub party_addresses: Vec<SocketAddr>,
 	/// Timeout for signing requests.
 	pub request_timeout_secs: u64,
 	/// Timeout for key-generation requests.
 	pub dkg_timeout_secs: u64,
 	/// Which channel keys are MPC-backed.
 	pub coverage: MpcCoverage,
-	/// Path of the 32-byte pre-shared key file authenticating and encrypting the link to
-	/// Party A (the same file Party A was started with as `--auth-key-file`).
+	/// Path of the 32-byte pre-shared key file authenticating and encrypting the link to the
+	/// parties (the same file each party was started with as `--auth-key-file`).
 	pub auth_key_path: Option<String>,
 }
 
@@ -769,12 +770,18 @@ impl ConfigBuilder {
 
 		let mpc_config = match self.mpc {
 			Some(mpc) => {
-				let party_address = SocketAddr::from_str(&mpc.party_address).map_err(|e| {
-					io::Error::new(
-						io::ErrorKind::InvalidInput,
-						format!("Invalid mpc.party_address configured: {}", e),
-					)
-				})?;
+				let party_addresses = mpc
+					.party_address
+					.split(',')
+					.map(|addr| {
+						SocketAddr::from_str(addr.trim()).map_err(|e| {
+							io::Error::new(
+								io::ErrorKind::InvalidInput,
+								format!("Invalid mpc.party_address configured: {}", e),
+							)
+						})
+					})
+					.collect::<Result<Vec<_>, _>>()?;
 				let coverage = match mpc.coverage.as_deref().map(|c| c.to_ascii_lowercase()) {
 					None => MpcCoverage::All,
 					Some(c) if c == "all" => MpcCoverage::All,
@@ -789,7 +796,7 @@ impl ConfigBuilder {
 					},
 				};
 				Some(MpcConfig {
-					party_address,
+					party_addresses,
 					request_timeout_secs: mpc.request_timeout_secs.unwrap_or(30),
 					dkg_timeout_secs: mpc.dkg_timeout_secs.unwrap_or(120),
 					coverage,
@@ -1513,7 +1520,7 @@ pub struct ArgsConfig {
 	#[arg(
 		long,
 		env = "LDK_SERVER_MPC_PARTY_ADDRESS",
-		help = "Address of MPC Party A (cb-mpc P1). When set, channel funding keys are generated and used via 2-of-2 MPC. Only enable on a fresh node."
+		help = "Client addresses of the MPC parties, comma-separated. When set, channel keys are generated and used via threshold MPC. Only enable on a fresh node."
 	)]
 	mpc_party_address: Option<String>,
 

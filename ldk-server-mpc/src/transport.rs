@@ -1,11 +1,11 @@
-//! Transports for the cb-mpc protocol messages between the two parties.
+//! Framing for the party links, and an in-process transport for tests and benchmarks.
 
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::cbmpc::{Transport, TransportError};
+use crate::cbmpc::TransportError;
 
 /// Maximum size of a single framed protocol message (defensive bound).
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -33,64 +33,48 @@ pub fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
 	Ok(buf)
 }
 
-/// A framed transport over an established (optionally PSK-secured) connection to the other
-/// party.
-///
-/// The protocol library drives the connection strictly in lock-step (send/recv alternate), so a
-/// single mutex-protected connection is sufficient.
-pub struct TcpTransport {
-	conn: Mutex<crate::secure::Conn>,
-}
+/// One party's end of a link to another: where it sends and where it receives.
+type LocalLink = (Sender<Vec<u8>>, Mutex<Receiver<Vec<u8>>>);
 
-impl TcpTransport {
-	pub fn new(conn: crate::secure::Conn, timeout: Duration) -> std::io::Result<Self> {
-		conn.set_timeouts(timeout)?;
-		Ok(TcpTransport { conn: Mutex::new(conn) })
-	}
-
-	pub fn into_inner(self) -> crate::secure::Conn {
-		self.conn.into_inner().unwrap_or_else(|e| e.into_inner())
-	}
-}
-
-impl Transport for TcpTransport {
-	fn send(&self, msg: &[u8]) -> Result<(), TransportError> {
-		let mut c = self.conn.lock().map_err(|_| TransportError("poisoned".into()))?;
-		c.write_frame(msg).map_err(Into::into)
-	}
-
-	fn recv(&self) -> Result<Vec<u8>, TransportError> {
-		let mut c = self.conn.lock().map_err(|_| TransportError("poisoned".into()))?;
-		c.read_frame().map_err(Into::into)
-	}
-}
-
-/// In-process transport pair backed by channels. Used by tests and benchmarks that run
-/// both parties in one process (on separate threads).
-pub struct ChannelTransport {
-	tx: Sender<Vec<u8>>,
-	rx: Mutex<Receiver<Vec<u8>>>,
+/// In-process transport for an `n`-party session: every pair of parties is joined by a pair
+/// of channels. Used by tests and benchmarks that run all parties in one process.
+pub struct LocalMesh {
+	/// `links[peer]` is `None` for this party's own index.
+	links: Vec<Option<LocalLink>>,
 	timeout: Duration,
 }
 
-impl ChannelTransport {
-	pub fn pair(timeout: Duration) -> (ChannelTransport, ChannelTransport) {
-		let (a_tx, b_rx) = channel();
-		let (b_tx, a_rx) = channel();
-		(
-			ChannelTransport { tx: a_tx, rx: Mutex::new(a_rx), timeout },
-			ChannelTransport { tx: b_tx, rx: Mutex::new(b_rx), timeout },
-		)
+impl LocalMesh {
+	/// One transport per party, in party order.
+	pub fn new(n: usize, timeout: Duration) -> Vec<LocalMesh> {
+		let mut parties: Vec<LocalMesh> =
+			(0..n).map(|_| LocalMesh { links: (0..n).map(|_| None).collect(), timeout }).collect();
+		for i in 0..n {
+			for j in (i + 1)..n {
+				let (i_tx, j_rx) = channel();
+				let (j_tx, i_rx) = channel();
+				parties[i].links[j] = Some((i_tx, Mutex::new(i_rx)));
+				parties[j].links[i] = Some((j_tx, Mutex::new(j_rx)));
+			}
+		}
+		parties
+	}
+
+	fn link(&self, peer: usize) -> Result<&LocalLink, TransportError> {
+		self.links
+			.get(peer)
+			.and_then(|l| l.as_ref())
+			.ok_or_else(|| TransportError(format!("no link to party {peer}")))
 	}
 }
 
-impl Transport for ChannelTransport {
-	fn send(&self, msg: &[u8]) -> Result<(), TransportError> {
-		self.tx.send(msg.to_vec()).map_err(|_| TransportError("peer dropped".into()))
+impl crate::mp::MpTransport for LocalMesh {
+	fn send(&self, peer: usize, msg: &[u8]) -> Result<(), TransportError> {
+		self.link(peer)?.0.send(msg.to_vec()).map_err(|_| TransportError("peer dropped".into()))
 	}
 
-	fn recv(&self) -> Result<Vec<u8>, TransportError> {
-		let rx = self.rx.lock().map_err(|_| TransportError("poisoned".into()))?;
+	fn recv(&self, peer: usize) -> Result<Vec<u8>, TransportError> {
+		let rx = self.link(peer)?.1.lock().map_err(|_| TransportError("poisoned".into()))?;
 		rx.recv_timeout(self.timeout).map_err(|e| TransportError(e.to_string()))
 	}
 }

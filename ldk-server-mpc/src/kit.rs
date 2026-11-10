@@ -474,22 +474,11 @@ pub fn seed_fingerprint(seed: &[u8; 32]) -> String {
 /// Helpers shared by this crate's unit tests.
 #[cfg(test)]
 pub(crate) mod test_util {
-	use std::thread;
-	use std::time::Duration;
-
 	use bitcoin::secp256k1::rand::{thread_rng, RngCore};
 
 	use super::*;
-	use crate::tdh2::{Tdh2Key, TwoParty};
-	use crate::transport::ChannelTransport;
-
-	pub fn tdh2_keys() -> (Tdh2Key, Tdh2Key) {
-		let (ta, tb) = ChannelTransport::pair(Duration::from_secs(30));
-		let names = ["party-a", "party-b"];
-		let b = thread::spawn(move || tdh2::dkg(&names, 1, &TwoParty(&tb)).unwrap());
-		let a = tdh2::dkg(&names, 0, &TwoParty(&ta)).unwrap();
-		(a, b.join().unwrap())
-	}
+	use crate::mp::Threshold;
+	use crate::tdh2::Tdh2Key;
 
 	pub fn tmp_dir(name: &str) -> PathBuf {
 		let mut n = [0u8; 8];
@@ -499,20 +488,21 @@ pub(crate) mod test_util {
 		dir
 	}
 
-	/// A kit store holding one kit of `count` entries from the first commitment number.
-	pub fn store_with_kit(kit_id: &KitId, count: u32) -> (KitStore, Tdh2Key, Tdh2Key) {
-		let (a, b) = tdh2_keys();
+	/// A kit store holding one kit of `count` entries from the first commitment number,
+	/// encrypted to a fresh 3-of-4 TDH2 key.
+	pub fn store_with_kit(kit_id: &KitId, count: u32) -> (KitStore, Threshold, Vec<Tdh2Key>) {
+		let (ac, keys) = crate::tdh2::test_util::keys();
 		let dir = tmp_dir("fixture");
 		let seg = generate_segment(
 			&[0x42u8; 32],
 			kit_id,
-			&a.public_key,
+			&keys[0].public_key,
 			INITIAL_COMMITMENT_NUMBER,
 			count,
 		)
 		.unwrap();
 		fs::write(dir.join(segment_file_name(kit_id, INITIAL_COMMITMENT_NUMBER)), seg).unwrap();
-		(KitStore::open(&dir).unwrap(), a, b)
+		(KitStore::open(&dir).unwrap(), ac, keys)
 	}
 }
 
@@ -521,20 +511,25 @@ mod tests {
 	use bitcoin::secp256k1::rand::{thread_rng, RngCore};
 	use lightning::ln::chan_utils::CounterpartyCommitmentSecrets;
 
-	use super::test_util::{tdh2_keys, tmp_dir};
+	use super::test_util::tmp_dir;
 	use super::*;
+	use crate::mp::Threshold;
+	use crate::tdh2::test_util::keys as tdh2_keys;
 	use crate::tdh2::Tdh2Key;
 
-	fn decrypt(a: &Tdh2Key, b: &Tdh2Key, kit: &KitId, idx: u64, rec: &KitRecord) -> [u8; 32] {
-		let l = label(kit, idx);
-		let pa = a.partial_decrypt(&rec.ciphertext, &l).unwrap();
-		let pb = b.partial_decrypt(&rec.ciphertext, &l).unwrap();
-		a.combine(&rec.ciphertext, &l, &[pa, pb]).unwrap().try_into().unwrap()
+	fn decrypt(
+		ac: &Threshold, keys: &[Tdh2Key], kit: &KitId, idx: u64, rec: &KitRecord,
+	) -> [u8; 32] {
+		crate::tdh2::test_util::decrypt(ac, keys, &[0, 2, 3], &rec.ciphertext, &label(kit, idx))
+			.unwrap()
+			.try_into()
+			.unwrap()
 	}
 
 	#[test]
 	fn kit_secrets_form_a_bolt3_shachain() {
-		let (a, b) = tdh2_keys();
+		let (ac, keys) = tdh2_keys();
+		let a = &keys[0];
 		let master = [0x11u8; 32];
 		let kit = [0x22u8; 32];
 		let dir = tmp_dir("shachain");
@@ -550,7 +545,7 @@ mod tests {
 		for i in 0..40u64 {
 			let idx = INITIAL_COMMITMENT_NUMBER - i;
 			let rec = store.record(&kit, idx).unwrap().unwrap();
-			let secret = decrypt(&a, &b, &kit, idx, &rec);
+			let secret = decrypt(&ac, &keys, &kit, idx, &rec);
 			assert_eq!(
 				PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&secret).unwrap()),
 				rec.point
@@ -576,7 +571,8 @@ mod tests {
 
 	#[test]
 	fn a_ciphertext_cannot_stand_in_for_another_index() {
-		let (a, b) = tdh2_keys();
+		let (_, keys) = tdh2_keys();
+		let (a, b) = (&keys[0], &keys[1]);
 		let kit = [0x33u8; 32];
 		let dir = tmp_dir("swap");
 		let seg = generate_segment(&[1u8; 32], &kit, &a.public_key, INITIAL_COMMITMENT_NUMBER, 4)
@@ -592,7 +588,8 @@ mod tests {
 
 	#[test]
 	fn segments_extend_a_kit() {
-		let (a, _) = tdh2_keys();
+		let (_, keys) = tdh2_keys();
+		let a = &keys[0];
 		let kit = [0x44u8; 32];
 		let dir = tmp_dir("refill");
 		let top = INITIAL_COMMITMENT_NUMBER;
@@ -614,7 +611,8 @@ mod tests {
 
 	#[test]
 	fn a_kit_serves_one_channel() {
-		let (a, _) = tdh2_keys();
+		let (_, keys) = tdh2_keys();
+		let a = &keys[0];
 		let dir = tmp_dir("bind");
 		let top = INITIAL_COMMITMENT_NUMBER;
 		for kit in [[1u8; 32], [2u8; 32]] {

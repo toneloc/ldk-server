@@ -1,4 +1,4 @@
-# LDK Server on Bitcoin Signet with Coinbase cb-mpc 2-of-2 MPC-backed channel funding keys.
+# LDK Server on Bitcoin Signet with Coinbase cb-mpc threshold MPC-backed channel keys.
 #
 # Start the two MPC parties first (see run-mpc-parties.sh), then:
 #   ldk-server contrib/mpc-signet/ldk-server-signet-mpc.toml
@@ -26,7 +26,8 @@ level = "Debug"
 log_to_file = true
 
 [mpc]
-# Address of MPC Party A (cb-mpc P1). Party B is only reachable by Party A.
-party_address = "127.0.0.1:7701"
+# Client addresses of the MPC parties (see run-mpc-parties.sh). The next is tried when one
+# is unreachable.
+party_address = "127.0.0.1:7701,127.0.0.1:7702,127.0.0.1:7703,127.0.0.1:7704"
 request_timeout_secs = 30
 dkg_timeout_secs = 120

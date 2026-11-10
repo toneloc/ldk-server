@@ -1,10 +1,19 @@
-//! `ldk-server-mpc-party`: one MPC party (P1 or P2) wrapping Coinbase cb-mpc ECDSA-2P.
+//! `ldk-server-mpc-party`: one MPC party. Every party runs this same program; any
+//! `--threshold` of them can sign.
 //!
-//! Example (two processes on one machine):
+//! Each party first prints its identity key, and the operators exchange them:
 //!
 //! ```text
-//! ldk-server-mpc-party --role p2 --listen 127.0.0.1:7702 --keystore ./mpc-b
-//! ldk-server-mpc-party --role p1 --listen 127.0.0.1:7701 --peer 127.0.0.1:7702 --keystore ./mpc-a
+//! ldk-server-mpc-party --keystore ./mpc-a --print-identity
+//! ```
+//!
+//! Then every party is started with the same `--party` list (name=address=identity, same
+//! order everywhere) and its own `--name`:
+//!
+//! ```text
+//! ldk-server-mpc-party --name a --threshold 3 --listen 127.0.0.1:7701 --keystore ./mpc-a \
+//!   --party a=127.0.0.1:7711=<id a> --party b=127.0.0.1:7712=<id b> \
+//!   --party c=127.0.0.1:7713=<id c> --party d=127.0.0.1:7714=<id d>
 //! ```
 
 use std::net::SocketAddr;
@@ -12,34 +21,43 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use ldk_server_mpc::cbmpc::Party;
+use hex_conservative::{DisplayHex, FromHex};
+use ldk_server_mpc::mesh::{Identity, PartyInfo};
 use ldk_server_mpc::party::{PartyConfig, PartyService};
 use ldk_server_mpc::policy::{PayoutAllowlist, PolicyConfig};
+use ldk_server_mpc::secure::AtRestKey;
 
 #[derive(Parser, Debug)]
 #[command(
 	name = "ldk-server-mpc-party",
-	about = "Coinbase cb-mpc 2-of-2 ECDSA party for LDK Server"
+	about = "Coinbase cb-mpc threshold ECDSA party for LDK Server"
 )]
 struct Args {
-	/// Role of this party: p1 (serves LDK Server, obtains signatures) or p2.
-	#[arg(long, env = "LDK_MPC_ROLE")]
-	role: Party,
-	/// Address to listen on.
-	#[arg(long, env = "LDK_MPC_LISTEN")]
-	listen: SocketAddr,
-	/// Address of P2 (required for p1).
-	#[arg(long, env = "LDK_MPC_PEER")]
-	peer: Option<SocketAddr>,
+	/// This party's name: one of the names in `--party`.
+	#[arg(long, env = "LDK_MPC_NAME", required_unless_present = "print_identity")]
+	name: Option<String>,
+	/// A party as `name=address=identity`: its stable unique name (the cb-mpc party id), the
+	/// address it accepts the other parties on, and its identity public key (hex, from
+	/// `--print-identity`). Give every party, this one included, in the same order on every
+	/// party.
+	#[arg(long = "party", env = "LDK_MPC_PARTIES", value_delimiter = ',')]
+	parties: Vec<String>,
+	/// How many parties must agree to sign or to release a revocation secret.
+	#[arg(long, env = "LDK_MPC_THRESHOLD", required_unless_present = "print_identity")]
+	threshold: Option<usize>,
+	/// Address to accept LDK Server's requests on.
+	#[arg(long, env = "LDK_MPC_LISTEN", required_unless_present = "print_identity")]
+	listen: Option<SocketAddr>,
 	/// Directory where this party's key shares are stored.
 	#[arg(long, env = "LDK_MPC_KEYSTORE")]
 	keystore: PathBuf,
-	/// Stable unique identifier of party 1 (cb-mpc pid). Must match on both parties.
-	#[arg(long, env = "LDK_MPC_P1_NAME", default_value = "ldk-server-mpc-party-a")]
-	p1_name: String,
-	/// Stable unique identifier of party 2 (cb-mpc pid). Must match on both parties.
-	#[arg(long, env = "LDK_MPC_P2_NAME", default_value = "ldk-server-mpc-party-b")]
-	p2_name: String,
+	/// This party's identity key file. Created if missing. Defaults to
+	/// `<keystore>/identity.key`.
+	#[arg(long, env = "LDK_MPC_IDENTITY_FILE")]
+	identity_file: Option<PathBuf>,
+	/// Print this party's identity public key (creating the key if needed) and exit.
+	#[arg(long)]
+	print_identity: bool,
 	/// Per-message I/O timeout (seconds) for the inter-party protocol.
 	#[arg(long, default_value_t = 30)]
 	protocol_timeout_secs: u64,
@@ -66,12 +84,13 @@ struct Args {
 	/// Maximum a cooperative close may pay us below our last tracked balance, in sats.
 	#[arg(long, default_value_t = 10_000)]
 	max_closing_fee_sat: u64,
-	/// 32-byte pre-shared key file authenticating/encrypting the LDK Server link (Party A).
-	/// Created if missing; copy it to LDK Server (`[mpc] auth_key_path`).
+	/// 32-byte pre-shared key file authenticating/encrypting the link from LDK Server.
+	/// Created if missing; LDK Server (`[mpc] auth_key_path`) and every party it may talk to
+	/// need the same file.
 	#[arg(long, env = "LDK_MPC_AUTH_KEY_FILE")]
 	auth_key_file: Option<PathBuf>,
-	/// 32-byte pre-shared key file authenticating/encrypting the Party A ⇄ Party B link.
-	/// Created if missing; must have the same content on both parties.
+	/// Optional 32-byte pre-shared key file mixed into the links between parties, on top of
+	/// their identity keys. Created if missing; must have the same content on every party.
 	#[arg(long, env = "LDK_MPC_PEER_AUTH_KEY_FILE")]
 	peer_auth_key_file: Option<PathBuf>,
 	/// 32-byte key file encrypting key shares at rest. Created if missing. Keep it separate
@@ -147,13 +166,49 @@ fn main() {
 	let peer_psk = load_key(&args.peer_auth_key_file, "peer auth");
 	let share_key = load_key(&args.share_key_file, "share");
 
+	let fail = |msg: String| -> ! {
+		eprintln!("{msg}");
+		std::process::exit(2);
+	};
+	let identity_file =
+		args.identity_file.clone().unwrap_or_else(|| args.keystore.join("identity.key"));
+	let at_rest = share_key.as_ref().map(AtRestKey::new);
+	let identity = Identity::load_or_create(&identity_file, at_rest.as_ref()).unwrap_or_else(|e| {
+		fail(format!("failed to load identity key {}: {e}", identity_file.display()))
+	});
+	if args.print_identity {
+		println!("{}", identity.public_key().as_hex());
+		return;
+	}
+
+	let parties: Vec<PartyInfo> = args
+		.parties
+		.iter()
+		.map(|spec| {
+			let parts: Vec<&str> = spec.split('=').collect();
+			let [name, addr, id] = parts[..] else {
+				fail(format!("invalid --party '{spec}': expected name=address=identity"));
+			};
+			PartyInfo {
+				name: name.to_string(),
+				addr: addr
+					.parse()
+					.unwrap_or_else(|e| fail(format!("invalid address in --party '{spec}': {e}"))),
+				identity: <[u8; 32]>::from_hex(id)
+					.unwrap_or_else(|e| fail(format!("invalid identity in --party '{spec}': {e}"))),
+			}
+		})
+		.collect();
+	let name = args.name.clone().expect("required by clap");
+	let lead_tdh2 = parties.first().map(|p| p.name == name).unwrap_or(false);
+
 	let cfg = PartyConfig {
-		party: args.role,
-		listen_addr: args.listen,
-		peer_addr: args.peer,
+		name,
+		parties,
+		threshold: args.threshold.expect("required by clap"),
+		identity,
+		listen_addr: args.listen.expect("required by clap"),
 		keystore_dir: args.keystore,
-		p1_name: args.p1_name,
-		p2_name: args.p2_name,
 		protocol_timeout: Duration::from_secs(args.protocol_timeout_secs),
 		client_timeout: Duration::from_secs(args.client_timeout_secs),
 		policy,
@@ -169,9 +224,10 @@ fn main() {
 			std::process::exit(1);
 		},
 	};
-	if service.config().party == Party::P1 && service.tdh2_public_key().is_none() {
+	if lead_tdh2 && service.tdh2_public_key().is_none() {
 		// The offline ceremony needs the joint TDH2 public key (`<keystore>/tdh2.pub`) before it
-		// can make kits, so generate it as soon as Party B is reachable.
+		// can make kits. The first party in the list generates it with the others as soon as
+		// all of them are reachable.
 		let service = std::sync::Arc::clone(&service);
 		std::thread::spawn(move || loop {
 			match service.ensure_tdh2() {

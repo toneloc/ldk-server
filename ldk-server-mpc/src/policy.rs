@@ -1,4 +1,4 @@
-//! Signing policy enforced by Party B (and, redundantly, by Party A).
+//! Signing and secret-release policy, enforced by every party from its own record.
 //!
 //! The policy does not trust the metadata LDK Server attaches to a request. For every
 //! signature it:
@@ -532,7 +532,10 @@ impl ChannelPolicy {
 		Ok(self.load(channel).map_err(|e| PolicyError(e.to_string()))?.kit_id)
 	}
 
-	fn kit_record(&self, channel: &ChannelId, idx: u64) -> Result<(KitId, KitRecord), PolicyError> {
+	/// The kit entry for commitment `idx` of `channel`. Reading it authorizes nothing.
+	pub fn kit_entry(
+		&self, channel: &ChannelId, idx: u64,
+	) -> Result<(KitId, KitRecord), PolicyError> {
 		let kit_id =
 			self.kit_of(channel)?.ok_or_else(|| PolicyError("channel has no kit bound".into()))?;
 		let record = self
@@ -550,7 +553,7 @@ impl ChannelPolicy {
 	pub fn per_commitment_point(
 		&self, channel: &ChannelId, idx: u64,
 	) -> Result<PublicKey, PolicyError> {
-		Ok(self.kit_record(channel, idx)?.1.point)
+		Ok(self.kit_entry(channel, idx)?.1.point)
 	}
 
 	/// Allows this party's contribution to releasing the secret for `idx`, which is given only
@@ -578,7 +581,7 @@ impl ChannelPolicy {
 				))
 			},
 		}
-		let entry = self.kit_record(channel, idx)?;
+		let entry = self.kit_entry(channel, idx)?;
 		st.released_secrets += 1;
 		self.store(channel, st).map_err(|e| PolicyError(e.to_string()))?;
 		Ok(entry)

@@ -1,14 +1,16 @@
-//! Minimal binary wire protocol (v2).
+//! Minimal binary wire protocol.
 //!
 //! Two message families share one framing (`transport::write_frame`):
 //!
-//! - **Client ⇄ Party A (P1)**: [`Request`] / [`Response`]. One request per TCP connection.
-//! - **Party A ⇄ Party B (P2)**: a [`SessionStart`] header, a [`SessionAck`], then, for
-//!   interactive operations (DKG, sign), the opaque cb-mpc protocol frames and finally a
-//!   [`SessionDone`] from P2 carrying the aggregate public key.
+//! - **Client ⇄ party**: [`Request`] / [`Response`]. One request per TCP connection, to any
+//!   party; that party leads the request.
+//! - **Party ⇄ party**: the leader sends each member a [`SessionStart`] and gets a
+//!   [`SessionAck`]. For interactive operations (key generation, signing) the leader then
+//!   says go, the members link up with each other ([`MeshJoin`]), the opaque cb-mpc protocol
+//!   frames follow, and each member ends with a [`SessionDone`].
 //!
 //! Every signing request carries a [`SigningContext`] with the full transaction being signed,
-//! so Party B can recompute the sighash and apply policy rather than trust a bare digest.
+//! so each party can recompute the sighash and apply policy rather than trust a bare digest.
 //! Encoding is deliberately simple (big-endian integers, `u32` length-prefixed byte strings).
 
 use std::fmt;
@@ -338,7 +340,7 @@ pub struct CounterpartyKeys {
 	pub htlc_basepoint: [u8; 33],
 }
 
-/// Context attached to a signing request. Supplied by LDK Server; Party B verifies the parts it
+/// Context attached to a signing request. Supplied by LDK Server; each party verifies the parts it
 /// can (sighash, key derivation, balances) and applies policy. Fields it cannot verify are
 /// informational only.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -499,7 +501,7 @@ impl SignItem {
 }
 
 // ---------------------------------------------------------------------------
-// Client ⇄ P1
+// Client ⇄ party
 // ---------------------------------------------------------------------------
 
 const TAG_REQUEST: u8 = 0x01;
@@ -507,6 +509,9 @@ const TAG_RESPONSE: u8 = 0x02;
 const TAG_SESSION_START: u8 = 0x10;
 const TAG_SESSION_ACK: u8 = 0x11;
 const TAG_SESSION_DONE: u8 = 0x12;
+const TAG_MESH_JOIN: u8 = 0x13;
+const TAG_GO: u8 = 0x14;
+const TAG_COMMIT: u8 = 0x15;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -526,10 +531,13 @@ pub enum Request {
 		channel: ChannelId,
 		idx: u64,
 	},
-	/// Per-commitment secret for commitment `idx` of `channel`, subject to policy.
+	/// Per-commitment secret for commitment `idx` of `channel`, subject to policy. `newer` is
+	/// a later holder commitment with its proof, if the caller has one: it lets a party that
+	/// missed the validation notice catch up.
 	ReleaseCommitmentSecret {
 		channel: ChannelId,
 		idx: u64,
+		newer: Option<(u64, HolderProof)>,
 	},
 	/// LDK validated the counterparty's signatures on holder commitment `commitment_number`.
 	/// `proof` lets the parties check that for themselves; they require it for every
@@ -545,7 +553,7 @@ pub enum Request {
 		idx: u64,
 		secret: [u8; 32],
 	},
-	/// Produces one 2-of-2 ECDSA signature per item.
+	/// Produces one threshold ECDSA signature per item.
 	Sign {
 		request_id: [u8; 16],
 		channel: Option<ChannelId>,
@@ -580,10 +588,18 @@ impl Request {
 				w.fixed(channel);
 				w.u64(*idx);
 			},
-			Request::ReleaseCommitmentSecret { channel, idx } => {
+			Request::ReleaseCommitmentSecret { channel, idx, newer } => {
 				w.u8(5);
 				w.fixed(channel);
 				w.u64(*idx);
+				match newer {
+					Some((number, proof)) => {
+						w.u8(1);
+						w.u64(*number);
+						HolderProof::encode_opt(Some(proof), &mut w);
+					},
+					None => w.u8(0),
+				}
 			},
 			Request::HolderCommitmentValidated { channel, commitment_number, proof } => {
 				w.u8(6);
@@ -630,7 +646,19 @@ impl Request {
 			},
 			2 => Request::GetPublicKey { key_id: r.fixed32()? },
 			4 => Request::GetPerCommitmentPoint { channel: r.fixed32()?, idx: r.u64()? },
-			5 => Request::ReleaseCommitmentSecret { channel: r.fixed32()?, idx: r.u64()? },
+			5 => {
+				let channel = r.fixed32()?;
+				let idx = r.u64()?;
+				let newer = if r.u8()? == 1 {
+					let number = r.u64()?;
+					let proof = HolderProof::decode_opt(&mut r)?
+						.ok_or(DecodeError("missing holder proof"))?;
+					Some((number, proof))
+				} else {
+					None
+				};
+				Request::ReleaseCommitmentSecret { channel, idx, newer }
+			},
 			6 => Request::HolderCommitmentValidated {
 				channel: r.fixed32()?,
 				commitment_number: r.u64()?,
@@ -780,32 +808,39 @@ impl Response {
 }
 
 // ---------------------------------------------------------------------------
-// P1 ⇄ P2 session framing
+// Party ⇄ party session framing
 // ---------------------------------------------------------------------------
 
+/// What a session between parties does. The party that received the client's request leads
+/// the session; every other member applies its own policy before it takes part.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum SessionOp {
-	/// Interactive DKG for `key_id`.
+	/// Interactive key generation for `key_id`, among all parties.
 	Dkg {
 		key_id: KeyId,
 		channel: Option<(ChannelId, KeyKind)>,
 	},
-	/// Interactive signing of one item.
+	/// Interactive key generation of the joint TDH2 key (revocation secrets), among all parties.
+	Tdh2Dkg,
+	/// Interactive signing of every item, in order, among a quorum.
 	Sign {
 		channel: Option<ChannelId>,
-		item: SignItem,
+		items: Vec<SignItem>,
 	},
-	/// Party B's per-commitment point for `idx`, read from its copy of the channel's kit.
-	PerCommitmentPoint {
+	/// Binds the kit `kit_id` to `channel`.
+	BindKit {
 		channel: ChannelId,
-		idx: u64,
+		kit_id: [u8; 32],
 	},
-	/// Asks Party B for its partial decryption of the secret for `idx`. Party B answers only
+	/// Asks for this party's partial decryption of the secret for `idx`. A party answers only
 	/// if its own policy allows the release, and decrypts only its own copy of the kit entry.
+	/// `newer` is a later holder commitment and its proof, so a party that missed the
+	/// validation notice can catch up from the request itself.
 	ReleaseSecret {
 		channel: ChannelId,
 		idx: u64,
+		newer: Option<(u64, HolderProof)>,
 	},
 	HolderCommitmentValidated {
 		channel: ChannelId,
@@ -817,17 +852,46 @@ pub enum SessionOp {
 		idx: u64,
 		secret: [u8; 32],
 	},
-	/// Interactive key generation of the parties' joint TDH2 key (revocation secrets).
-	Tdh2Dkg,
-	/// Binds the kit `kit_id` to `channel` on Party B.
-	BindKit {
+	/// Tells a party outside the signing quorum what was signed, so its record of the channel
+	/// keeps up. The party applies its policy as if it had signed.
+	Observe {
 		channel: ChannelId,
-		kit_id: [u8; 32],
+		items: Vec<SignItem>,
 	},
 }
 
+impl SessionOp {
+	/// Whether the op runs a cb-mpc protocol over a mesh of the session's members.
+	pub fn is_interactive(&self) -> bool {
+		matches!(self, SessionOp::Dkg { .. } | SessionOp::Tdh2Dkg | SessionOp::Sign { .. })
+	}
+}
+
+fn encode_items(w: &mut Writer, items: &[SignItem]) {
+	w.u32(items.len() as u32);
+	for item in items {
+		item.encode(w);
+	}
+}
+
+fn decode_items(r: &mut Reader<'_>) -> Result<Vec<SignItem>, DecodeError> {
+	let n = r.u32()? as usize;
+	if n > 1024 {
+		return Err(DecodeError("too many sign items"));
+	}
+	let mut items = Vec::with_capacity(n);
+	for _ in 0..n {
+		items.push(SignItem::decode(r)?);
+	}
+	Ok(items)
+}
+
+/// Opens a session. `members` are the indices of the parties taking part, the leader first;
+/// for non-interactive ops it is just the leader and the receiver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionStart {
+	pub session: [u8; 16],
+	pub members: Vec<u8>,
 	pub op: SessionOp,
 }
 
@@ -835,6 +899,8 @@ impl SessionStart {
 	pub fn encode(&self) -> Vec<u8> {
 		let mut w = Writer::new();
 		w.u8(TAG_SESSION_START);
+		w.fixed(&self.session);
+		w.bytes(&self.members);
 		match &self.op {
 			SessionOp::Dkg { key_id, channel } => {
 				w.u8(1);
@@ -848,20 +914,23 @@ impl SessionStart {
 					None => w.u8(0),
 				}
 			},
-			SessionOp::Sign { channel, item } => {
+			SessionOp::Sign { channel, items } => {
 				w.u8(2);
 				w.opt_fixed32(channel.as_ref());
-				item.encode(&mut w);
+				encode_items(&mut w, items);
 			},
-			SessionOp::PerCommitmentPoint { channel, idx } => {
-				w.u8(3);
-				w.fixed(channel);
-				w.u64(*idx);
-			},
-			SessionOp::ReleaseSecret { channel, idx } => {
+			SessionOp::ReleaseSecret { channel, idx, newer } => {
 				w.u8(4);
 				w.fixed(channel);
 				w.u64(*idx);
+				match newer {
+					Some((number, proof)) => {
+						w.u8(1);
+						w.u64(*number);
+						HolderProof::encode_opt(Some(proof), &mut w);
+					},
+					None => w.u8(0),
+				}
 			},
 			SessionOp::HolderCommitmentValidated { channel, commitment_number, proof } => {
 				w.u8(5);
@@ -881,6 +950,11 @@ impl SessionStart {
 				w.fixed(channel);
 				w.fixed(kit_id);
 			},
+			SessionOp::Observe { channel, items } => {
+				w.u8(9);
+				w.fixed(channel);
+				encode_items(&mut w, items);
+			},
 		}
 		w.0
 	}
@@ -889,6 +963,11 @@ impl SessionStart {
 		let mut r = Reader::new(buf);
 		if r.u8()? != TAG_SESSION_START {
 			return Err(DecodeError("not a session start"));
+		}
+		let session = r.fixed16()?;
+		let members = r.bytes()?;
+		if members.len() < 2 || members.len() > 255 {
+			return Err(DecodeError("bad session member list"));
 		}
 		let op = match r.u8()? {
 			1 => {
@@ -902,9 +981,20 @@ impl SessionStart {
 				};
 				SessionOp::Dkg { key_id, channel }
 			},
-			2 => SessionOp::Sign { channel: r.opt_fixed32()?, item: SignItem::decode(&mut r)? },
-			3 => SessionOp::PerCommitmentPoint { channel: r.fixed32()?, idx: r.u64()? },
-			4 => SessionOp::ReleaseSecret { channel: r.fixed32()?, idx: r.u64()? },
+			2 => SessionOp::Sign { channel: r.opt_fixed32()?, items: decode_items(&mut r)? },
+			4 => {
+				let channel = r.fixed32()?;
+				let idx = r.u64()?;
+				let newer = if r.u8()? == 1 {
+					let number = r.u64()?;
+					let proof = HolderProof::decode_opt(&mut r)?
+						.ok_or(DecodeError("missing holder proof"))?;
+					Some((number, proof))
+				} else {
+					None
+				};
+				SessionOp::ReleaseSecret { channel, idx, newer }
+			},
 			5 => SessionOp::HolderCommitmentValidated {
 				channel: r.fixed32()?,
 				commitment_number: r.u64()?,
@@ -917,15 +1007,48 @@ impl SessionStart {
 			},
 			7 => SessionOp::Tdh2Dkg,
 			8 => SessionOp::BindKit { channel: r.fixed32()?, kit_id: r.fixed32()? },
+			9 => SessionOp::Observe { channel: r.fixed32()?, items: decode_items(&mut r)? },
 			_ => return Err(DecodeError("unknown session op")),
 		};
 		r.finish()?;
-		Ok(SessionStart { op })
+		Ok(SessionStart { session, members, op })
 	}
 }
 
-/// Party B's answer to a [`SessionStart`]. For interactive ops `Ok` carries no payload and the
-/// cb-mpc frames follow; for non-interactive ops `Ok` carries the result.
+/// Sent by a session member to another member it dials, to say which session the link is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeshJoin {
+	pub session: [u8; 16],
+}
+
+impl MeshJoin {
+	pub fn encode(&self) -> Vec<u8> {
+		let mut w = Writer::new();
+		w.u8(TAG_MESH_JOIN);
+		w.fixed(&self.session);
+		w.0
+	}
+
+	pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+		let mut r = Reader::new(buf);
+		if r.u8()? != TAG_MESH_JOIN {
+			return Err(DecodeError("not a mesh join"));
+		}
+		let session = r.fixed16()?;
+		r.finish()?;
+		Ok(MeshJoin { session })
+	}
+}
+
+/// The leader's signal that every member accepted the session and the protocol can start.
+pub const FRAME_GO: &[u8] = &[TAG_GO];
+/// The leader's signal, after a key generation, that every member got the same public key and
+/// should now store its share.
+pub const FRAME_COMMIT: &[u8] = &[TAG_COMMIT];
+
+/// A member's answer to a [`SessionStart`]. For interactive ops `Ok` carries no payload and the
+/// cb-mpc frames follow once the leader says go; for non-interactive ops `Ok` carries the
+/// result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionAck {
 	Ok { payload: Vec<u8> },
@@ -968,8 +1091,8 @@ impl SessionAck {
 	}
 }
 
-/// Sent by P2 after an interactive protocol completes so both sides can confirm they computed
-/// the same aggregate public key.
+/// Sent by a member to the leader after an interactive protocol completes, so the leader can
+/// confirm every member computed the same public key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionDone {
 	pub pubkey: Vec<u8>,
@@ -999,6 +1122,7 @@ impl SessionDone {
 pub enum FrameKind {
 	Request,
 	SessionStart,
+	MeshJoin,
 	Other,
 }
 
@@ -1006,6 +1130,7 @@ pub fn frame_kind(buf: &[u8]) -> FrameKind {
 	match buf.first() {
 		Some(&TAG_REQUEST) => FrameKind::Request,
 		Some(&TAG_SESSION_START) => FrameKind::SessionStart,
+		Some(&TAG_MESH_JOIN) => FrameKind::MeshJoin,
 		_ => FrameKind::Other,
 	}
 }
@@ -1058,7 +1183,15 @@ mod tests {
 			Request::EnsureKey { key_id: [1u8; 32], channel: None },
 			Request::GetPublicKey { key_id: [2u8; 32] },
 			Request::GetPerCommitmentPoint { channel: [1u8; 32], idx: 42 },
-			Request::ReleaseCommitmentSecret { channel: [1u8; 32], idx: 42 },
+			Request::ReleaseCommitmentSecret { channel: [1u8; 32], idx: 42, newer: None },
+			Request::ReleaseCommitmentSecret {
+				channel: [1u8; 32],
+				idx: 42,
+				newer: Some((
+					41,
+					HolderProof { transaction: vec![1], counterparty_sig: [2u8; 64] },
+				)),
+			},
 			Request::HolderCommitmentValidated {
 				channel: [1u8; 32],
 				commitment_number: 41,
@@ -1116,19 +1249,22 @@ mod tests {
 
 	#[test]
 	fn session_roundtrip() {
+		let item = SignItem {
+			key_id: [1u8; 32],
+			derivation: Derivation::None,
+			digest: [2u8; 32],
+			context: sample_context(),
+		};
 		let ops = vec![
 			SessionOp::Dkg { key_id: [1u8; 32], channel: Some(([2u8; 32], KeyKind::Htlc)) },
-			SessionOp::Sign {
-				channel: Some([2u8; 32]),
-				item: SignItem {
-					key_id: [1u8; 32],
-					derivation: Derivation::None,
-					digest: [2u8; 32],
-					context: sample_context(),
-				},
+			SessionOp::Sign { channel: Some([2u8; 32]), items: vec![item.clone(), item.clone()] },
+			SessionOp::Observe { channel: [2u8; 32], items: vec![item.clone()] },
+			SessionOp::ReleaseSecret { channel: [2u8; 32], idx: 7, newer: None },
+			SessionOp::ReleaseSecret {
+				channel: [2u8; 32],
+				idx: 7,
+				newer: Some((6, HolderProof { transaction: vec![4], counterparty_sig: [5u8; 64] })),
 			},
-			SessionOp::PerCommitmentPoint { channel: [2u8; 32], idx: 7 },
-			SessionOp::ReleaseSecret { channel: [2u8; 32], idx: 7 },
 			SessionOp::Tdh2Dkg,
 			SessionOp::BindKit { channel: [2u8; 32], kit_id: [3u8; 32] },
 			SessionOp::HolderCommitmentValidated {
@@ -1143,10 +1279,16 @@ mod tests {
 			},
 		];
 		for op in ops {
-			let s = SessionStart { op };
+			let s = SessionStart { session: [9u8; 16], members: vec![2, 0, 3], op };
 			assert_eq!(SessionStart::decode(&s.encode()).unwrap(), s);
 			assert_eq!(frame_kind(&s.encode()), FrameKind::SessionStart);
 		}
+		let j = MeshJoin { session: [4u8; 16] };
+		assert_eq!(MeshJoin::decode(&j.encode()).unwrap(), j);
+		assert_eq!(frame_kind(&j.encode()), FrameKind::MeshJoin);
+		assert_eq!(frame_kind(FRAME_GO), FrameKind::Other);
+		let lonely = SessionStart { session: [9u8; 16], members: vec![1], op: SessionOp::Tdh2Dkg };
+		assert!(SessionStart::decode(&lonely.encode()).is_err());
 		let a = SessionAck::Error { code: ErrorCode::PolicyDenied, message: "x".into() };
 		assert_eq!(SessionAck::decode(&a.encode()).unwrap(), a);
 		let a = SessionAck::Ok { payload: vec![1, 2, 3] };

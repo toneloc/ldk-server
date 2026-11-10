@@ -1,5 +1,8 @@
 # Signet demonstration: MPC-backed LDK Server channels
 
+> This log is from the earlier two-party, funding-key version of this fork. The threshold
+> design on branch `mpc` (several parties, any three of four) has only been run on regtest.
+
 Run on 2026-10-08 (UTC) with the `coverage = "funding"` build (the full-coverage build was
 verified on regtest afterwards; see `e2e-tests/tests/mpc.rs`). Both MPC parties and LDK
 Server ran on one machine; the counterparties were a third-party LND node and a second,
